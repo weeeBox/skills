@@ -68,10 +68,27 @@ with `--base <BASE>`, so codex sees `BASE...INTEGRATION` = the candidate's work 
 
 ## Step 3 - decide (the gate + risk table)
 
+- **Before an auto-land `commit`, write the integ-keyed verdict record** so `commit` can re-verify against
+  the exact integration commit. It derives the path from `<INTEGRATION>` (a stale record for a different
+  SHA is ignored). `$CODEX_RESULT_JSON` = the codex job's result JSON you already read; `$DEEPSEEK_VF` =
+  review-gate's `$VF`:
+  ```bash
+  printf '%s' "$INTEGRATION" | grep -qE '^[0-9a-f]{40,64}$' || { echo "INTEGRATION is not a git OID — abort"; exit 1; }
+  case "$CODEX_RESULT_JSON$DEEPSEEK_VF" in *"
+  "*) echo "reviewer artifact path contains a newline — abort"; exit 1 ;; esac
+  RECDIR="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/.claude/state/land-verdicts"; mkdir -p "$RECDIR"
+  _t="$(mktemp "$RECDIR/.${INTEGRATION}.rec.XXXXXX")" || { echo "mktemp failed"; exit 1; }
+  printf 'CODEX_RESULT=%s\nDEEPSEEK_VERDICT=%s\n' "$CODEX_RESULT_JSON" "$DEEPSEEK_VF" > "$_t" && mv -f "$_t" "$RECDIR/$INTEGRATION.rec"
+  ```
+  `commit` re-runs the risk classifier (refuses non-LOW, exit 7) and re-reads those artifacts, refusing
+  (exit 8) unless each artifact's last anchored `VERDICT:` line is exactly `SHIP`. `LANDER_HUMAN_OVERRIDE=1`
+  is the only bypass of the risk/verdict checks (never of integration validation) - an explicit,
+  `land-override`-logged, in-band escape hatch.
+
 | codex | deepseek | risk | action |
 |-------|----------|------|--------|
-| SHIP  | SHIP     | LOW  | **auto-land:** `${CLAUDE_PLUGIN_ROOT}/engine/lander.sh commit <candidate> <target> <BASE> <INTEGRATION> <WORKTREE>` |
-| SHIP  | SHIP     | HIGH | **STOP for a human** even though green - present the diff + risk; a human runs `commit` |
+| SHIP  | SHIP     | LOW  | write the record (above), then **auto-land:** `${CLAUDE_PLUGIN_ROOT}/engine/lander.sh commit <candidate> <target> <BASE> <INTEGRATION> <WORKTREE>` |
+| SHIP  | SHIP     | HIGH | **STOP for a human** even though green - present the diff + risk; a human runs the same `commit` with `LANDER_HUMAN_OVERRIDE=1` |
 | SHIP-WITH-CHANGES | any | any | **not-a-pass:** `abort`, surface the requested changes, STOP for a human (never auto-land a conditional SHIP) |
 | any   | SHIP-WITH-CHANGES | any | **not-a-pass:** `abort`, surface the changes, STOP for a human |
 | BLOCK | any  | any | **abort:** `${CLAUDE_PLUGIN_ROOT}/engine/lander.sh abort <WORKTREE> "codex BLOCK"`, surface findings, STOP |

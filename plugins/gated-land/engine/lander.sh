@@ -66,9 +66,23 @@ die() { echo "lander: $1" >&2; log "land-error" "$1"; exit "${2:-1}"; }
 # never read as LOW->auto-land). The bundled classifier is dependency-free; set LANDER_RISK_PYTHONPATH
 # only if you point LANDER_RISK_CLASSIFY at a custom classifier that imports your own modules.
 risk_of() { # base..integration -> prints HIGH|LOW
-  local base="$1" integ="$2" rc
+  local base="$1" integ="$2" rc; local -a extra=()
+  # LANDER_RISK_EXTRA_FLAGS (advertised in dev-loop.conf): tighten-only tokens forwarded to the
+  # classifier. `set -f` keeps a glob value (e.g. --deny 'infra/**') LITERAL instead of expanding it
+  # against the cwd; a MALFORMED value makes eval fail -> we fail CLOSED to HIGH rather than silently
+  # continuing with the default classifier (which could return LOW).
+  if [ -n "${LANDER_RISK_EXTRA_FLAGS:-}" ]; then
+    set -f
+    # Validate in an INNER subshell first: an eval PARSE error (e.g. an unbalanced quote) terminates
+    # its subshell, and because risk_of itself runs inside a `$(...)` command substitution, an
+    # un-contained parse error would kill risk_of before the guard could fail closed. Containing it in
+    # `( )` lets the `if !` see the nonzero exit and fail closed to HIGH.
+    if ! ( eval "extra=(${LANDER_RISK_EXTRA_FLAGS})" ) >/dev/null 2>&1; then set +f; echo HIGH; return; fi
+    eval "extra=(${LANDER_RISK_EXTRA_FLAGS})"   # validated above -> parses cleanly here
+    set +f
+  fi
   git diff --numstat --no-renames "$base..$integ" 2>/dev/null \
-    | PYTHONPATH="${LANDER_RISK_PYTHONPATH:+$LANDER_RISK_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}}" "$PY" "$RISK_CLASSIFY" --gate >/dev/null 2>&1
+    | PYTHONPATH="${LANDER_RISK_PYTHONPATH:+$LANDER_RISK_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}}" "$PY" "$RISK_CLASSIFY" --gate "${extra[@]+"${extra[@]}"}" >/dev/null 2>&1
   rc=$?
   [ "$rc" -eq 0 ] && echo LOW || echo HIGH
 }
@@ -115,6 +129,21 @@ cmd_prepare() {
     "$candidate" "$target" "$base" "$integ" "$wt" "$risk"
 }
 
+# Re-read the reviewers' OWN artifacts; pass ONLY on a clean codex SHIP AND deepseek SHIP. The verdict
+# is the LAST line beginning 'VERDICT:' (CR stripped for CRLF artifacts); its value must be EXACTLY one
+# verdict token (anchored + exact-match), so 'VERDICT: BLOCK' + later prose containing SHIP/SPACESHIP
+# fails closed. Missing file / unparseable JSON / absent verdict line -> non-zero (fail closed).
+_verdict_ok() { # <codex_result_json> <deepseek_verdict_file>
+  local cres="$1" dsf="$2" craw cverd dverd
+  [ -f "$cres" ] && [ -f "$dsf" ] || return 1
+  craw="$("$PY" -c 'import json,sys,os;print(json.load(open(os.path.expanduser(sys.argv[1]),encoding="utf-8",errors="replace"))["result"].get("rawOutput",""))' "$cres" 2>/dev/null)" || return 1
+  cverd="$(printf '%s\n' "$craw" | tr -d '\r' | grep -E '^VERDICT:' | tail -1 | sed 's/^VERDICT:[[:space:]]*//' | grep -oE '^(SHIP-WITH-CHANGES|BLOCK|SHIP)$')"
+  [ "$cverd" = SHIP ] || return 1
+  dverd="$(tr -d '\r' < "$dsf" 2>/dev/null | grep -E '^VERDICT:' | tail -1 | sed 's/^VERDICT:[[:space:]]*//' | grep -oE '^(SHIP-WITH-CHANGES|BLOCK|OVERSIZE|ERROR|SHIP)$')"
+  [ "$dverd" = SHIP ] || return 1
+  return 0
+}
+
 cmd_commit() {
   local candidate="${1:?}" target="${2:?}" base="${3:?}" integ="${4:?}" wt="${5:?}"
   _lock_acquire || die "could not acquire lander lock within timeout"
@@ -124,6 +153,29 @@ cmd_commit() {
   trap "_lock_release; git -C '$PRIMARY' worktree remove --force '$wt' 2>/dev/null; git -C '$PRIMARY' worktree prune 2>/dev/null" EXIT
 
   target_clean || die "target checkout dirty at commit time — refusing to land"
+
+  # integration validation (ALWAYS, even under override): integ must be a real commit that IS the tree
+  # we are about to land (the throwaway worktree's HEAD). Blocks a record aimed at a fabricated SHA.
+  git rev-parse --verify -q "$integ^{commit}" >/dev/null 2>&1 || die "integ is not a valid commit: $integ" 8
+  [ "$(git -C "$wt" rev-parse HEAD 2>/dev/null)" = "$integ" ] || die "integration worktree HEAD != $integ — refusing" 8
+
+  # --- coded interlocks (skipped only via the explicit, logged trusted-caller escape hatch) ---
+  local rec="$PRIMARY/.claude/state/land-verdicts/$integ.rec"
+  if [ "${LANDER_HUMAN_OVERRIDE:-0}" = "1" ]; then
+    log "land-override" "$candidate integ=${integ:0:8} reason=${LANDER_OVERRIDE_REASON:-human}"
+  else
+    local risk; risk="$(risk_of "$base" "$integ")"
+    [ "$risk" = LOW ] || { log "land-risk-block" "$candidate risk=$risk"; \
+      die "RISK=$risk — auto-land refused; a human reviews and re-runs with LANDER_HUMAN_OVERRIDE=1" 7; }
+    [ -f "$rec" ] || { log "land-verdict-block" "$candidate no-record"; \
+      die "no verdict record for integration $integ — gate did not record a pass; refusing to land" 8; }
+    local cres dsv
+    cres="$(sed -n 's/^CODEX_RESULT=//p'    "$rec" | head -1)"
+    dsv="$(sed  -n 's/^DEEPSEEK_VERDICT=//p' "$rec" | head -1)"
+    _verdict_ok "$cres" "$dsv" || { log "land-verdict-block" "$candidate not-SHIP"; \
+      die "recorded codex/deepseek verdict is not a clean SHIP for $integ — refusing to land" 8; }
+  fi
+
   local now; now="$(git rev-parse --verify "refs/heads/$target^{commit}")"
   [ "$now" = "$base" ] || { log "land-stale" "$candidate base=$base now=$now"; \
     die "STALE BASE: $target moved $base -> $now since prepare — re-run the lander" 5; }
@@ -153,6 +205,7 @@ cmd_commit() {
     $1=="worktree"{w=$2} $1=="branch"&&$2==b{print w}')"
   [ -n "$swt" ] && git -C "$PRIMARY" worktree remove --force "$swt" 2>/dev/null
   log "land-ok" "$candidate -> $target @ ${integ:0:8} push=$pushed"
+  rm -f "$rec" 2>/dev/null   # record consumed; orphan records on non-success exits are harmless (see SKILL Ceiling)
   # The LOCAL land is done and irreversible (ref moved) -> always log land-ok. But a REQUESTED
   # push that failed means "not fully done": exit non-zero so a LANDER_PUSH=1 caller can't read
   # exit 0 as "pushed" (codex finding). land-ok stays as the record that it landed locally.
@@ -229,7 +282,7 @@ check "prepare RISK=HIGH on src/secrets" "[ '$RISK_SENS' = HIGH ]"
 
 # 2. commit lands it (target checked out is 'session/feat', not main -> CAS update-ref path)
 git checkout -q session/feat
-rc=0; "$SELF" commit session/feat main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null || rc=$?
+rc=0; LANDER_HUMAN_OVERRIDE=1 "$SELF" commit session/feat main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null || rc=$?
 check "commit ok" "[ $rc -eq 0 ]"
 check "main advanced to integration" "[ \"$(git rev-parse main)\" = '$INTEGRATION' ]"
 check "throwaway worktree cleaned" "[ ! -d '$WORKTREE' ]"
@@ -241,7 +294,7 @@ out=$("$SELF" prepare session/f2 main); eval "$out"
 git checkout -q -b session/other main; git commit -q --allow-empty -m other
 git update-ref refs/heads/main "$(git rev-parse session/other)"   # move main behind the lander's back
 before=$(git rev-parse main)
-rc=0; "$SELF" commit session/f2 main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
+rc=0; LANDER_HUMAN_OVERRIDE=1 "$SELF" commit session/f2 main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
 check "stale-base commit fails" "[ $rc -ne 0 ]"
 check "target unchanged on stale" "[ \"$(git rev-parse main)\" = \"$before\" ]"
 
@@ -266,7 +319,7 @@ git checkout -q -b session/co main; echo "print('co')">>src/a.py; git commit -qa
 git checkout -q main                         # back on target, clean
 before6=$(git rev-parse main)
 out=$("$SELF" prepare session/co main); eval "$out"
-rc=0; "$SELF" commit session/co main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null || rc=$?
+rc=0; LANDER_HUMAN_OVERRIDE=1 "$SELF" commit session/co main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null || rc=$?
 check "checked-out commit ok" "[ $rc -eq 0 ]"
 check "checked-out main advanced" "[ \"$(git rev-parse main)\" = '$INTEGRATION' ]"
 check "checked-out HEAD==main (worktree synced)" "[ \"$(git rev-parse HEAD)\" = '$INTEGRATION' ]"
@@ -281,7 +334,7 @@ check "classifier-fail -> RISK=HIGH (fail closed)" "[ '$RISK' = HIGH ]"
 # 8. LANDER_PUSH=1 with no remote -> local land succeeds but push fails -> exit 6, target advanced
 git checkout -q -b session/pf main; echo "print('pf')">>src/a.py; git commit -qam pf; git checkout -q main
 out=$("$SELF" prepare session/pf main); eval "$out"
-rc=0; LANDER_PUSH=1 "$SELF" commit session/pf main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
+rc=0; LANDER_PUSH=1 LANDER_HUMAN_OVERRIDE=1 "$SELF" commit session/pf main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
 check "push-fail exits 6" "[ $rc -eq 6 ]"
 check "push-fail still landed locally" "[ \"$(git rev-parse main)\" = '$INTEGRATION' ]"
 
@@ -306,7 +359,7 @@ check "git-diff-fail -> nonzero (pipefail fail-closed)" "[ $rc -ne 0 ]"
 # exclude it via pathspec so commit is not refused. .claude/ is NOT in .git/info/exclude here.
 git checkout -q -b session/sd main; echo "print('sd')">>src/a.py; git commit -qam sd; git checkout -q main
 out=$("$SELF" prepare session/sd main); eval "$out"
-rc=0; "$SELF" commit session/sd main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
+rc=0; LANDER_HUMAN_OVERRIDE=1 "$SELF" commit session/sd main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
 check "self-dirty: commit succeeds despite .claude/state/verify.log" "[ $rc -eq 0 ]"
 
 # 12. LANDER_RISK_PYTHONPATH (P-D): a classifier that imports a module present ONLY via the trusted seam.
@@ -327,6 +380,102 @@ git tag main "$(git rev-parse session/tg)" 2>/dev/null   # tag 'main' shadows br
 out=$("$SELF" prepare session/tg main); eval "$out"
 check "tag-shadow: BASE from refs/heads/main not the tag" "[ '$BASE' = \"$(git rev-parse refs/heads/main)\" ]"
 git tag -d main >/dev/null 2>&1 || true
+"$SELF" abort "$WORKTREE" cleanup >/dev/null 2>&1 || true
+
+# ---- Task 1: risk + integ-bound reviewer-verdict interlock -------------------------------------
+# artifacts live under .claude/state (excluded by target_clean) so they don't dirty the target.
+mk_codex(){ mkdir -p "$D/.claude/state"; printf '{"result":{"rawOutput":"review body\\nVERDICT: %s\\n"}}\n' "$1" > "$D/.claude/state/codex_$2.json"; echo "$D/.claude/state/codex_$2.json"; }
+mk_ds(){ mkdir -p "$D/.claude/state"; printf 'notes\nVERDICT: %s\n' "$1" > "$D/.claude/state/ds_$2.txt"; echo "$D/.claude/state/ds_$2.txt"; }
+mk_rec(){ local rd="$D/.claude/state/land-verdicts"; mkdir -p "$rd"; printf 'CODEX_RESULT=%s\nDEEPSEEK_VERDICT=%s\n' "$2" "$3" > "$rd/$1.rec"; }
+
+# 14. LOW + codex SHIP + deepseek SHIP + matching record -> commits, record cleaned
+git checkout -q -b session/ok main; echo "print('ok14')">>src/a.py; git commit -qam ok14; git checkout -q main
+out=$("$SELF" prepare session/ok main); eval "$out"
+mk_rec "$INTEGRATION" "$(mk_codex SHIP ok)" "$(mk_ds SHIP ok)"
+rc=0; "$SELF" commit session/ok main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
+check "interlock: LOW+SHIP+SHIP commits" "[ $rc -eq 0 ]"
+check "interlock: main advanced" "[ \"$(git rev-parse main)\" = '$INTEGRATION' ]"
+check "interlock: .rec cleaned on success" "[ ! -f \"$D/.claude/state/land-verdicts/$INTEGRATION.rec\" ]"
+
+# 15. codex BLOCK -> exit 8, target untouched
+git checkout -q -b session/blk main; echo "print('blk')">>src/a.py; git commit -qam blk; git checkout -q main
+before15=$(git rev-parse main); out=$("$SELF" prepare session/blk main); eval "$out"
+mk_rec "$INTEGRATION" "$(mk_codex BLOCK blk)" "$(mk_ds SHIP blk)"
+rc=0; "$SELF" commit session/blk main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
+check "interlock: codex BLOCK refused exit 8" "[ $rc -eq 8 ]"
+check "interlock: target untouched on BLOCK" "[ \"$(git rev-parse main)\" = \"$before15\" ]"
+"$SELF" abort "$WORKTREE" cleanup >/dev/null 2>&1 || true
+
+# 15b. anchored parse: 'VERDICT: BLOCK' then prose with SHIP/SPACESHIP -> still refused
+git checkout -q -b session/fo main; echo "print('fo')">>src/a.py; git commit -qam fo; git checkout -q main
+out=$("$SELF" prepare session/fo main); eval "$out"; mkdir -p "$D/.claude/state"
+printf '{"result":{"rawOutput":"VERDICT: BLOCK\\nafter fixing we could SHIP the SPACESHIP\\n"}}\n' > "$D/.claude/state/codex_fo.json"
+mk_rec "$INTEGRATION" "$D/.claude/state/codex_fo.json" "$(mk_ds SHIP fo)"
+rc=0; "$SELF" commit session/fo main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
+check "interlock: BLOCK-then-SHIP-prose refused (anchored)" "[ $rc -eq 8 ]"
+"$SELF" abort "$WORKTREE" cleanup >/dev/null 2>&1 || true
+
+# 15c. CRLF verdict still parses as SHIP -> commits
+git checkout -q -b session/crlf main; echo "print('crlf')">>src/a.py; git commit -qam crlf; git checkout -q main
+out=$("$SELF" prepare session/crlf main); eval "$out"; mkdir -p "$D/.claude/state"
+printf '{"result":{"rawOutput":"body\\r\\nVERDICT: SHIP\\r\\n"}}\n' > "$D/.claude/state/codex_crlf.json"
+printf 'notes\r\nVERDICT: SHIP\r\n' > "$D/.claude/state/ds_crlf.txt"
+mk_rec "$INTEGRATION" "$D/.claude/state/codex_crlf.json" "$D/.claude/state/ds_crlf.txt"
+rc=0; "$SELF" commit session/crlf main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
+check "interlock: CRLF verdict parses -> commits" "[ $rc -eq 0 ]"
+
+# 16. deepseek SHIP-WITH-CHANGES -> exit 8
+git checkout -q -b session/swc main; echo "print('swc')">>src/a.py; git commit -qam swc; git checkout -q main
+out=$("$SELF" prepare session/swc main); eval "$out"
+mk_rec "$INTEGRATION" "$(mk_codex SHIP swc)" "$(mk_ds SHIP-WITH-CHANGES swc)"
+rc=0; "$SELF" commit session/swc main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
+check "interlock: deepseek SWC refused exit 8" "[ $rc -eq 8 ]"
+"$SELF" abort "$WORKTREE" cleanup >/dev/null 2>&1 || true
+
+# 17. wrong-SHA record does NOT authorize this integ -> exit 8
+git checkout -q -b session/mv main; echo "print('mv')">>src/a.py; git commit -qam mv; git checkout -q main
+out=$("$SELF" prepare session/mv main); eval "$out"
+mk_rec deadbeefdeadbeefdeadbeefdeadbeefdeadbeef "$(mk_codex SHIP mv)" "$(mk_ds SHIP mv)"
+rc=0; "$SELF" commit session/mv main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
+check "interlock: wrong-SHA record -> exit 8" "[ $rc -eq 8 ]"
+"$SELF" abort "$WORKTREE" cleanup >/dev/null 2>&1 || true
+
+# 17b. bogus integ (not a real OID) -> exit 8 even under override
+git checkout -q -b session/bogus main; echo "print('bogus')">>src/a.py; git commit -qam bogus; git checkout -q main
+out=$("$SELF" prepare session/bogus main); eval "$out"
+rc=0; LANDER_HUMAN_OVERRIDE=1 "$SELF" commit session/bogus main "$BASE" 0000000000000000000000000000000000000000 "$WORKTREE" >/dev/null 2>&1 || rc=$?
+check "interlock: bogus integ refused exit 8 (even override)" "[ $rc -eq 8 ]"
+"$SELF" abort "$WORKTREE" cleanup >/dev/null 2>&1 || true
+
+# 18. HIGH risk + SHIP/SHIP + record, no override -> exit 7 (refused commit's trap removes the worktree)
+git checkout -q -b session/hi main; mkdir -p src/secrets; echo x=1>src/secrets/k.py; git add src/secrets/k.py; git commit -qam hi; git checkout -q main
+out=$("$SELF" prepare session/hi main); eval "$out"
+mk_rec "$INTEGRATION" "$(mk_codex SHIP hi)" "$(mk_ds SHIP hi)"
+rc=0; "$SELF" commit session/hi main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
+check "interlock: HIGH without override refused exit 7" "[ $rc -eq 7 ]"
+
+# 19. re-prepare (case 18's refused commit cleaned the worktree), then override -> commits
+out=$("$SELF" prepare session/hi main); eval "$out"
+rc=0; LANDER_HUMAN_OVERRIDE=1 "$SELF" commit session/hi main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
+check "interlock: HIGH with override commits" "[ $rc -eq 0 ]"
+check "interlock: override advanced main" "[ \"$(git rev-parse main)\" = '$INTEGRATION' ]"
+
+# ---- Task 3: LANDER_RISK_EXTRA_FLAGS forwarding (uses the REAL classifier) ---------------------
+SELF_CLASSIFIER="$(cd "$(dirname "$SELF")" && pwd)/risk_classify.py"
+# 20. forwarded --deny-substr flips a benign src change LOW->HIGH
+git checkout -q -b session/xf main; echo "print('xf')">>src/a.py; git commit -qam xf; git checkout -q main
+out=$(LANDER_RISK_CLASSIFY="$SELF_CLASSIFIER" LANDER_RISK_EXTRA_FLAGS="--deny-substr a.py" "$SELF" prepare session/xf main); eval "$out"
+check "extra-flags: --deny-substr flips LOW->HIGH" "[ '$RISK' = HIGH ]"
+"$SELF" abort "$WORKTREE" cleanup >/dev/null 2>&1 || true
+# 20b. glob value stays literal (set -f) -> HIGH
+git checkout -q -b session/gx main; echo "print('gx')">>src/a.py; git commit -qam gx; git checkout -q main
+out=$(LANDER_RISK_CLASSIFY="$SELF_CLASSIFIER" LANDER_RISK_EXTRA_FLAGS="--deny 'src/**'" "$SELF" prepare session/gx main); eval "$out"
+check "extra-flags: glob value literal (set -f) -> HIGH" "[ '$RISK' = HIGH ]"
+"$SELF" abort "$WORKTREE" cleanup >/dev/null 2>&1 || true
+# 20c. malformed value fails CLOSED to HIGH
+git checkout -q -b session/bad main; echo "print('bad')">>src/a.py; git commit -qam bad; git checkout -q main
+out=$(LANDER_RISK_CLASSIFY="$SELF_CLASSIFIER" LANDER_RISK_EXTRA_FLAGS="--deny 'unterminated" "$SELF" prepare session/bad main); eval "$out"
+check "extra-flags: malformed value fails closed -> HIGH" "[ '$RISK' = HIGH ]"
 "$SELF" abort "$WORKTREE" cleanup >/dev/null 2>&1 || true
 
 echo "lander selftest: $pass passed, $fail failed"
