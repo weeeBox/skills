@@ -1,0 +1,40 @@
+# dev-loop.conf - configuration for the gated-land skills (ship / gate-loop / land).
+#
+# SETUP: copy this file to the ROOT of the repo you want to gate, as `.dev-loop.conf`,
+# and edit the values. The skills source `<repo-root>/.dev-loop.conf` if it exists and
+# fall back to the defaults below otherwise. Keeping it in YOUR repo (not the plugin dir)
+# means it survives plugin updates and can be version-controlled per project.
+#
+#     cp "$CLAUDE_PLUGIN_ROOT/dev-loop.conf.example" ./.dev-loop.conf
+#
+# This file is sourced by bash, so it is shell syntax (KEY="value"; export as noted).
+
+# --- required: how to run your full test suite -----------------------------------------
+# Must exit NON-ZERO on any failure. Examples: "make test", "npm test",
+# "pytest -q", "bash tests/run_all.sh", "cargo test".
+TEST_COMMAND="${TEST_COMMAND:-make test}"
+
+# --- required: the integration target branch -------------------------------------------
+BASE_BRANCH="${BASE_BRANCH:-main}"
+
+# --- lander engine wiring (usually leave as-is) ----------------------------------------
+# The serialized merge queue and the risk classifier are vendored in this plugin.
+# $CLAUDE_PLUGIN_ROOT is set by Claude Code to the gated-land plugin root at runtime.
+export LANDER_SUITE_CMD="$TEST_COMMAND"
+export LANDER_RISK_CLASSIFY="$CLAUDE_PLUGIN_ROOT/engine/risk_classify.py"
+# The generic risk classifier has no imports, so no PYTHONPATH is needed.
+
+# Interpreter for the risk classifier. Defaults inside lander.sh to .venv/bin/python then
+# python3. Override if your project uses a different interpreter:
+# export LANDER_PY="python3"
+
+# --- optional -------------------------------------------------------------------------
+# Auto-push after a successful land (default: off - land commits locally only):
+# export LANDER_PUSH=1
+# Seconds before a stale lander lock is reclaimed (default in lander.sh):
+# export LANDER_LOCK_STALE=900
+
+# --- risk policy (edit engine/risk_classify.py DEFAULT_* for durable policy) ------------
+# You can also TIGHTEN the auto-land risk gate per-repo here (append-only / tighten-only;
+# these are passed to risk_classify.py). Never widens the gate.
+# export LANDER_RISK_EXTRA_FLAGS="--deny 'infra/**' --deny-substr 'tenant' --max-files 10"

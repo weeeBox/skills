@@ -1,0 +1,11 @@
+{
+  "name": "dev-loop-core",
+  "version": "0.1.0",
+  "description": "Portable Claude Code skills: a multi-model (codex + deepseek + agy) review gate, and a daily session-retro that mines your transcripts for friction and writes evidence-backed improvement recommendations.",
+  "author": { "name": "weeeBox", "url": "https://github.com/weeeBox" },
+  "homepage": "https://github.com/weeeBox/skills",
+  "repository": "https://github.com/weeeBox/skills",
+  "license": "MIT",
+  "keywords": ["review", "code-review", "gate", "retro", "automation", "workflow"],
+  "skills": "./skills/"
+}

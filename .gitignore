@@ -1,0 +1,4 @@
+.dev-loop.conf
+.DS_Store
+__pycache__/
+*.pyc

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "skills",
+  "description": "weeeBox's Claude Code skills.",
+  "owner": {
+    "name": "weeeBox",
+    "url": "https://github.com/weeeBox"
+  },
+  "plugins": [
+    {
+      "name": "dev-loop-core",
+      "description": "Portable Claude Code skills: a multi-model (codex + deepseek + agy) review gate, and a daily session-retro that mines your transcripts for friction and writes evidence-backed improvement recommendations. No repo assumptions.",
+      "author": { "name": "weeeBox", "url": "https://github.com/weeeBox" },
+      "category": "workflow",
+      "source": "./plugins/dev-loop-core"
+    },
+    {
+      "name": "gated-land",
+      "description": "An opinionated, autonomous gate-and-land pipeline for solo devs: one-shot ship gate, a capped verify->fix->re-gate loop, and a serialized local merge queue with a config-driven risk classifier. Builds on dev-loop-core's review gate. Configure it to your repo via dev-loop.conf.",
+      "author": { "name": "weeeBox", "url": "https://github.com/weeeBox" },
+      "category": "workflow",
+      "source": "./plugins/gated-land"
+    }
+  ]
+}
