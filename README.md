@@ -48,9 +48,6 @@ Runs codex + deepseek (blocking) + agy (advisory) over one unit of work - a **pl
 a **branch diff** (before merge) - in parallel, with a wedge watchdog, a per-worktree lock, and
 fail-closed verdict handling. It **stops for a human**; it never fixes, re-gates, merges, or pushes.
 
-> This is the canonical home of `review-gate`. The standalone `weeeBox/review-gate` repo is deprecated
-> in favor of this bundle.
-
 ### `session-retro`
 
 Analyzes a day of Claude Code session transcripts across all your projects and writes a friction report
