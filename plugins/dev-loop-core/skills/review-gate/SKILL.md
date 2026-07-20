@@ -69,7 +69,9 @@ Review a design/plan doc (or a staged change) before any code is written.
      [ -n "$DS" ] && python3 "$DS" setup --json          # gate on "ready": true
      ```
      If `ready` is false (or `$DS` empty): report "deepseek not configured - skipped" (honest gap, not a
-     pass, not a block) and gate on codex+agy only. If ready, dispatch (same shell so the key is loaded)
+     pass, not a block) and gate on codex+agy only - **UNLESS `RG_REQUIRE_DEEPSEEK=1` is set** (the
+     autonomous consumers gate-loop/land/ship set it), in which case a not-configured deepseek is itself
+     a fail-closed human STOP (BLOCK-equivalent), never a codex-only pass. If ready, dispatch (same shell so the key is loaded)
      via `run_in_background: true`, writing the verdict to a per-round scratchpad file:
      ```
      python3 "$DS" adversarial-review "$RGSCOPE" > "$VF" 2>&1   # $VF = <scratchpad>/deepseek-verdict-r<round>.txt
@@ -246,8 +248,11 @@ read an error, timeout, empty result, or dropped message as ALLOW.
 - **Wedge vs done** - completion is codex's populated `result` OR agy's verdict text in its log file;
   watchdog-fired while that is still absent = wedged -> salvage, cancel, one retry, then fail closed.
 - **Empty input = STOP** - nothing staged / `git diff <base>...HEAD` empty -> "nothing to ship".
-- **Oversized diff = BLOCK-equivalent** - past ~50 KB the reviewer silently truncates; do not accept a
-  pass -> BLOCK and tell the human to split/chunk the change.
+- **Oversized diff** - run `$RG/../../gated-land/skills/gate-loop/scripts/diff-size.sh <base> HEAD` (or the
+  co-located `diff-size.sh` if this skill vendors it) BEFORE dispatch instead of eyeballing three
+  different thresholds: `BYTES=ERROR` (bad ref / failed diff) is a human stop; `AGY=OVERSIZE` / `DEEPSEEK=OVERSIZE`
+  is that tool's honest oversize gap (a human stop for a blocker, a reported gap for agy); `CODEX=WARN` means
+  split/chunk the change. Never accept a truncated-diff pass -> BLOCK-equivalent.
 - **Dropped resume** - see **Re-gate**: fall back to fresh, never double-retry.
 
 ## Reporting (stop for a human)

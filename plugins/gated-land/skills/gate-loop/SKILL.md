@@ -51,7 +51,16 @@ to the lander. Not for a one-shot review - that is `/ship` (human-gated, one cod
 
 ## The loop (max 3 gate rounds)
 
-Repeat the round below. A **round** = one gate attempt (codex + deepseek). Cap at **3**.
+At loop entry, append one `gateloop-start` row to the audit log so the cap is counted from data, not
+memory: `printf '%s\tgateloop-start\t%s\t-\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse --short HEAD)" >> .claude/state/verify.log`.
+
+Repeat the round below. A **round** = one gate attempt (codex + deepseek). **Cap from data, not memory:**
+at the top of each round, if `${CLAUDE_PLUGIN_ROOT}/skills/gate-loop/scripts/round-count.sh .claude/state/verify.log`
+returns `>=3`, take the Cap-out path (do NOT start a 4th round). The count is positional (rows after the
+last `gateloop-start`), so it survives context compaction and clock drift.
+
+Drive review-gate's deepseek dispatch with `RG_REQUIRE_DEEPSEEK=1` exported — for this autonomous loop a
+not-configured deepseek is a fail-closed human stop, never a codex-only pass.
 
 1. **Full suite.** your full-suite command (`$TEST_COMMAND` from `.dev-loop.conf`).
    - Red → this is a fix pass: find the **root cause** and fix it, re-run affected + full suite until
@@ -67,7 +76,8 @@ Repeat the round below. A **round** = one gate attempt (codex + deepseek). Cap a
    - Exit 3 → **STOP. Do not self-approve, even if the suite is green and codex would SHIP.** Log
      `gateloop-tamper` to verify.log and hand the branch diff to a human, or dispatch a **dedicated
      codex pass whose sole job is to judge that test/config/deps diff** - the loop cannot clear it.
-   - Exit 0 → continue.
+   - Exit 0 → continue. **Only exit 0 continues; ANY non-zero (2 usage, 3 tamper, or anything else) is a
+     fail-closed STOP** - never "exit != 3 means proceed".
 5. **codex + deepseek gate on the branch diff.** Drive BOTH through review-gate's **diff-stage**
    mechanics (`/codex:adversarial-review --base <base>` plus review-gate's deepseek dispatch on the
    same `<base>...HEAD` range), arming the wedge watchdog in the same breath. **Round 2+: resume the
