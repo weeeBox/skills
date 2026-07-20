@@ -23,8 +23,10 @@ is_guarded() {
     pytest.ini|*/pytest.ini|pyproject.toml|*/pyproject.toml) return 0 ;;
     requirements*.txt|*/requirements*.txt)             return 0 ;;  # deps (mock the world)
     verify.sh|*/verify.sh|run_all.sh|*/run_all.sh)     return 0 ;;  # common verify-script names
-    # Add your own verification substrate here (e.g. an in-repo risk/policy file a self-driving
-    # session could edit to force a green run): pattern) return 0 ;;
+    .dev-loop.conf|*/.dev-loop.conf)                   return 0 ;;  # suite/base/classifier selector
+    # Add your own verification substrate here — anything a self-driving session could edit to force a
+    # green run: the suite selector (.dev-loop.conf, guarded above), an in-repo risk/policy classifier
+    # if you vendor one (LANDER_RISK_CLASSIFY target), a coverage gate, etc.: pattern) return 0 ;;
     *)                                                 return 1 ;;
   esac
 }
@@ -60,14 +62,15 @@ selftest() {
       tests/test_foo.py src/tests/x.py conftest.py pkg/conftest.py \
       pytest.ini pyproject.toml a/pyproject.toml \
       requirements.txt requirements-dev.txt tools/requirements.txt \
-      verify.sh .claude/hooks/verify.sh run_all.sh tests/run_all.sh; do
+      verify.sh .claude/hooks/verify.sh run_all.sh tests/run_all.sh \
+      .dev-loop.conf sub/.dev-loop.conf; do
     is_guarded "$p" || { echo "FAIL: expected GUARDED: $p"; fails=$((fails+1)); }
   done
   # clean paths - note the edge cases that must NOT trip the guard
   for p in \
       src/app/main.py docs/x.md README.md \
       testdata/foo.py src/mytests.py verify_thing.py my_pyproject.toml \
-      src/lib/util.py; do
+      src/lib/util.py docs/dev-loop.conf.md; do
     is_guarded "$p" && { echo "FAIL: expected CLEAN: $p"; fails=$((fails+1)); }
   done
   # fail-closed: an unresolvable base must return TAMPER (3), never a false all-clear
