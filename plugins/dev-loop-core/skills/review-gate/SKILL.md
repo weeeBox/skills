@@ -120,13 +120,13 @@ Review a branch diff before merge (the path `/ship` delegates to). Same as plan 
   `X = Y` aliases have no local `def`). Evidence: `a5b90104` spent ~8 min tracing out-of-scope source.
 - Lock scope command: `review-gate-lock.sh acquire "git diff <base>...HEAD"`.
 
-### Generated / graphify-out cleanup
+### Generated / build-output cleanup
 
-A dirty generated tree (`graphify-out/`, build output) pollutes the diff the reviewers see. By default
-`git checkout -- <generated-dir>` to drop disposable tool noise before scoping - **but only where the
-repo treats it as disposable.** A repo whose own `CLAUDE.md` tracks that dir as real work (scratch does,
-for `graphify-out/`) must instead STOP and ask the human; never run a destructive git command on it.
-`ship/SKILL.md` explicitly overrides this step for scratch - it must exist here for that override to be coherent.
+A dirty generated tree (build output, a tool-generated dir) pollutes the diff the reviewers see. By
+default `git checkout -- <generated-dir>` to drop disposable tool noise before scoping - **but only
+where the repo treats it as disposable.** A repo whose own conventions track that dir as real work must
+instead STOP and ask the human; never run a destructive git command on it. A consuming skill (e.g.
+`ship`) may override this step for a repo where the generated dir is not disposable.
 
 ## Stuck workers
 

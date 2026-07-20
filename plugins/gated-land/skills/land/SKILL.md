@@ -7,7 +7,7 @@ description: Stage-2 local merge queue - integrate a green session/<slug> branch
 
 # land
 
-Stage 2 of the autonomous multi-session env (this is an opinionated solo-dev pipeline; see the repo README). It drives
+Stage 2 of the gated-land pipeline (this is an opinionated solo-dev pipeline; see the repo README). It drives
 `${CLAUDE_PLUGIN_ROOT}/engine/lander.sh` - the ONE serialized merge queue - and wraps the codex+deepseek re-gate that a bash
 script can't drive itself. Input: a green `session/<slug>` branch (produced by the `gate-loop` skill). Output:
 that branch integrated into `main`, or a clean STOP with the target untouched.

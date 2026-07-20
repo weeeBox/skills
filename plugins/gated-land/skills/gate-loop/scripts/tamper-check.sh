@@ -22,10 +22,9 @@ is_guarded() {
     conftest.py|*/conftest.py)                         return 0 ;;  # pytest fixtures/config
     pytest.ini|*/pytest.ini|pyproject.toml|*/pyproject.toml) return 0 ;;
     requirements*.txt|*/requirements*.txt)             return 0 ;;  # deps (mock the world)
-    verify.sh|*/verify.sh|run_all.sh|*/run_all.sh)     return 0 ;;  # the verify scripts
-    src/cuj_loop/classify.py|*/cuj_loop/classify.py)   return 0 ;;  # the static risk classifier:
-                                # a self-driving session could edit it to force LOW risk and
-                                # auto-land past the gate (agy finding) - treat as substrate.
+    verify.sh|*/verify.sh|run_all.sh|*/run_all.sh)     return 0 ;;  # common verify-script names
+    # Add your own verification substrate here (e.g. an in-repo risk/policy file a self-driving
+    # session could edit to force a green run): pattern) return 0 ;;
     *)                                                 return 1 ;;
   esac
 }
@@ -61,15 +60,14 @@ selftest() {
       tests/test_foo.py src/tests/x.py conftest.py pkg/conftest.py \
       pytest.ini pyproject.toml a/pyproject.toml \
       requirements.txt requirements-dev.txt tools/requirements.txt \
-      verify.sh .claude/hooks/verify.sh run_all.sh tests/run_all.sh \
-      src/cuj_loop/classify.py a/src/cuj_loop/classify.py; do
+      verify.sh .claude/hooks/verify.sh run_all.sh tests/run_all.sh; do
     is_guarded "$p" || { echo "FAIL: expected GUARDED: $p"; fails=$((fails+1)); }
   done
   # clean paths - note the edge cases that must NOT trip the guard
   for p in \
-      src/engine/executor.py docs/x.md README.md \
+      src/app/main.py docs/x.md README.md \
       testdata/foo.py src/mytests.py verify_thing.py my_pyproject.toml \
-      src/cuj_loop/ledger.py; do
+      src/lib/util.py; do
     is_guarded "$p" && { echo "FAIL: expected CLEAN: $p"; fails=$((fails+1)); }
   done
   # fail-closed: an unresolvable base must return TAMPER (3), never a false all-clear

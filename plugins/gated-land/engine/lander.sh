@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# lander.sh — the local merge queue (Stage 2 of the autonomous multi-session env).
-# See docs/designs/2026-07-11-autonomous-multi-session-env-design.md, Plane 3 "the lander".
+# lander.sh — a serialized local merge queue (the `gated-land` plugin's `land` engine).
 #
 # Deterministic mechanics only; the codex re-gate is driven by the `/land` SKILL between
 # `prepare` and `commit` (the skill is the thing that can drive codex via review-gate). So this
@@ -25,8 +24,8 @@ COMMON="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
 PRIMARY="$(dirname "$COMMON")"                       # the primary checkout (git-common-dir's parent)
 LOCK="$COMMON/lander.lock.d"                         # mkdir-atomic lock dir (portable; no flock on macOS/bash3.2)
 LOG="$PRIMARY/.claude/state/verify.log"
-SUITE_CMD="${LANDER_SUITE_CMD:-bash tests/run_all.sh}"   # overridable so --selftest injects a fast suite
-RISK_CLASSIFY="${LANDER_RISK_CLASSIFY:-$PRIMARY/src/cuj_loop/risk_classify.py}"
+SUITE_CMD="${LANDER_SUITE_CMD:-make test}"          # overridable (set it in .dev-loop.conf); --selftest injects a fast suite
+RISK_CLASSIFY="${LANDER_RISK_CLASSIFY:-$(cd "$(dirname "$0")" && pwd)/risk_classify.py}"   # co-located generic classifier by default
 PY="${LANDER_PY:-$PRIMARY/.venv/bin/python}"; [ -x "$PY" ] || PY=python3
 
 _mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }  # BSD||GNU
@@ -59,23 +58,25 @@ log() { # ts \t event \t head \t detail
 }
 die() { echo "lander: $1" >&2; log "land-error" "$1"; exit "${2:-1}"; }
 
-# --- risk: static, from the ACTUAL diff, via the deterministic land-risk classifier (design §7) ---
+# --- risk: static, from the ACTUAL diff, via the deterministic land-risk classifier ---
 # Feed `git diff --numstat --no-renames` (line counts, so the size caps apply; --no-renames splits a
 # rename into delete+add so each path is policy-checkable). risk_classify.py's --gate mode encodes the
 # verdict in the EXIT CODE: 0=LOW, 1=NOT_LOW, 2=could-not-classify. pipefail (set at top) propagates a
 # failed `git diff`. FAIL CLOSED: anything other than a clean exit-0 -> HIGH (a discarded error must
-# never read as LOW->auto-land). risk_classify.py imports cuj_loop.classify, so `src` MUST be on
-# PYTHONPATH or the import fails -> non-zero -> HIGH.
+# never read as LOW->auto-land). The bundled classifier is dependency-free; set LANDER_RISK_PYTHONPATH
+# only if you point LANDER_RISK_CLASSIFY at a custom classifier that imports your own modules.
 risk_of() { # base..integration -> prints HIGH|LOW
   local base="$1" integ="$2" rc
   git diff --numstat --no-renames "$base..$integ" 2>/dev/null \
-    | PYTHONPATH="${LANDER_RISK_PYTHONPATH:+$LANDER_RISK_PYTHONPATH:}$PRIMARY/src${PYTHONPATH:+:$PYTHONPATH}" "$PY" "$RISK_CLASSIFY" --gate >/dev/null 2>&1
+    | PYTHONPATH="${LANDER_RISK_PYTHONPATH:+$LANDER_RISK_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}}" "$PY" "$RISK_CLASSIFY" --gate >/dev/null 2>&1
   rc=$?
   [ "$rc" -eq 0 ] && echo LOW || echo HIGH
 }
 
 target_clean() { # refuse to build on / land onto a dirty target checkout
-  [ -z "$(git -C "$PRIMARY" status --porcelain -- . ':(exclude)graphify-out' ':(exclude).claude/state' 2>/dev/null)" ]
+  # LANDER_STATUS_EXCLUDES: space-separated extra pathspecs to ignore (e.g. a tracked generated dir).
+  local ex=""; for p in .claude/state ${LANDER_STATUS_EXCLUDES:-}; do ex="$ex :(exclude)$p"; done
+  [ -z "$(git -C "$PRIMARY" status --porcelain -- . $ex 2>/dev/null)" ]
 }
 
 cmd_prepare() {
@@ -188,7 +189,7 @@ check(){ if eval "$2"; then pass=$((pass+1)); else echo "FAIL: $1"; fail=$((fail
 
 # fake fast suite + a fake land-risk classifier honoring the --gate contract: reads `git diff
 # --numstat` on STDIN, and with --gate exits 0=LOW / 1=NOT_LOW / 2=error. NOT_LOW if any changed path
-# is under src/safety/ or the diff exceeds 15 files; else LOW. Keep it OUT of the tracked tree
+# is under src/secrets/ or the diff exceeds 15 files; else LOW. Keep it OUT of the tracked tree
 # (untracked files would trip target_clean) via git's local exclude.
 export LANDER_SUITE_CMD='true'
 # .claude/ is gitignored in the real repo (verify.log lives there); mirror that here so the
@@ -200,7 +201,7 @@ lines = [ln for ln in sys.stdin.read().splitlines() if ln.strip()]
 if any(len(ln.split('\t')) != 3 for ln in lines):   # malformed numstat -> could-not-classify (mirror real)
     print(json.dumps({"risk": "NOT_LOW", "reasons": ["could not classify"]})); sys.exit(2)
 paths = [ln.split('\t', 2)[2] for ln in lines]
-not_low = any('src/safety/' in p for p in paths) or len(paths) > 15
+not_low = any('src/secrets/' in p for p in paths) or len(paths) > 15
 print(json.dumps({"risk": "NOT_LOW" if not_low else "LOW"}))
 sys.exit((1 if not_low else 0) if '--gate' in sys.argv else 0)
 PYEOF
@@ -218,12 +219,12 @@ check "target untouched by prepare" "[ \"$(git rev-parse main)\" = '$main' ]"
 
 # 1b. sensitive-path candidate -> RISK=HIGH
 git checkout -q -b session/sens "$main"
-mkdir -p src/safety; echo "x=1" > src/safety/consent.py
-git add src/safety/consent.py; git commit -qam sens
+mkdir -p src/secrets; echo "x=1" > src/secrets/key.py
+git add src/secrets/key.py; git commit -qam sens
 rc=0; out2=$("$SELF" prepare session/sens main) || rc=$?
 check "prepare ok (sensitive)" "[ $rc -eq 0 ]"
 RISK_SENS=$(printf '%s\n' "$out2" | sed -n 's/^RISK=//p'); WT_SENS=$(printf '%s\n' "$out2" | sed -n 's/^WORKTREE=//p')
-check "prepare RISK=HIGH on src/safety" "[ '$RISK_SENS' = HIGH ]"
+check "prepare RISK=HIGH on src/secrets" "[ '$RISK_SENS' = HIGH ]"
 "$SELF" abort "$WT_SENS" cleanup >/dev/null 2>&1 || true
 
 # 2. commit lands it (target checked out is 'session/feat', not main -> CAS update-ref path)

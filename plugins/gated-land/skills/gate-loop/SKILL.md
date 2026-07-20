@@ -7,7 +7,7 @@ description: The autonomous in-session verify→fix→re-gate loop that turns a 
 
 # gate-loop
 
-The Stage-1 autonomous loop of the multi-session env (this is an opinionated solo-dev pipeline; see the repo README). It is a
+The Stage-1 autonomous loop of the gated-land pipeline (this is an opinionated solo-dev pipeline; see the repo README). It is a
 **skill, not a script** on purpose: the session Claude IS the fixer, so it orchestrates the loop the
 way `review-gate`/`ship` do, driving the already-built pieces rather than re-implementing them.
 
@@ -95,7 +95,7 @@ Repeat the round below. A **round** = one gate attempt (codex + deepseek). Cap a
 
 ## verify.log rows
 
-Append one tab-separated row per terminal event (match the existing format - see `verify.sh`):
+Append one tab-separated row per terminal event to your audit log (`.claude/state/verify.log`):
 
 ```
 printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" <event> "$(git rev-parse --short HEAD)" "<detail>" >> .claude/state/verify.log

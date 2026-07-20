@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# review-gate wedge watchdog. Global copy owned by the review-gate skill; scratch keeps
-# scripts/watch-bg-job.sh as its repo-local twin.
+# review-gate wedge watchdog, owned by the review-gate skill.
 #
 # NOT the completion signal - completion is decided by the orchestrator polling the job's
 # `result` field. This only answers "has output stopped moving long enough to go look?"

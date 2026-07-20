@@ -31,7 +31,7 @@ def _glob_any(path, patterns):
     for pat in patterns:
         q = pat.casefold()
         if q.endswith("/**"):
-            if p == q[:-3] or p.startswith(q[:-2]):  # 'src/safety/**' -> 'src/safety/'
+            if p == q[:-3] or p.startswith(q[:-2]):  # e.g. 'docs/api/**' -> 'docs/api/'
                 return pat
         elif fnmatch.fnmatch(p, q):
             return pat
