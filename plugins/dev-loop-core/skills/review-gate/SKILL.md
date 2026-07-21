@@ -82,7 +82,7 @@ Review a design/plan doc (or a staged change) before any code is written.
      retros P1/P2). Passing it through the companion's existing free-form focus arg keeps the guidance in
      THIS skill (durable) instead of the vendored, reinstall-ephemeral prompt template:
      ```
-     RGSCOPE="SCOPE DISCIPLINE: Bash/git are DISABLED and the full diff is inlined below - never run git/ls/cat/find. Glob a path to confirm it exists before you Read it (a referenced file may live under a different dir than a sibling, or in a design-only gate not exist yet); list a directory with Glob dir/**, never ls, and never Read a directory."
+     RGSCOPE="SCOPE DISCIPLINE: Bash, git, and Skill are DISABLED - never run git/ls/cat/find/rg and never invoke Skill (incl. review-gate) to orchestrate. The full diff is inlined below and its file paths are AUTHORITATIVE - resolve every path against them, never guess a sibling's src/<subdir>/ from memory (e.g. src/engine/ when the real path is src/app/); on a 404, Glob the basename ONCE (never re-fire the same path at a new offset). If the diff touches only docs/designs/** or docs/plans/**, this is a DESIGN-only gate - files it names may not exist yet, so Glob to confirm before Reading a named source/artifact; never Read a design-referenced file blind. Your target worktree can be reaped mid-review: on the FIRST 'Directory does not exist', an rg/posix_spawn ENOENT, or a File-does-not-exist on a path that read fine seconds earlier, STOP all filesystem probing (the tree is gone, no retry fixes it) and complete the verdict from the inlined diff plus whatever you already read. List a directory with Glob dir/**, never ls, and never Read a directory."
      ```
      The verdict is the **last `VERDICT:` line** of `$VF` (the companion fails closed: any error/missing
      key/oversize -> `VERDICT: ERROR`, never a silent pass). deepseek reviews as a read-only agent that
@@ -248,11 +248,11 @@ read an error, timeout, empty result, or dropped message as ALLOW.
 - **Wedge vs done** - completion is codex's populated `result` OR agy's verdict text in its log file;
   watchdog-fired while that is still absent = wedged -> salvage, cancel, one retry, then fail closed.
 - **Empty input = STOP** - nothing staged / `git diff <base>...HEAD` empty -> "nothing to ship".
-- **Oversized diff** - run `$RG/../../gated-land/skills/gate-loop/scripts/diff-size.sh <base> HEAD` (or the
-  co-located `diff-size.sh` if this skill vendors it) BEFORE dispatch instead of eyeballing three
-  different thresholds: `BYTES=ERROR` (bad ref / failed diff) is a human stop; `AGY=OVERSIZE` / `DEEPSEEK=OVERSIZE`
-  is that tool's honest oversize gap (a human stop for a blocker, a reported gap for agy); `CODEX=WARN` means
-  split/chunk the change. Never accept a truncated-diff pass -> BLOCK-equivalent.
+- **Oversized diff** - run `$RG/diff-size.sh <base> HEAD` (co-located with the lock/watchdog scripts)
+  BEFORE dispatch instead of eyeballing three different thresholds: `BYTES=ERROR` (bad ref / failed diff)
+  is a human stop; `AGY=OVERSIZE` / `DEEPSEEK=OVERSIZE` is that tool's honest oversize gap (a human stop
+  for a blocker, a reported gap for agy); `CODEX=WARN` means split/chunk the change. Never accept a
+  truncated-diff pass -> BLOCK-equivalent.
 - **Dropped resume** - see **Re-gate**: fall back to fresh, never double-retry.
 
 ## Reporting (stop for a human)
