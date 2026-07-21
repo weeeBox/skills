@@ -24,11 +24,15 @@ is_guarded() {
     requirements*.txt|*/requirements*.txt)             return 0 ;;  # deps (mock the world)
     verify.sh|*/verify.sh|run_all.sh|*/run_all.sh)     return 0 ;;  # common verify-script names
     .dev-loop.conf|*/.dev-loop.conf)                   return 0 ;;  # suite/base/classifier selector
-    # Add your own verification substrate here — anything a self-driving session could edit to force a
-    # green run: the suite selector (.dev-loop.conf, guarded above), an in-repo risk/policy classifier
-    # if you vendor one (LANDER_RISK_CLASSIFY target), a coverage gate, etc.: pattern) return 0 ;;
-    *)                                                 return 1 ;;
   esac
+  # Repo-specific substrate a self-driving session could edit to force a green run (an in-repo
+  # risk/policy classifier, a coverage gate, etc.) that the built-in patterns above don't cover: set
+  # TAMPER_EXTRA_SUBSTR in .dev-loop.conf to a space-separated list of substrings to additionally guard.
+  local p
+  for p in ${TAMPER_EXTRA_SUBSTR:-}; do
+    case "$1" in *"$p"*) return 0 ;; esac
+  done
+  return 1
 }
 
 tamper_check() {
@@ -77,6 +81,10 @@ selftest() {
   if tamper_check __definitely_no_such_ref__ HEAD 2>/dev/null; then
     echo "FAIL: bad-base tamper_check returned clean (should fail closed)"; fails=$((fails+1))
   fi
+  # TAMPER_EXTRA_SUBSTR: repo-specific substrate guard, additive to the built-ins above
+  local TAMPER_EXTRA_SUBSTR="src/cuj_loop/classify.py"
+  is_guarded "src/cuj_loop/classify.py" || { echo "FAIL: expected GUARDED via TAMPER_EXTRA_SUBSTR"; fails=$((fails+1)); }
+  is_guarded "src/other/file.py" && { echo "FAIL: TAMPER_EXTRA_SUBSTR over-matched an unrelated path"; fails=$((fails+1)); }
   if ((fails)); then echo "tamper-check selftest: $fails FAILED"; return 1; fi
   echo "tamper-check selftest: OK"; return 0
 }

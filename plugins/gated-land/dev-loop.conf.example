@@ -22,7 +22,13 @@ BASE_BRANCH="${BASE_BRANCH:-main}"
 # $CLAUDE_PLUGIN_ROOT is set by Claude Code to the gated-land plugin root at runtime.
 export LANDER_SUITE_CMD="$TEST_COMMAND"
 export LANDER_RISK_CLASSIFY="$CLAUDE_PLUGIN_ROOT/engine/risk_classify.py"
-# The generic risk classifier has no imports, so no PYTHONPATH is needed.
+# The generic risk classifier has no imports, so no PYTHONPATH is needed. If you point
+# LANDER_RISK_CLASSIFY at your own in-repo classifier instead (e.g. one that vendors its own
+# engine for a safety-critical gate with no external runtime dependency), and it imports your
+# own modules, set LANDER_RISK_PYTHONPATH so those imports resolve from inside the throwaway
+# integration worktree lander.sh builds in (a relative path there would NOT resolve):
+# export LANDER_RISK_CLASSIFY="$(git rev-parse --show-toplevel)/path/to/your_risk_classify.py"
+# export LANDER_RISK_PYTHONPATH="$(git rev-parse --show-toplevel)/src"
 
 # Interpreter for the risk classifier. Defaults inside lander.sh to .venv/bin/python then
 # python3. Override if your project uses a different interpreter:
@@ -33,8 +39,18 @@ export LANDER_RISK_CLASSIFY="$CLAUDE_PLUGIN_ROOT/engine/risk_classify.py"
 # export LANDER_PUSH=1
 # Seconds before a stale lander lock is reclaimed (default in lander.sh):
 # export LANDER_LOCK_STALE=900
+# Extra pathspecs for target_clean to ignore, beyond .claude/state (e.g. a tracked generated
+# dir that's legitimately dirty between runs, not disposable tool noise):
+# export LANDER_STATUS_EXCLUDES="graphify-out"
 
 # --- risk policy (edit engine/risk_classify.py DEFAULT_* for durable policy) ------------
 # You can also TIGHTEN the auto-land risk gate per-repo here (append-only / tighten-only;
 # these are passed to risk_classify.py). Never widens the gate.
 # export LANDER_RISK_EXTRA_FLAGS="--deny 'infra/**' --deny-substr 'tenant' --max-files 10"
+
+# --- gate-loop test-tamper guard (optional) ---------------------------------------------
+# Space-separated substrings of extra paths the tamper guard should treat as verification
+# substrate, beyond its built-ins (tests/, conftest.py, pytest config, requirements*, verify
+# scripts, .dev-loop.conf) - e.g. an in-repo risk/policy classifier a self-driving session
+# could edit to force a green run:
+# export TAMPER_EXTRA_SUBSTR="src/cuj_loop/classify.py src/some_other/policy_gate.py"
