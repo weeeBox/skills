@@ -266,5 +266,28 @@ Always end here, clean or not:
 - **Pass = codex `SHIP` AND deepseek `SHIP` (or deepseek skipped).** If BOTH blockers are clean: ask
   whether to proceed/merge. If EITHER is BLOCK / SHIP-WITH-CHANGES / (deepseek) ERROR/OVERSIZE: report
   which blocker(s) held and ask how to proceed (fix then re-invoke, or an explicit logged override).
+- **Gate-round log (observation-only; NEVER blocks the gate).** After the verdicts are known, emit one
+  `gate_log.py verdict` per reviewer so a retrospective can compute reviewer precision + blocker
+  agreement + plan/diff value (these were previously unmeasurable). The shared round id comes from the
+  lock (minted at `acquire`); `$STAGE` is `plan` or `diff`; `$FINDINGS_JSON` is a JSON list of
+  `{"id":..,"category":"bug|security|correctness|race|fail-open|provenance|money|style|design-nit|false-positive"}`
+  from your triage of that reviewer's findings (this category is what the severity-gated re-gate rule
+  consumes). Fail-open (`|| true`): logging must never fail a gate.
+
+  ```bash
+  RID="$("$RG/review-gate-lock.sh" round-id)"; WT="$(git rev-parse --show-toplevel)"
+  DH="$(sed -n 's/^diff_hash=//p' "$(git rev-parse --absolute-git-dir)/review-gate.lock.d/state")"
+  # $CODEX_VERDICT/$DEEPSEEK_VERDICT/$AGY_VERDICT = the SHIP/BLOCK/... you parsed above.
+  for rv in "codex:$CODEX_VERDICT:${CODEX_JOB:-codex}" \
+            "deepseek:$DEEPSEEK_VERDICT:deepseek" \
+            "agy:$AGY_VERDICT:${AGY_JOB:-agy}"; do
+    name="${rv%%:*}"; rest="${rv#*:}"; verdict="${rest%%:*}"; job="${rest##*:}"
+    [ -n "$verdict" ] || continue
+    "$WT/scripts/gate_log.py" verdict --round-id "$RID" --reviewer "$name" \
+      --verdict "$verdict" --repo "$(basename "$WT")" --worktree "$WT" \
+      --base-sha "$base" --diff-hash "$DH" --job-id "$job" --stage "$STAGE" \
+      --findings-json "${FINDINGS_JSON:-[]}" >/dev/null 2>&1 || true
+  done
+  ```
 - `review-gate-lock.sh release`.
 - Do NOT: fix a finding, resume-to-verify, commit, merge, push, ExitWorktree, or auto-loop. That is v2.

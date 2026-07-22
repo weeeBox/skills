@@ -27,9 +27,9 @@ _paths(){
   owner="${CLAUDE_SESSION_ID:-}"
 }
 
-_write_state(){ # atomic: owner diff_hash codex_job agy_job round
-  printf 'owner=%s\ndiff_hash=%s\ncodex_job=%s\nagy_job=%s\nround=%s\nts=%s\n' \
-    "$1" "$2" "$3" "$4" "$5" "$(date +%s)" > "$state.tmp" && mv "$state.tmp" "$state"
+_write_state(){ # atomic: owner diff_hash codex_job agy_job round round_id
+  printf 'owner=%s\ndiff_hash=%s\ncodex_job=%s\nagy_job=%s\nround=%s\nround_id=%s\nts=%s\n' \
+    "$1" "$2" "$3" "$4" "$5" "$6" "$(date +%s)" > "$state.tmp" && mv "$state.tmp" "$state"
 }
 
 cmd_acquire(){
@@ -39,7 +39,8 @@ cmd_acquire(){
   [ "$rc" -eq 0 ] || { echo "scope command failed (rc=$rc): $scope_cmd" >&2; exit 4; }
   local dh; dh=$(printf '%s' "$out" | git hash-object --stdin)
   if mkdir "$lockdir" 2>/dev/null; then
-    _write_state "$owner" "$dh" "" "" ""      # bootstrap immediately (no empty-state window)
+    local rid; rid="$(python3 -c 'import uuid;print(uuid.uuid4().hex)' 2>/dev/null || uuidgen 2>/dev/null | tr -d - | tr 'A-Z' 'a-z')"
+    _write_state "$owner" "$dh" "" "" "" "$rid"   # bootstrap immediately (no empty-state window)
     echo "ACQUIRED"; return 0
   fi
   # lockdir exists -> decide. mtime target falls back to lockdir while state not yet written.
@@ -71,8 +72,8 @@ cmd_record(){
   local so=""; [ -f "$state" ] && so=$(val owner "$state")   # owner-guarded (codex): only the owner records,
   [ -z "$so" ] || [ "$so" = "$owner" ] || {                  # else a non-owner could hijack the owner field
     echo "record: lock owned by '$so', not me ('$owner') - refusing" >&2; return 1; }
-  local sdh; sdh=$(val diff_hash "$state")       # PRESERVE bootstrap hash, never recompute
-  _write_state "$owner" "$sdh" "$c" "$a" "$r"
+  local sdh srid; sdh=$(val diff_hash "$state"); srid=$(val round_id "$state")  # PRESERVE hash + round_id
+  _write_state "$owner" "$sdh" "$c" "$a" "$r" "$srid"
 }
 
 cmd_heartbeat(){ _paths; [ -f "$state" ] && touch "$state" || { [ -d "$lockdir" ] && touch "$lockdir"; }; }
@@ -173,15 +174,28 @@ if [ "${1:-}" = "--selftest" ]; then
   run CLAUDE_SESSION_ID=A "$S" release
   echo "PASS: record is owner-guarded (non-owner cannot hijack the owner field)"
 
+  # 15. round-id: acquire mints a 32-hex round_id; record preserves it (shared across re-gate rounds)
+  run CLAUDE_SESSION_ID=A "$S" acquire "$SC" >/dev/null
+  rid=$(run CLAUDE_SESSION_ID=A "$S" round-id)
+  [ "${#rid}" -eq 32 ] || fail "round-id not 32-hex ($rid)"
+  run CLAUDE_SESSION_ID=A "$S" record cx ay 1 >/dev/null
+  rid2=$(run CLAUDE_SESSION_ID=A "$S" round-id)
+  [ "$rid" = "$rid2" ] || fail "record did not preserve round_id ($rid != $rid2)"
+  run CLAUDE_SESSION_ID=A "$S" release
+  echo "PASS: round-id minted at acquire + preserved across record"
+
   echo "ALL PASS"; exit 0
 fi
 
 # ---------------- dispatch ----------------
+cmd_round_id(){ _paths; val round_id "$state"; }   # shared gate-round uuid, read back by the gate_log verdict emit (Task B)
+
 sub="${1:-}"; shift || true
 case "$sub" in
   acquire)   cmd_acquire "$@" ;;
   record)    cmd_record "$@" ;;
+  round-id)  cmd_round_id ;;
   heartbeat) cmd_heartbeat ;;
   release)   cmd_release ;;
-  *) echo "usage: review-gate-lock.sh acquire|record|heartbeat|release|--selftest" >&2; exit 2 ;;
+  *) echo "usage: review-gate-lock.sh acquire|record|round-id|heartbeat|release|--selftest" >&2; exit 2 ;;
 esac

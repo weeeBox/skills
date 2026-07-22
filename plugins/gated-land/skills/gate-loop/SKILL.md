@@ -88,9 +88,22 @@ not-configured deepseek is a fail-closed human stop, never a codex-only pass.
    - **codex SHIP AND deepseek SHIP** + tamper-clean + suite green → **DONE.**
      Log `gateloop-pass` to verify.log. Report the green `session/<slug>` branch and **STOP before
      integration** (Stage 1 hands off to the lander / `/ship`, it does not merge).
-   - **BLOCK from either blocker** (or `SHIP-WITH-CHANGES` from either, which is not-a-pass) → fix the
-     root cause of the findings, re-run the affected suite, and start the next round. If a fix must
-     touch a test/config/deps file, that is a Step-4 tamper stop, not an autonomous fix.
+   - **BLOCK from either blocker** (or `SHIP-WITH-CHANGES` from either, which is not-a-pass) →
+     **severity-gate the re-gate** so a nitpick loop can't blow the round budget. Classify this round's
+     findings: a repo may wire `$REGATE_DECISION_CMD` in `.dev-loop.conf` to decide from the diff's risk
+     class + each finding's severity (it prints `regate` or `batch`); **if unset, default to a full
+     re-gate** - today's behavior, fail-safe.
+     - **full re-gate** (any blocking-severity finding - bug/security/correctness/race/fail-open/
+       provenance/money - or a risk-sensitive diff) → fix the **root cause of the whole defect class**
+       (enumerate siblings, add one class regression), re-run the affected suite, and start the next
+       round. If a fix must touch a test/config/deps file, that is a Step-4 tamper stop, not an
+       autonomous fix.
+     - **batch** (all findings are style/design nits on a low-risk diff) → apply **all** the nit fixes
+       in ONE commit, then run ONE **confirmation** gate (codex + deepseek on the batched commit).
+       Converged if it SHIPs or returns only nits; a **new blocking finding sends it back to full
+       re-gate** - batching is never an escape hatch.
+     - **Guardrails:** a BLOCK is never merged over (codex AND deepseek must still SHIP the final
+       commit); a risk-sensitive diff never batches; batch+confirm counts toward the 3-round cap.
    - **deepseek `ERROR`/`OVERSIZE`** (missing key at call time, API failure, diff too large) → a human
      stop, never a loop and never a pass: log `gateloop-capout` and hand off.
 
