@@ -286,7 +286,7 @@ Always end here, clean or not:
     [ -n "$verdict" ] || continue
     python3 "$WT/scripts/gate_log.py" verdict --round-id "$RID" --reviewer "$name" \
       --verdict "$verdict" --repo "$(basename "$WT")" --worktree "$WT" \
-      --base-sha "$base" --diff-hash "$DH" --job-id "$job" --stage "$STAGE" \
+      --base-sha "$base" --diff-hash "$DH" --job-id "$job" --stage "${STAGE:-diff}" \
       --findings-json "${findings:-[]}" >/dev/null 2>&1 || true
   done <<EOF
 codex|$CODEX_VERDICT|${CODEX_JOB:-codex}|${CODEX_FINDINGS:-[]}
