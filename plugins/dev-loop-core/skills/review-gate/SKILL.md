@@ -283,7 +283,7 @@ Always end here, clean or not:
             "agy:$AGY_VERDICT:${AGY_JOB:-agy}"; do
     name="${rv%%:*}"; rest="${rv#*:}"; verdict="${rest%%:*}"; job="${rest##*:}"
     [ -n "$verdict" ] || continue
-    "$WT/scripts/gate_log.py" verdict --round-id "$RID" --reviewer "$name" \
+    python3 "$WT/scripts/gate_log.py" verdict --round-id "$RID" --reviewer "$name" \
       --verdict "$verdict" --repo "$(basename "$WT")" --worktree "$WT" \
       --base-sha "$base" --diff-hash "$DH" --job-id "$job" --stage "$STAGE" \
       --findings-json "${FINDINGS_JSON:-[]}" >/dev/null 2>&1 || true
