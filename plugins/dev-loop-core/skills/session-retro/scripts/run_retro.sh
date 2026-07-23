@@ -6,7 +6,8 @@
 set -u
 
 BASE="$HOME/.claude/session-reports"
-SKILL="$HOME/.claude/skills/session-retro"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SKILL="${SKILL:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 CLAUDE="${CLAUDE:-$(command -v claude || echo "$HOME/.brew/bin/claude")}"
 PY="${PY:-/usr/bin/python3}"   # overridable so failure paths can be tested cheaply
 LOCK="$BASE/.lock"
