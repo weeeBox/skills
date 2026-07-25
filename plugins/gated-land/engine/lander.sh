@@ -129,18 +129,16 @@ cmd_prepare() {
     "$candidate" "$target" "$base" "$integ" "$wt" "$risk"
 }
 
-# Re-read the reviewers' OWN artifacts; pass ONLY on a clean codex SHIP AND deepseek SHIP. The verdict
-# is the LAST line beginning 'VERDICT:' (CR stripped for CRLF artifacts); its value must be EXACTLY one
-# verdict token (anchored + exact-match), so 'VERDICT: BLOCK' + later prose containing SHIP/SPACESHIP
-# fails closed. Missing file / unparseable JSON / absent verdict line -> non-zero (fail closed).
-_verdict_ok() { # <codex_result_json> <deepseek_verdict_file>
-  local cres="$1" dsf="$2" craw cverd dverd
-  [ -f "$cres" ] && [ -f "$dsf" ] || return 1
+# Re-read codex's OWN artifact; pass ONLY on a clean codex SHIP. Verdict = the LAST line beginning
+# 'VERDICT:' (CR stripped for CRLF artifacts); its value must be EXACTLY one verdict token (anchored +
+# exact-match), so 'VERDICT: BLOCK' + later prose containing SHIP/SPACESHIP fails closed. Missing file /
+# unparseable JSON / absent verdict line -> non-zero (fail closed).
+_verdict_ok() { # <codex_result_json>
+  local cres="$1" craw cverd
+  [ -f "$cres" ] || return 1
   craw="$("$PY" -c 'import json,sys,os;print(json.load(open(os.path.expanduser(sys.argv[1]),encoding="utf-8",errors="replace"))["result"].get("rawOutput",""))' "$cres" 2>/dev/null)" || return 1
   cverd="$(printf '%s\n' "$craw" | tr -d '\r' | grep -E '^VERDICT:' | tail -1 | sed 's/^VERDICT:[[:space:]]*//' | grep -oE '^(SHIP-WITH-CHANGES|BLOCK|SHIP)$')"
   [ "$cverd" = SHIP ] || return 1
-  dverd="$(tr -d '\r' < "$dsf" 2>/dev/null | grep -E '^VERDICT:' | tail -1 | sed 's/^VERDICT:[[:space:]]*//' | grep -oE '^(SHIP-WITH-CHANGES|BLOCK|OVERSIZE|ERROR|SHIP)$')"
-  [ "$dverd" = SHIP ] || return 1
   return 0
 }
 
@@ -169,11 +167,10 @@ cmd_commit() {
       die "RISK=$risk — auto-land refused; a human reviews and re-runs with LANDER_HUMAN_OVERRIDE=1" 7; }
     [ -f "$rec" ] || { log "land-verdict-block" "$candidate no-record"; \
       die "no verdict record for integration $integ — gate did not record a pass; refusing to land" 8; }
-    local cres dsv
+    local cres
     cres="$(sed -n 's/^CODEX_RESULT=//p'    "$rec" | head -1)"
-    dsv="$(sed  -n 's/^DEEPSEEK_VERDICT=//p' "$rec" | head -1)"
-    _verdict_ok "$cres" "$dsv" || { log "land-verdict-block" "$candidate not-SHIP"; \
-      die "recorded codex/deepseek verdict is not a clean SHIP for $integ — refusing to land" 8; }
+    _verdict_ok "$cres" || { log "land-verdict-block" "$candidate not-SHIP"; \
+      die "recorded codex verdict is not a clean SHIP for $integ — refusing to land" 8; }
   fi
 
   local now; now="$(git rev-parse --verify "refs/heads/$target^{commit}")"
@@ -385,22 +382,21 @@ git tag -d main >/dev/null 2>&1 || true
 # ---- Task 1: risk + integ-bound reviewer-verdict interlock -------------------------------------
 # artifacts live under .claude/state (excluded by target_clean) so they don't dirty the target.
 mk_codex(){ mkdir -p "$D/.claude/state"; printf '{"result":{"rawOutput":"review body\\nVERDICT: %s\\n"}}\n' "$1" > "$D/.claude/state/codex_$2.json"; echo "$D/.claude/state/codex_$2.json"; }
-mk_ds(){ mkdir -p "$D/.claude/state"; printf 'notes\nVERDICT: %s\n' "$1" > "$D/.claude/state/ds_$2.txt"; echo "$D/.claude/state/ds_$2.txt"; }
-mk_rec(){ local rd="$D/.claude/state/land-verdicts"; mkdir -p "$rd"; printf 'CODEX_RESULT=%s\nDEEPSEEK_VERDICT=%s\n' "$2" "$3" > "$rd/$1.rec"; }
+mk_rec(){ local rd="$D/.claude/state/land-verdicts"; mkdir -p "$rd"; printf 'CODEX_RESULT=%s\n' "$2" > "$rd/$1.rec"; }
 
-# 14. LOW + codex SHIP + deepseek SHIP + matching record -> commits, record cleaned
+# 14. LOW + codex SHIP + record -> commits, record cleaned
 git checkout -q -b session/ok main; echo "print('ok14')">>src/a.py; git commit -qam ok14; git checkout -q main
 out=$("$SELF" prepare session/ok main); eval "$out"
-mk_rec "$INTEGRATION" "$(mk_codex SHIP ok)" "$(mk_ds SHIP ok)"
+mk_rec "$INTEGRATION" "$(mk_codex SHIP ok)"
 rc=0; "$SELF" commit session/ok main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
-check "interlock: LOW+SHIP+SHIP commits" "[ $rc -eq 0 ]"
+check "interlock: LOW+SHIP commits" "[ $rc -eq 0 ]"
 check "interlock: main advanced" "[ \"$(git rev-parse main)\" = '$INTEGRATION' ]"
 check "interlock: .rec cleaned on success" "[ ! -f \"$D/.claude/state/land-verdicts/$INTEGRATION.rec\" ]"
 
 # 15. codex BLOCK -> exit 8, target untouched
 git checkout -q -b session/blk main; echo "print('blk')">>src/a.py; git commit -qam blk; git checkout -q main
 before15=$(git rev-parse main); out=$("$SELF" prepare session/blk main); eval "$out"
-mk_rec "$INTEGRATION" "$(mk_codex BLOCK blk)" "$(mk_ds SHIP blk)"
+mk_rec "$INTEGRATION" "$(mk_codex BLOCK blk)"
 rc=0; "$SELF" commit session/blk main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
 check "interlock: codex BLOCK refused exit 8" "[ $rc -eq 8 ]"
 check "interlock: target untouched on BLOCK" "[ \"$(git rev-parse main)\" = \"$before15\" ]"
@@ -410,7 +406,7 @@ check "interlock: target untouched on BLOCK" "[ \"$(git rev-parse main)\" = \"$b
 git checkout -q -b session/fo main; echo "print('fo')">>src/a.py; git commit -qam fo; git checkout -q main
 out=$("$SELF" prepare session/fo main); eval "$out"; mkdir -p "$D/.claude/state"
 printf '{"result":{"rawOutput":"VERDICT: BLOCK\\nafter fixing we could SHIP the SPACESHIP\\n"}}\n' > "$D/.claude/state/codex_fo.json"
-mk_rec "$INTEGRATION" "$D/.claude/state/codex_fo.json" "$(mk_ds SHIP fo)"
+mk_rec "$INTEGRATION" "$D/.claude/state/codex_fo.json"
 rc=0; "$SELF" commit session/fo main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
 check "interlock: BLOCK-then-SHIP-prose refused (anchored)" "[ $rc -eq 8 ]"
 "$SELF" abort "$WORKTREE" cleanup >/dev/null 2>&1 || true
@@ -419,23 +415,22 @@ check "interlock: BLOCK-then-SHIP-prose refused (anchored)" "[ $rc -eq 8 ]"
 git checkout -q -b session/crlf main; echo "print('crlf')">>src/a.py; git commit -qam crlf; git checkout -q main
 out=$("$SELF" prepare session/crlf main); eval "$out"; mkdir -p "$D/.claude/state"
 printf '{"result":{"rawOutput":"body\\r\\nVERDICT: SHIP\\r\\n"}}\n' > "$D/.claude/state/codex_crlf.json"
-printf 'notes\r\nVERDICT: SHIP\r\n' > "$D/.claude/state/ds_crlf.txt"
-mk_rec "$INTEGRATION" "$D/.claude/state/codex_crlf.json" "$D/.claude/state/ds_crlf.txt"
+mk_rec "$INTEGRATION" "$D/.claude/state/codex_crlf.json"
 rc=0; "$SELF" commit session/crlf main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
 check "interlock: CRLF verdict parses -> commits" "[ $rc -eq 0 ]"
 
-# 16. deepseek SHIP-WITH-CHANGES -> exit 8
+# 16. codex SHIP-WITH-CHANGES -> exit 8
 git checkout -q -b session/swc main; echo "print('swc')">>src/a.py; git commit -qam swc; git checkout -q main
 out=$("$SELF" prepare session/swc main); eval "$out"
-mk_rec "$INTEGRATION" "$(mk_codex SHIP swc)" "$(mk_ds SHIP-WITH-CHANGES swc)"
+mk_rec "$INTEGRATION" "$(mk_codex SHIP-WITH-CHANGES swc)"
 rc=0; "$SELF" commit session/swc main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
-check "interlock: deepseek SWC refused exit 8" "[ $rc -eq 8 ]"
+check "interlock: codex SWC refused exit 8" "[ $rc -eq 8 ]"
 "$SELF" abort "$WORKTREE" cleanup >/dev/null 2>&1 || true
 
 # 17. wrong-SHA record does NOT authorize this integ -> exit 8
 git checkout -q -b session/mv main; echo "print('mv')">>src/a.py; git commit -qam mv; git checkout -q main
 out=$("$SELF" prepare session/mv main); eval "$out"
-mk_rec deadbeefdeadbeefdeadbeefdeadbeefdeadbeef "$(mk_codex SHIP mv)" "$(mk_ds SHIP mv)"
+mk_rec deadbeefdeadbeefdeadbeefdeadbeefdeadbeef "$(mk_codex SHIP mv)"
 rc=0; "$SELF" commit session/mv main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
 check "interlock: wrong-SHA record -> exit 8" "[ $rc -eq 8 ]"
 "$SELF" abort "$WORKTREE" cleanup >/dev/null 2>&1 || true
@@ -447,10 +442,10 @@ rc=0; LANDER_HUMAN_OVERRIDE=1 "$SELF" commit session/bogus main "$BASE" 00000000
 check "interlock: bogus integ refused exit 8 (even override)" "[ $rc -eq 8 ]"
 "$SELF" abort "$WORKTREE" cleanup >/dev/null 2>&1 || true
 
-# 18. HIGH risk + SHIP/SHIP + record, no override -> exit 7 (refused commit's trap removes the worktree)
+# 18. HIGH risk + SHIP + record, no override -> exit 7 (refused commit's trap removes the worktree)
 git checkout -q -b session/hi main; mkdir -p src/secrets; echo x=1>src/secrets/k.py; git add src/secrets/k.py; git commit -qam hi; git checkout -q main
 out=$("$SELF" prepare session/hi main); eval "$out"
-mk_rec "$INTEGRATION" "$(mk_codex SHIP hi)" "$(mk_ds SHIP hi)"
+mk_rec "$INTEGRATION" "$(mk_codex SHIP hi)"
 rc=0; "$SELF" commit session/hi main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
 check "interlock: HIGH without override refused exit 7" "[ $rc -eq 7 ]"
 
