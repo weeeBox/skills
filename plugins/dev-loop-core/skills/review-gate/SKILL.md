@@ -35,19 +35,23 @@ Review a design/plan doc (or a staged change) before any code is written.
 2. `review-gate-lock.sh acquire "git diff --cached -- <doc>"` and branch on the printed verdict
    (see **Concurrency**). On `ACQUIRED`, dispatch; on `RECONNECT`, poll the printed jobs.
 3. Dispatch **codex** and **agy** in parallel (both fire-and-forget background jobs):
-   - **codex** via the `codex:codex-rescue` agent (or `/codex:adversarial-review`). Prompt: point at
-     the exact file; demand the two integration-bug classes reviewers routinely miss - (1) **wiring/
-     dead-code** (a module with correct logic that is never imported/registered/wired -> a shipped
-     no-op), (2) **concurrency-path routing** (a new lock/queue/idempotency layer that one caller
-     still bypasses); ask for a verdict line **SHIP / SHIP-WITH-CHANGES / BLOCK** with findings tied
-     to `file:line`.
+   - **codex** via the `codex:codex-rescue` agent (or `/codex:adversarial-review`). Prompt: open with:
+     **"Your context is read-only: Bash and Skill are DISABLED. The diff, base ref, and branch commit
+     list are already inlined above - do not call Bash to reconstruct them (`git`, `ls`, `cat`, `find`
+     all fail) and do not `Read`/probe for suite-result artifacts (`.rc`/scratchpad files); treat suite
+     pass/fail as given by the payload, or flag 'suite result not provided' as a finding. Use
+     Read/Glob/Grep only."** Then point at the exact file; demand the two integration-bug classes
+     reviewers routinely miss - (1) **wiring/dead-code** (a module with correct logic that is never
+     imported/registered/wired -> a shipped no-op), (2) **concurrency-path routing** (a new
+     lock/queue/idempotency layer that one caller still bypasses); ask for a verdict line **SHIP /
+     SHIP-WITH-CHANGES / BLOCK** with findings tied to `file:line`.
    - **agy** by a DIRECT Bash call to the companion - NOT the `agy:agy-rescue` subagent, which is a
      contractual `task`-only forwarder that refuses `adversarial-review` (it may run once then refuse
      mid-gate; do not depend on it). Resolve the wrapper version-robustly and invoke `adversarial-review`
      (its built-in adversarial prompt; agy verdict vocab is proceed/revisit/rethink - advisory only):
      ```
      AGY=$(ls ~/.claude/plugins/cache/agy-plugin-cc/agy/*/scripts/agy-companion.mjs | sort -V | tail -1)
-     node "$AGY" adversarial-review "focus: wiring/dead-code + concurrency-path routing"
+     node "$AGY" adversarial-review "Your context is read-only: Bash and Skill are DISABLED. The diff, base ref, and branch commit list are already inlined above - do not call Bash to reconstruct them (git, ls, cat, find all fail) and do not Read/probe for suite-result artifacts (.rc/scratchpad files); treat suite pass/fail as given by the payload, or flag 'suite result not provided' as a finding. Use Read/Glob/Grep only. Focus: wiring/dead-code + concurrency-path routing."
      ```
      With no `--base` it reviews `git diff HEAD`, falling back to `git diff --cached` - so a staged plan
      is picked up. It prints `Job ID:` and `Get results: /agy:result <id>` (NOT a `Log:` line - that is
@@ -82,7 +86,7 @@ Review a design/plan doc (or a staged change) before any code is written.
      retros P1/P2). Passing it through the companion's existing free-form focus arg keeps the guidance in
      THIS skill (durable) instead of the vendored, reinstall-ephemeral prompt template:
      ```
-     RGSCOPE="SCOPE DISCIPLINE: Bash, git, and Skill are DISABLED - never run git/ls/cat/find/rg and never invoke Skill (incl. review-gate) to orchestrate. The full diff is inlined below and its file paths are AUTHORITATIVE - resolve every path against them, never guess a sibling's src/<subdir>/ from memory (e.g. src/engine/ when the real path is src/app/); on a 404, Glob the basename ONCE (never re-fire the same path at a new offset). If the diff touches only docs/designs/** or docs/plans/**, this is a DESIGN-only gate - files it names may not exist yet, so Glob to confirm before Reading a named source/artifact; never Read a design-referenced file blind. Your target worktree can be reaped mid-review: on the FIRST 'Directory does not exist', an rg/posix_spawn ENOENT, or a File-does-not-exist on a path that read fine seconds earlier, STOP all filesystem probing (the tree is gone, no retry fixes it) and complete the verdict from the inlined diff plus whatever you already read. List a directory with Glob dir/**, never ls, and never Read a directory."
+     RGSCOPE="SCOPE DISCIPLINE: Your context is read-only: Bash and Skill are DISABLED. The diff, base ref, and branch commit list are already inlined above - do not call Bash to reconstruct them (git, ls, cat, find all fail) and do not Read/probe for suite-result artifacts (.rc/scratchpad files); treat suite pass/fail as given by the payload, or flag 'suite result not provided' as a finding. Use Read/Glob/Grep only. Never run git/ls/cat/find/rg and never invoke Skill (incl. review-gate) to orchestrate. The full diff is inlined below and its file paths are AUTHORITATIVE - resolve every path against them, never guess a sibling's src/<subdir>/ from memory (e.g. src/engine/ when the real path is src/app/); on a 404, Glob the basename ONCE (never re-fire the same path at a new offset). If the diff touches only docs/designs/** or docs/plans/**, this is a DESIGN-only gate - files it names may not exist yet, so Glob to confirm before Reading a named source/artifact; never Read a design-referenced file blind. Your target worktree can be reaped mid-review: on the FIRST 'Directory does not exist', an rg/posix_spawn ENOENT, or a File-does-not-exist on a path that read fine seconds earlier, STOP all filesystem probing (the tree is gone, no retry fixes it) and complete the verdict from the inlined diff plus whatever you already read. List a directory with Glob dir/**, never ls, and never Read a directory."
      ```
      The verdict is the **last `VERDICT:` line** of `$VF` (the companion fails closed: any error/missing
      key/oversize -> `VERDICT: ERROR`, never a silent pass). deepseek reviews as a read-only agent that
@@ -98,10 +102,17 @@ Review a branch diff before merge (the path `/ship` delegates to). Same as plan 
 
 - Resolve `<base>` (usually `main`; ask if ambiguous). Confirm `git diff <base>...HEAD` is non-empty -
   if empty, STOP and report "nothing to ship" (never a clean verdict on empty input).
-- **codex:** `/codex:adversarial-review --base <base>` (scopes to the whole branch diff).
+- **codex:** `/codex:adversarial-review --base <base>` (scopes to the whole branch diff). Include the
+  same read-only preamble from the plan-stage codex prompt so the reviewer does not attempt disabled
+  Bash/Skill calls or probe suite-result artifacts.
 - **agy:** the companion `adversarial-review` NOW supports `--base`, so it reviews the SAME range as
   codex - dispatch it by the same direct Bash call as the plan stage (never the `agy:agy-rescue`
-  subagent), just add the base: `node "$AGY" adversarial-review --base <base>` (runs
+  subagent), just add the base and the same read-only preamble/focus text: `node "$AGY"
+  adversarial-review --base <base> "Your context is read-only: Bash and Skill are DISABLED. The diff,
+  base ref, and branch commit list are already inlined above - do not call Bash to reconstruct them
+  (git, ls, cat, find all fail) and do not Read/probe for suite-result artifacts (.rc/scratchpad
+  files); treat suite pass/fail as given by the payload, or flag 'suite result not provided' as a
+  finding. Use Read/Glob/Grep only. Focus: wiring/dead-code + concurrency-path routing."` (runs
   `git diff <base>...HEAD`). Caveat: the companion hard-rejects a diff >200 KB (`process.exit(1)`); on
   an oversized diff report the agy gap **honestly as a tooling limitation, never as an agy pass**.
 - **deepseek:** same readiness check and background dispatch as the plan stage, just add the base (and
