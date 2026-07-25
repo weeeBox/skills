@@ -1,6 +1,6 @@
 ---
 name: ship
-description: A (v1, non-autonomous) ship gate for a repo - run the full test suite, then run the codex+deepseek (blocking) / agy (advisory) diff-stage review gate once, then stop for a human merge decision. Does not auto-fix, auto-re-gate, or auto-merge (that is v2, not yet built). Use when the user says "ship it", "ship this", invokes /ship, or asks to run the ship gate before merging a worktree's work to main. Isolates the expensive LLM review to this one explicit boundary - never run it on every turn.
+description: A (v1, non-autonomous) ship gate for a repo - run the full test suite, then run the codex (blocking) / agy (advisory) diff-stage review gate once, then stop for a human merge decision. Does not auto-fix, auto-re-gate, or auto-merge (that is v2, not yet built). Use when the user says "ship it", "ship this", invokes /ship, or asks to run the ship gate before merging a worktree's work to main. Isolates the expensive LLM review to this one explicit boundary - never run it on every turn.
 ---
 
 > **Configure first (opinionated pipeline).** This skill assumes a repo configured via `.dev-loop.conf` at its root (copy `$CLAUDE_PLUGIN_ROOT/dev-loop.conf.example` and edit). Source it so `$TEST_COMMAND`, `$BASE_BRANCH`, and the vendored-lander wiring are set. Requires the `dev-loop-core` plugin (the `review-gate` skill it drives). See the repo README.
@@ -32,7 +32,6 @@ Follow the `review-gate` skill's **diff stage** dispatch mechanics exactly (it i
 
 - **Scope the review to the branch, not the ambient working-tree diff.** `/ship` fires at a merge boundary where a common convention is per-task commits, so the working tree is typically already clean - a review that just looks at "the worktree diff" silently reviews nothing in that normal case. Resolve the base ref (`main`, or ask the human if it is ambiguous) and confirm `git diff <base>...HEAD` is non-empty before dispatching. If it is empty, **STOP** and tell the human there is nothing to ship rather than reporting a false-clean gate.
   - **Codex** (blocking): launch `/codex:adversarial-review --base <base>` (it supports scoping to a branch diff against a base ref directly).
-  - **deepseek** (second blocking gate): dispatch it through **review-gate's diff-stage recipe** with `--base <base>` - review-gate owns the companion path (and its `2>/dev/null` + `[ -n "$DS" ]` guards), the `$VF` verdict file, and the main-checkout `.env` load (a worktree has no `./.env`); do NOT duplicate them here. Verdict = the recipe's last `VERDICT:` line. A genuine not-ready / `ERROR` / `OVERSIZE` is a **human stop** (fail closed), never a silent skip - deepseek is a required blocker here (setup: the README).
   - **agy** (advisory): `/agy:adversarial-review` has no branch/base option - it only ever reviews the current uncommitted `git diff`/staged diff, so at ship time (clean tree) it will report "nothing to review." That is a known tooling gap, not a real advisory pass - do not treat it as agy having reviewed and found nothing. Report the gap plainly in Step 3 rather than presenting agy's empty result as a clean verdict.
 - Arm the stuck-worker watchdog in the same breath as dispatch (see review-gate's "Stuck workers" section) - never wait passively.
 - Collect whatever verdict comes back - clean or with findings. **Do not fix anything, do not resume the thread, do not re-run the review in this step or this skill invocation.** Reacting to findings is Step 3's job, and Step 3 hands that decision to the human, not to this skill.
@@ -41,7 +40,7 @@ Follow the `review-gate` skill's **diff stage** dispatch mechanics exactly (it i
 
 Whether codex came back clean or with findings, this skill stops here every time - a red review is not a reason to keep working, it is the reason to stop and hand off:
 
-- Report: full-suite result (Step 1), **codex AND deepseek verdicts verbatim** (findings included, if any), and either agy's findings and whether the blockers corroborated them, or - if agy hit the empty-diff tooling gap from Step 2 - say so plainly instead of implying agy reviewed anything.
+- Report: full-suite result (Step 1), **codex verdict verbatim** (findings included, if any), and either agy's findings and whether codex corroborated them, or - if agy hit the empty-diff tooling gap from Step 2 - say so plainly instead of implying agy reviewed anything.
 - **Stop.** Do **not**, under any circumstance, in this skill:
   - fix any finding codex or agy raised
   - resume or re-dispatch either review to check a fix
@@ -50,8 +49,8 @@ Whether codex came back clean or with findings, this skill stops here every time
   - push
   - call `ExitWorktree`
   - loop back to re-run Step 2 automatically
-- If **both codex and deepseek** came back SHIP: ask the human whether to merge.
-- If **either** came back with findings / non-SHIP (or deepseek hit a fail-closed `ERROR`/`OVERSIZE`): report both verdicts and ask the human how to proceed (e.g. fix the findings yourself and invoke `/ship` again once done, or explicitly override). The human decides the next step - this skill does not.
+- If **codex** came back SHIP: ask the human whether to merge.
+- If codex came back with findings / non-SHIP: report the verdict and ask the human how to proceed (e.g. fix the findings yourself and invoke `/ship` again once done, or explicitly override). The human decides the next step - this skill does not.
 
   All of the above automation lives elsewhere: the fix→re-gate loop is the `gate-loop` skill and integration is the lander (`${CLAUDE_PLUGIN_ROOT}/engine/lander.sh`, Stage 2, not yet built). This v1 `/ship` stays the explicit human-gated path and is deliberately not wired into either.
 
