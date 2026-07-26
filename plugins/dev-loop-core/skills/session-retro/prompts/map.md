@@ -15,6 +15,11 @@ Report, in plain markdown, citing timestamps from the extract:
    a CLAUDE.md rule (give exact text), a skill (name + 3-line outline), a doc, a code/
    repo reorganization, a permission/settings change, or a tool. If nothing would have
    helped, say so honestly.
+5. **Time sinks**: from the extract header (`duration_secs`, `largest_gaps`,
+   `slowest_tools_secs`, `repeated_error_runs`), note where wall-clock and tokens went.
+   Treat `largest_gaps` as NEUTRAL time (human think-time / model latency / async wait /
+   tool latency) - only call a gap wasted if you can cite thrash (a retry loop, a
+   re-read, a dead-tool volley). `repeated_error_runs` ARE waste; call them out.
 
 Be concrete and terse. No generic advice. Output only the analysis, nothing else.
 

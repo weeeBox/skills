@@ -78,8 +78,22 @@ def scan_file(path, start, end):
         "user_turns": 0, "assistant_turns": 0, "tools": {}, "errors": 0,
         "error_samples": [], "interrupts": 0, "denials": 0, "perm_switches": 0,
         "retries": 0, "first_ts": None, "last_ts": None, "events": 0,
+        "in_tokens": 0, "out_tokens": 0, "cache_read_tokens": 0,
+        "cache_write_tokens": 0, "tool_secs": {}, "gaps": [], "repeated_error_runs": [],
     }
     prev_call = None
+    prev_ts = None          # datetime of the previous in-day event (transcript order)
+    prev_label = None       # what the previous event was, for gap attribution
+    pending = {}            # tool_use id -> (name, ts) awaiting its tool_result
+    all_gaps = []           # (secs, at_hms, after_label) - top-5 kept at the end
+    cur_err = None          # first line of the current consecutive-error run
+    cur_err_count = 0
+    runs = []               # completed runs of >=2 identical consecutive errors
+
+    def flush_run():
+        if cur_err_count >= 2:
+            runs.append({"snippet": cur_err, "count": cur_err_count})
+
     for d in iter_lines(path):
         if d.get("type") == "permission-mode":
             # untimestamped meta line: counted file-wide (only files with in-day
@@ -92,13 +106,29 @@ def scan_file(path, start, end):
         s["events"] += 1
         s["first_ts"] = s["first_ts"] or ts.isoformat()
         s["last_ts"] = ts.isoformat()
+        # inter-event gap in TRANSCRIPT order (not sorted), attributed to what the
+        # previous event was. NEUTRAL wall-clock: may be human think-time, model
+        # latency, async wait, or tool latency - not waste on its own.
+        if prev_ts is not None:
+            all_gaps.append(((ts - prev_ts).total_seconds(),
+                             prev_ts.strftime("%H:%M:%S"), prev_label))
         t = d.get("type")
+        label = t
         if t == "assistant":
             s["assistant_turns"] += 1
+            u = (d.get("message") or {}).get("usage") or {}
+            s["in_tokens"] += u.get("input_tokens", 0) or 0
+            s["out_tokens"] += u.get("output_tokens", 0) or 0
+            s["cache_read_tokens"] += u.get("cache_read_input_tokens", 0) or 0
+            s["cache_write_tokens"] += u.get("cache_creation_input_tokens", 0) or 0
             for b in blocks(d):
                 if b.get("type") == "tool_use":
                     name = b.get("name", "?")
                     s["tools"][name] = s["tools"].get(name, 0) + 1
+                    label = "tool_use:" + name
+                    bid = b.get("id")
+                    if bid:
+                        pending[bid] = (name, ts)  # local to this file: never crosses scans
                     call = (name, json.dumps(b.get("input", {}), sort_keys=True))
                     if call == prev_call:
                         s["retries"] += 1
@@ -108,26 +138,52 @@ def scan_file(path, start, end):
             for b in blocks(d):
                 if isinstance(b, dict) and b.get("type") == "tool_result":
                     has_tool_result = True
+                    label = "tool_result"
+                    tuid = b.get("tool_use_id")
+                    if tuid in pending:
+                        nm, t0 = pending.pop(tuid)  # pop: a replayed result can't double-count
+                        s["tool_secs"][nm] = s["tool_secs"].get(nm, 0) + (ts - t0).total_seconds()
                     txt = text_of(b)
                     if b.get("is_error"):
                         s["errors"] += 1
+                        snip = txt.strip().split("\n")[0][:200]
                         if len(s["error_samples"]) < 10:
-                            s["error_samples"].append(txt.strip().split("\n")[0][:200])
+                            s["error_samples"].append(snip)
                         if DENIAL_RE.search(txt):
                             s["denials"] += 1
+                        if snip == cur_err:
+                            cur_err_count += 1
+                        else:
+                            flush_run()
+                            cur_err, cur_err_count = snip, 1
+                    else:
+                        flush_run()  # a successful result breaks the error run
+                        cur_err, cur_err_count = None, 0
                 txt = text_of(b) if isinstance(b, dict) else str(b)
                 if "[Request interrupted" in txt:
                     s["interrupts"] += 1
             if not has_tool_result:
                 s["user_turns"] += 1
+        prev_ts, prev_label = ts, label
+    flush_run()
+    s["gaps"] = [{"secs": round(g, 1), "at": at, "after": lab}
+                 for g, at, lab in sorted(all_gaps, reverse=True)[:5]]
+    s["repeated_error_runs"] = runs
     return s
 
 
 def merge_sub(parent, sub):
-    for k in ("errors", "interrupts", "denials", "retries", "assistant_turns"):
+    for k in ("errors", "interrupts", "denials", "retries", "assistant_turns",
+              "in_tokens", "out_tokens", "cache_read_tokens", "cache_write_tokens"):
         parent[k] += sub[k]
     for name, n in sub["tools"].items():
         parent["tools"][name] = parent["tools"].get(name, 0) + n
+    for name, sec in sub.get("tool_secs", {}).items():
+        parent["tool_secs"][name] = parent["tool_secs"].get(name, 0) + sec
+    # subagent errors are already in the parent's score/evidence path; fold their
+    # repeated-error runs too (re-ranked/truncated in scan_day). gaps/duration stay
+    # parent-only (a subagent's gaps are not the parent's wall-clock).
+    parent["repeated_error_runs"] = parent["repeated_error_runs"] + sub.get("repeated_error_runs", [])
     parent["error_samples"] = (parent["error_samples"] + sub["error_samples"])[:10]
 
 
@@ -168,6 +224,15 @@ def scan_day(day):
             subs = list(subdir.glob("*.jsonl")) if subdir.is_dir() else []
             for sub in subs:
                 merge_sub(s, scan_file(sub, start, end))
+            dur = 0.0
+            if s["first_ts"] and s["last_ts"]:
+                dur = (parse_ts(s["last_ts"]) - parse_ts(s["first_ts"])).total_seconds()
+            s["duration_secs"] = round(dur, 1)
+            s["total_tokens"] = (s["in_tokens"] + s["out_tokens"]
+                                 + s["cache_read_tokens"] + s["cache_write_tokens"])
+            s["tool_secs"] = {k: round(v, 1) for k, v in s["tool_secs"].items()}
+            s["repeated_error_runs"] = sorted(
+                s["repeated_error_runs"], key=lambda r: -r["count"])[:3]
             s.update(project=proj.name, session=f.stem, path=str(f),
                      subagents=len(subs), friction_score=friction(s))
             sessions.append(s)
@@ -181,11 +246,13 @@ def cmd_scan(day):
     workdir = REPORTS / "work" / day.isoformat()
     workdir.mkdir(parents=True, exist_ok=True)
     (workdir / "scan.json").write_text(json.dumps(result, indent=1))
-    print(f"{'score':>6} {'err':>4} {'int':>4} {'rty':>4} {'turns':>6} {'tools':>6}  session")
+    print(f"{'score':>6} {'err':>4} {'int':>4} {'rty':>4} {'turns':>6} {'tools':>6} "
+          f"{'dur_s':>7} {'ktok':>6}  session")
     for s in result["sessions"]:
         print(f"{s['friction_score']:>6} {s['errors']:>4} {s['interrupts']:>4} "
               f"{s['retries']:>4} {s['user_turns']+s['assistant_turns']:>6} "
-              f"{sum(s['tools'].values()):>6}  {s['project']}/{s['session'][:8]}")
+              f"{sum(s['tools'].values()):>6} {s.get('duration_secs', 0):>7.0f} "
+              f"{s.get('total_tokens', 0) / 1000:>6.0f}  {s['project']}/{s['session'][:8]}")
     if result["still_active"]:
         print(f"still-active files scanned: {len(result['still_active'])}")
     print(f"scan.json: {workdir / 'scan.json'}")
@@ -250,12 +317,60 @@ def cmd_extract(day, top):
     scan_path = workdir / "scan.json"
     result = json.loads(scan_path.read_text()) if scan_path.exists() else cmd_scan(day)
     start, end = day_bounds(day)
-    picked = [s for s in result["sessions"] if s["friction_score"] > 0][:top]
+    cap = min(top, 8)
+    sessions = result["sessions"]
+    fric = [s for s in sessions if s["friction_score"] > 0]
+    slow = [s for s in sorted(sessions, key=lambda x: x.get("duration_secs", 0), reverse=True)
+            if s.get("duration_secs", 0) > 0]
+    picked, seen, slow_added = [], set(), []
+
+    def _add(s):
+        k = (s["project"], s["session"])
+        if k in seen:
+            return False
+        seen.add(k)
+        picked.append(s)
+        return True
+
+    # Reserve up to 2 of the `cap` slots for the slowest sessions friction would NOT
+    # surface (friction==0 but long wall-clock) - so "slow but quiet" sessions stop
+    # being invisible. The rest go to friction; leftover slots backfill with slow.
+    # Note: when friction sessions exceed cap, this drops the 2 weakest to make room.
+    for s in [x for x in slow if x["friction_score"] == 0][:2]:
+        if len(picked) < cap and _add(s):
+            slow_added.append(s)
+    for s in fric:
+        if len(picked) >= cap:
+            break
+        _add(s)
+    for s in slow:
+        if len(picked) >= cap:
+            break
+        _add(s)
+    picked.sort(key=lambda x: (x["friction_score"], x.get("duration_secs", 0)), reverse=True)
+    if slow_added:
+        print("slow-reserved extracts (friction=0, long wall-clock): "
+              + ", ".join(f"{s['session'][:8]}({s.get('duration_secs', 0):.0f}s)"
+                          for s in slow_added))
     for s in picked:
-        out = [f"# Extract {s['project']}/{s['session']} ({day})",
-               f"friction={s['friction_score']} errors={s['errors']} "
-               f"interrupts={s['interrupts']} retries={s['retries']} "
-               f"subagents={s['subagents']}", ""]
+        top_tools = sorted(s.get("tool_secs", {}).items(), key=lambda kv: -kv[1])[:3]
+        gaps = s.get("gaps", [])[:3]
+        rer = s.get("repeated_error_runs", [])
+        out = [
+            f"# Extract {s['project']}/{s['session']} ({day})",
+            f"friction={s['friction_score']} errors={s['errors']} "
+            f"interrupts={s['interrupts']} retries={s['retries']} subagents={s['subagents']}",
+            f"duration_secs={s.get('duration_secs', 0)} total_tokens={s.get('total_tokens', 0)} "
+            f"cache_write_tokens={s.get('cache_write_tokens', 0)}",
+            "slowest_tools_secs=" + (", ".join(f"{n}:{v}" for n, v in top_tools) or "none"),
+            "largest_gaps=" + (", ".join(f"{g['secs']}s after {g['after']} @{g['at']}"
+                                         for g in gaps) or "none")
+            + "  (NEUTRAL wall-clock: human think-time / model latency / async wait / "
+            "tool latency - NOT waste on its own)",
+            "repeated_error_runs=" + (", ".join(f"{r['count']}x {r['snippet'][:60]!r}"
+                                                for r in rer) or "none"),
+            "",
+        ]
         size = sum(len(x) + 1 for x in out)
         # sessions with subagents keep 15KB of the cap reserved for their error
         # evidence (their stats are folded into the score, so the report needs it)
@@ -293,6 +408,10 @@ def cmd_metrics(day):
         "retries": sum(s["retries"] for s in ss),
         "denials": sum(s["denials"] for s in ss),
         "top_friction": max((s["friction_score"] for s in ss), default=0),
+        # .get defaults: a scan.json written before this field existed must not KeyError
+        "tokens": sum(s.get("total_tokens", 0) for s in ss),
+        "cache_write_tokens": sum(s.get("cache_write_tokens", 0) for s in ss),
+        "max_duration_secs": max((s.get("duration_secs", 0) for s in ss), default=0),
     }
     path = REPORTS / "metrics.jsonl"
     rows = []
@@ -400,6 +519,40 @@ def selftest():
     probe["error_samples"] = ["TypeError: undefined is not a function"]
     assert friction(probe) > 0, friction(probe)
     p.unlink()
+    # --- increment 1: time/cost extraction ---
+    # distinct timestamps + usage + a matched tool pair + two consecutive identical errors
+    def ev(t, **kw):
+        return dict(timestamp=f"2026-07-08T12:00:{t:02d}.000Z", **kw)
+    tlines = [
+        ev(0, type="user", message={"content": [{"type": "text", "text": "hi"}]}),
+        ev(0, type="assistant", message={"usage": {
+            "input_tokens": 100, "output_tokens": 10,
+            "cache_creation_input_tokens": 50, "cache_read_input_tokens": 200},
+            "content": [{"type": "tool_use", "name": "Bash", "id": "a", "input": {"command": "ls"}}]}),
+        ev(5, type="user", message={"content": [
+            {"type": "tool_result", "tool_use_id": "a", "content": "ok"}]}),
+        ev(5, type="assistant", message={"content": [
+            {"type": "tool_use", "name": "Grep", "id": "b", "input": {"pattern": "x"}}]}),
+        ev(10, type="user", message={"content": [
+            {"type": "tool_result", "tool_use_id": "b", "is_error": True, "content": "ENOENT rg"}]}),
+        ev(10, type="assistant", message={"content": [
+            {"type": "tool_use", "name": "Grep", "id": "c", "input": {"pattern": "y"}}]}),
+        ev(40, type="user", message={"content": [
+            {"type": "tool_result", "tool_use_id": "c", "is_error": True, "content": "ENOENT rg"}]}),
+    ]
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f2:
+        for l in tlines:
+            f2.write(json.dumps(l) + "\n")
+        p2 = Path(f2.name)
+    s2 = scan_file(p2, start, end)
+    assert (s2["in_tokens"], s2["out_tokens"], s2["cache_write_tokens"], s2["cache_read_tokens"]) \
+        == (100, 10, 50, 200), s2
+    assert s2["tool_secs"] == {"Bash": 5.0, "Grep": 35.0}, s2   # 5 + (5 then 30)
+    assert s2["gaps"] and s2["gaps"][0]["secs"] == 30.0 and "Grep" in s2["gaps"][0]["after"], s2["gaps"]
+    assert s2["repeated_error_runs"] == [{"snippet": "ENOENT rg", "count": 2}], s2["repeated_error_runs"]
+    dur = (parse_ts(s2["last_ts"]) - parse_ts(s2["first_ts"])).total_seconds()
+    assert dur == 40.0, dur
+    p2.unlink()
     # metrics upsert is idempotent per date (atomic replace-by-date)
     global REPORTS
     real_reports = REPORTS
@@ -409,12 +562,22 @@ def selftest():
         work.mkdir(parents=True)
         (work / "scan.json").write_text(json.dumps({"sessions": [
             {"tools": {"Bash": 2}, "errors": 1, "interrupts": 0, "retries": 1,
-             "denials": 0, "friction_score": 12.5}]}))
+             "denials": 0, "friction_score": 12.5, "total_tokens": 300,
+             "cache_write_tokens": 50, "duration_secs": 40.0}]}))
         cmd_metrics(date(2026, 7, 8))
         cmd_metrics(date(2026, 7, 8))
         lines = (REPORTS / "metrics.jsonl").read_text().splitlines()
         assert len(lines) == 1, lines
-        assert json.loads(lines[0])["top_friction"] == 12.5
+        m = json.loads(lines[0])
+        assert m["top_friction"] == 12.5
+        assert (m["tokens"], m["cache_write_tokens"], m["max_duration_secs"]) == (300, 50, 40.0), m
+        # a pre-migration scan.json (no token fields) must not KeyError -> .get defaults
+        (work / "scan.json").write_text(json.dumps({"sessions": [
+            {"tools": {}, "errors": 0, "interrupts": 0, "retries": 0,
+             "denials": 0, "friction_score": 0}]}))
+        cmd_metrics(date(2026, 7, 8))
+        m2 = json.loads((REPORTS / "metrics.jsonl").read_text().splitlines()[0])
+        assert m2["tokens"] == 0 and m2["max_duration_secs"] == 0, m2
         # ledger filter: valid passes; future rec id, time-travel, malformed dropped
         (REPORTS / "actions-log.md").write_text("\n".join([
             "- [2026-07-09] taken rec:2026-07-08#1 - valid (ok)",

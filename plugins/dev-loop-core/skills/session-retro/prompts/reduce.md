@@ -46,14 +46,28 @@ Write the report in this exact structure, as plain markdown, and output ONLY the
 ## Scoreboard
 Sessions analyzed (note still-active files), total tool calls, errors, interrupts,
 retries - with deltas vs the previous report AND day-over-day / week-over-week trends
-from the metrics history. Call out any sustained trend (3+ days moving the same way)
-explicitly.
+from the metrics history. Also report the cost/latency axes now in the metrics history:
+`tokens`, `cache_write_tokens`, and `max_duration_secs` - with the same deltas/trends.
+Call out any sustained trend (3+ days moving the same way) explicitly.
 
 ## Top friction patterns
 One subsection per pattern, worst first. A pattern also present in the previous report
 is flagged **REPEAT** and ranks above new one-offs. Each pattern: what happened
 (evidence: project + session id + timestamp), estimated cost (turns/time wasted).
 Where a `taken` action targeted a pattern, state the observed effect.
+
+## Slowness & cost
+Rank the day's sessions by wall-clock (`duration_secs` in scan.json) and by
+`total_tokens`; report the top few of each with project + session id. For the slowest,
+name the biggest time sinks from the extract header - the largest `gaps` and the
+`slowest_tools_secs` - and any `repeated_error_runs` (>=2 identical consecutive errors,
+e.g. a retry loop or a batched disabled-tool volley).
+IMPORTANT - a `gaps` entry is NEUTRAL wall-clock: it may be human think-time, model
+latency, async/background-job wait, or tool latency. Do NOT call a gap "wasted" unless
+the surrounding evidence shows thrash (a retry loop, a re-read, a dead-tool volley). A
+high-`duration_secs` low-friction session is a legitimate finding to surface here even
+with zero errors - but describe it as "slow", not "wasteful", absent evidence of waste.
+Rank recommendations by time/token impact here, not error-density alone.
 
 ## Recommendations
 Ranked list, each tagged `[rec: <date>#<n>]`. Every recommendation MUST have BOTH:
