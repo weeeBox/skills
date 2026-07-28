@@ -85,6 +85,8 @@ for d in $dates; do
   if [ "$("$PY" -c "import json,sys;print(len(json.load(open(sys.argv[1]))['sessions']))" "$work/scan.json")" = "0" ]; then
     printf '# Session retro %s\n\nNo sessions recorded on this date.\n\n<!-- retro-complete -->\n' "$d" > "$BASE/$d.md"
     "$PY" "$SKILL/scripts/scan_sessions.py" metrics --date "$d" || { echo "metrics FAILED for $d"; fail_reasons="$fail_reasons metrics:$d"; }
+    # record this report's rec-ids for cross-day recurrence tracking (after stamping)
+    "$PY" "$SKILL/scripts/scan_sessions.py" recs --date "$d" || { echo "recs FAILED for $d"; fail_reasons="$fail_reasons recs:$d"; }
     completed="$completed $d"
     echo "no sessions on $d, stub report written"
     continue
@@ -146,6 +148,14 @@ for d in $dates; do
       echo "--- actions log (wrapper-filtered: valid, temporally-plausible lines only) ---"
       echo "$ledger"
     fi
+    # fix-effectiveness + chronic-friction digest: wrapper-COMPUTED (deterministic, from
+    # recs.jsonl + the schema-validated actions-log), so it stays in the trusted-first zone.
+    # reduce narrates it; it is DATA, never directives.
+    eff=$("$PY" "$SKILL/scripts/scan_sessions.py" effectiveness --date "$d")
+    if [ -n "$eff" ]; then
+      echo "--- fix-effectiveness & chronic friction (wrapper-computed from recs.jsonl + actions-log; TRUSTED, DATA to narrate) ---"
+      echo "$eff"
+    fi
     # trusted global config (the user's OWN rules/settings) - so reduce can dedup
     # recommendations against existing rules and flag stale/ineffective ones. Still in
     # the trusted-first zone, before any transcript-derived content. It is DATA TO
@@ -191,6 +201,8 @@ for d in $dates; do
     # metrics AFTER stamping (deliberate: today's stats reach reduce via scan.json;
     # metrics.jsonl exists for prior-day trends). Failure notifies but never unstamps.
     "$PY" "$SKILL/scripts/scan_sessions.py" metrics --date "$d" || { echo "metrics FAILED for $d"; fail_reasons="$fail_reasons metrics:$d"; }
+    # record this report's rec-ids for cross-day recurrence tracking (after stamping)
+    "$PY" "$SKILL/scripts/scan_sessions.py" recs --date "$d" || { echo "recs FAILED for $d"; fail_reasons="$fail_reasons recs:$d"; }
     completed="$completed $d"
   else
     echo "report FAILED validation for $d (missing/too small/truncated); left uncovered for retry"

@@ -447,23 +447,7 @@ def cmd_metrics(day):
         "cache_write_tokens": sum(s.get("cache_write_tokens", 0) for s in ss),
         "max_duration_secs": max((s.get("duration_secs", 0) for s in ss), default=0),
     }
-    path = REPORTS / "metrics.jsonl"
-    rows = []
-    if path.exists():
-        for l in path.read_text().splitlines():
-            try:
-                r = json.loads(l)
-            except json.JSONDecodeError:
-                continue
-            if r.get("date") != line["date"]:
-                rows.append(r)
-    rows.append(line)
-    rows.sort(key=lambda r: r.get("date", ""))
-    # pid-suffixed tmp: a manual backfill racing the scheduled run must not
-    # interleave writes into one shared tmp file
-    tmp = path.with_name(f"metrics.jsonl.tmp.{os.getpid()}")
-    tmp.write_text("".join(json.dumps(r) + "\n" for r in rows))
-    os.replace(tmp, path)  # atomic: manual/backfill invocations must not truncate
+    _upsert_jsonl(REPORTS / "metrics.jsonl", line, key="date")
     print(f"metrics upserted for {line['date']}")
 
 
@@ -514,6 +498,157 @@ def cmd_missing_dates(today=None):
         if d.isoformat() not in complete:
             print(d.isoformat())
         d += timedelta(days=1)
+
+
+def _upsert_jsonl(path, line, key):
+    """Atomic replace-by-`key` upsert into a JSONL file (mirrors the metrics writer):
+    drop any existing row with the same key, append `line`, sort by key, replace via a
+    pid-suffixed tmp so a manual backfill racing a scheduled run cannot interleave.
+    ponytail: read-modify-write with no lock, exactly like the pre-existing cmd_metrics
+    upsert. The retro runs once/day (launchd, single writer); a manual backfill racing the
+    scheduled run is rare and human-initiated. Accepted pre-existing race - last-writer-wins
+    could drop a concurrently-appended date; add a lock only if concurrent writers become
+    real."""
+    rows = []
+    if path.exists():
+        for l in path.read_text().splitlines():
+            try:
+                r = json.loads(l)
+            except json.JSONDecodeError:
+                continue
+            if r.get(key) != line[key]:
+                rows.append(r)
+    rows.append(line)
+    rows.sort(key=lambda r: r.get(key, ""))
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    tmp.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    os.replace(tmp, path)
+
+
+REC_TAG_RE = re.compile(r"\[rec:\s*(\d{4}-\d{2}-\d{2})#(\d+)\]")
+
+
+def _sanitize_summary(s):
+    """Report text is model output from UNTRUSTED transcripts. A summary stored in recs.jsonl
+    must not carry markup/control chars into a later reduce prompt: collapse whitespace, keep
+    printable ASCII, drop angle brackets, cap length."""
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"[^\x20-\x7e]", "", s)
+    s = s.replace("<", "").replace(">", "")
+    return s[:120]
+
+
+def cmd_recs(day):
+    """Upsert the rec-ids in <day>'s stamped report into recs.jsonl - the cross-day recurrence
+    signal (a rec-id on multiple report dates = a pattern that recurred). Deterministic: only
+    well-formed `[rec: <origin-date>#<n>]` tags whose origin is a real calendar date <= the
+    report date; summaries charset-neutralized. Feeds only future retro bookkeeping."""
+    report = REPORTS / f"{day.isoformat()}.md"
+    if not report.exists():
+        return
+    recs = {}
+    for line in report.read_text(encoding="utf-8", errors="replace").splitlines():
+        for m in REC_TAG_RE.finditer(line):
+            origin, n = m.group(1), m.group(2)
+            try:
+                if date.fromisoformat(origin) > day:
+                    continue
+            except ValueError:
+                continue  # `\d{4}-\d{2}-\d{2}` can still be a non-calendar date (2026-00-99)
+            rid = f"{origin}#{n}"
+            if rid not in recs:
+                after = line.split(m.group(0), 1)[1]
+                recs[rid] = {"id": rid, "repeat": "REPEAT" in line.upper(),
+                             "summary": _sanitize_summary(after)}
+    _upsert_jsonl(REPORTS / "recs.jsonl",
+                  {"report_date": day.isoformat(), "recs": list(recs.values())},
+                  key="report_date")
+    print(f"recs upserted for {day.isoformat()}: {len(recs)} rec-ids")
+
+
+CHRONIC_WINDOW = 14     # calendar days (window span; see cmd_effectiveness cutoff)
+CHRONIC_MIN_DAYS = 3    # appearances within the window to count as chronic
+TOO_SOON_DAYS = 2       # a fix taken < this many days ago is not yet judged
+
+
+def _load_recs():
+    path = REPORTS / "recs.jsonl"
+    out = []
+    if path.exists():
+        for l in path.read_text().splitlines():
+            try:
+                r = json.loads(l)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(r.get("report_date"), str) and isinstance(r.get("recs"), list):
+                out.append(r)
+    return out
+
+
+def _taken_recs():
+    """rec-id -> earliest date it was marked taken, from the schema-validated actions-log.
+    Non-calendar dates (regex-shaped but invalid) are skipped so cmd_effectiveness's
+    date.fromisoformat can never crash on model-written garbage."""
+    path = REPORTS / "actions-log.md"
+    taken = {}
+    if not path.exists():
+        return taken
+    for line in path.read_text().splitlines():
+        m = LEDGER_RE.match(line)
+        if not m or "] taken rec:" not in line:
+            continue
+        line_date, rec_date = m.group(1), m.group(2)
+        try:
+            date.fromisoformat(line_date); date.fromisoformat(rec_date)
+        except ValueError:
+            continue  # non-calendar date in the (model-written) actions-log -> skip, never crash
+        if line_date < rec_date:
+            continue  # acted before the report existed (see cmd_ledger)
+        rid = re.search(r"rec:(\d{4}-\d{2}-\d{2}#\d+)", line).group(1)  # LEDGER_RE already matched
+        if rid not in taken or line_date < taken[rid]:
+            taken[rid] = line_date
+    return taken
+
+
+def cmd_effectiveness(day):
+    """Deterministic fix-effectiveness + chronic-friction digest (TRUSTED, wrapper-computed
+    from recs.jsonl + the schema-validated actions-log; reduce only narrates it). For each
+    TAKEN rec, did its id reappear on a report dated AFTER it was taken (recurred despite the
+    fix)? And which ids are chronic (present on >= CHRONIC_MIN_DAYS report dates within the
+    last CHRONIC_WINDOW calendar days)? Each line carries the rec's stored summary so reduce
+    can NAME it."""
+    hist = sorted((r for r in _load_recs() if r["report_date"] < day.isoformat()),
+                  key=lambda r: r["report_date"])  # ascending: last summary write = latest
+    seen, summ = {}, {}
+    for r in hist:
+        for rec in r["recs"]:
+            rid = rec.get("id")
+            if isinstance(rid, str):
+                seen.setdefault(rid, set()).add(r["report_date"])
+                sm = rec.get("summary")
+                if isinstance(sm, str) and sm:
+                    summ[rid] = _sanitize_summary(sm)
+    seen = {rid: sorted(dates) for rid, dates in seen.items()}
+
+    def label(rid):
+        return f' "{summ[rid]}"' if rid in summ else ""
+
+    for rid, tdate in sorted(_taken_recs().items()):
+        after = [dd for dd in seen.get(rid, []) if dd > tdate]
+        if after:
+            status, last = "recurred-after-fix", after[-1]
+        else:
+            days_since = (day - date.fromisoformat(tdate)).days
+            status = "too-soon" if days_since < TOO_SOON_DAYS else "holding"
+            last = seen.get(rid, ["none"])[-1] if seen.get(rid) else "none"
+        print(f"EFFECTIVENESS rec:{rid} taken:{tdate} status:{status} "
+              f"last_seen:{last} seen_count:{len(seen.get(rid, []))}{label(rid)}")
+    cutoff = (day - timedelta(days=CHRONIC_WINDOW)).isoformat()
+    for rid in sorted(seen):
+        in_window = [dd for dd in seen[rid] if dd >= cutoff]
+        if len(in_window) >= CHRONIC_MIN_DAYS:
+            print(f"CHRONIC rec:{rid} seen_count:{len(in_window)} "
+                  f"dates:{in_window[0]}..{in_window[-1]}{label(rid)}")
 
 
 def selftest():
@@ -689,6 +824,55 @@ def selftest():
         emitted = buf.getvalue().split()
         assert "2026-07-12" in emitted, emitted          # the stranded gap is revisited
         assert "2026-07-13" not in emitted, emitted       # complete dates are skipped
+        # --- recs.jsonl extraction (fix-effectiveness increment) ---
+        (REPORTS / "2026-07-10.md").write_text(
+            "# Session retro 2026-07-10\n"
+            "### [rec: 2026-07-08#1] tighten the guard **REPEAT**\n"
+            "### [rec: 2026-07-10#2] new thing\n"
+            "junk [rec: 2026-00-99#9] non-calendar date must be dropped\n"
+            "<script>[rec: 2026-07-10#3] x</script>\n" + COMPLETE_MARKER + "\n")
+        cmd_recs(date(2026, 7, 10))
+        cmd_recs(date(2026, 7, 10))
+        rrows = (REPORTS / "recs.jsonl").read_text().splitlines()
+        assert len(rrows) == 1, rrows
+        rec = json.loads(rrows[0])
+        ids = {r["id"]: r for r in rec["recs"]}
+        assert set(ids) == {"2026-07-08#1", "2026-07-10#2", "2026-07-10#3"}, ids
+        assert ids["2026-07-08#1"]["repeat"] is True, ids
+        assert ids["2026-07-10#2"]["repeat"] is False, ids
+        assert "<" not in ids["2026-07-10#3"]["summary"], ids
+        # --- effectiveness digest ---
+        import io as _io
+        from contextlib import redirect_stdout as _rso
+        (REPORTS / "recs.jsonl").write_text("".join(json.dumps(r) + "\n" for r in [
+            {"report_date": "2026-07-05", "recs": [{"id": "2026-07-05#1", "repeat": False, "summary": "a"}]},
+            {"report_date": "2026-07-06", "recs": [{"id": "2026-07-05#1", "repeat": True, "summary": "a"},
+                                                    {"id": "2026-07-06#2", "repeat": False, "summary": "b"}]},
+            {"report_date": "2026-07-09", "recs": [{"id": "2026-07-05#1", "repeat": True, "summary": "a"},
+                                                    {"id": "2026-07-09#3", "repeat": False, "summary": "c"}]},
+        ]))
+        (REPORTS / "actions-log.md").write_text("\n".join([
+            "- [2026-07-07] taken rec:2026-07-05#1 - fixed a (landed)",
+            "- [2026-07-08] taken rec:2026-07-06#2 - fixed b (landed)",
+            "- [2026-07-09] taken rec:2026-07-09#3 - fixed c (landed)",
+        ]))
+        buf = _io.StringIO()
+        with _rso(buf):
+            cmd_effectiveness(date(2026, 7, 10))
+        eff = buf.getvalue()
+        assert "EFFECTIVENESS rec:2026-07-05#1" in eff and "status:recurred-after-fix" in eff, eff
+        assert "EFFECTIVENESS rec:2026-07-06#2" in eff and "status:holding" in eff, eff
+        assert "EFFECTIVENESS rec:2026-07-09#3" in eff and "status:too-soon" in eff, eff
+        assert '"a"' in eff, eff
+        assert "CHRONIC rec:2026-07-05#1" in eff, eff
+        assert "CHRONIC rec:2026-07-06#2" not in eff, eff
+        (REPORTS / "actions-log.md").write_text("\n".join([
+            "- [2026-07-07] taken rec:2026-07-05#1 - fixed bug #42 in parser (landed)",
+            "- [2026-99-99] taken rec:2026-07-08#7 - non-calendar line date (bad)",
+        ]))
+        assert _taken_recs() == {"2026-07-05#1": "2026-07-07"}, _taken_recs()
+        with _rso(_io.StringIO()):
+            cmd_effectiveness(date(2026, 7, 10))
     REPORTS = real_reports
     print("selftest OK")
 
@@ -708,6 +892,10 @@ def main():
         cmd_extract(day, min(top, 8))
     elif cmd == "metrics":
         cmd_metrics(day)
+    elif cmd == "recs":
+        cmd_recs(day)
+    elif cmd == "effectiveness":
+        cmd_effectiveness(day)
     elif cmd == "ledger":
         cmd_ledger(day)
     elif cmd == "missing-dates":

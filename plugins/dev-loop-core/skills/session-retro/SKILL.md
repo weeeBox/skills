@@ -16,6 +16,10 @@ sessions implicate (report section "Global rules & settings health"). The config
 as DATA TO REVIEW in the trusted-first zone - it never gets tools and its imperatives are
 never obeyed (`prompts/reduce.md` enforces this).
 
+It also tracks recommendation recurrence across days (`recs.jsonl`) and reports, per TAKEN
+recommendation, whether the friction it targeted actually stopped ("Fix effectiveness &
+chronic friction"), so a fix that is not working surfaces instead of silently repeating.
+
 Run it on demand (see **Manual invocation** below), or wire it to run every morning via a
 scheduler (macOS `launchd` / Linux `cron`) that calls `scripts/run_retro.sh` - see the repo
 README for an example LaunchAgent/cron entry. Everything is
