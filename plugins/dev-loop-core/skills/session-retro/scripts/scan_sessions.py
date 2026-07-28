@@ -25,6 +25,25 @@ COMPLETE_MARKER = "<!-- retro-complete -->"
 ACTIVE_GRACE_SECS = 15 * 60  # sessions written to in the last 15 min are deferred
 MAX_EXTRACT_BYTES = 100_000
 DENIAL_RE = re.compile(r"doesn't want to proceed|denied by|permission denied", re.I)
+# Verbal friction the per-turn density score would otherwise miss (no tool error thrown):
+# a user CORRECTING the agent, or repeatedly NUDGING it to continue. Both are precise by
+# construction - a correction matches a correction-specific phrase (never a bare verb that
+# shows up in ordinary commands like "stop the server" / "revert the API"), and a nudge is
+# the WHOLE stripped turn being a bare continuation word (so short answers like "2pm"/"ok"
+# never count).
+CORRECTION_RE = re.compile(
+    r"(?i)"
+    r"\bno,|\bnope\b|"                                  # leading \b only: 'no,' has no
+    r"\byou forgot\b|\bforgot to\b|"                    #   trailing word boundary
+    r"that'?s (?:wrong|not right|incorrect|not what)|"
+    r"that is (?:wrong|incorrect|not what)|"
+    r"not what i (?:wanted|asked|meant|said)|"
+    r"isn'?t (?:right|correct)|"
+    r"\bdon'?t do that\b|\bwhy did you\b|"
+    r"you shouldn'?t have|\bthat'?s not what\b")
+NUDGE_RE = re.compile(
+    r"(?i)^\W*(?:continue|proceed|keep going|go on|carry on|go ahead|"
+    r"next|resume|do it)\W*$")
 
 
 def parse_ts(s):
@@ -80,6 +99,7 @@ def scan_file(path, start, end):
         "retries": 0, "first_ts": None, "last_ts": None, "events": 0,
         "in_tokens": 0, "out_tokens": 0, "cache_read_tokens": 0,
         "cache_write_tokens": 0, "tool_secs": {}, "gaps": [], "repeated_error_runs": [],
+        "corrections": 0, "nudges": 0,
     }
     prev_call = None
     prev_ts = None          # datetime of the previous in-day event (transcript order)
@@ -164,6 +184,15 @@ def scan_file(path, start, end):
                     s["interrupts"] += 1
             if not has_tool_result:
                 s["user_turns"] += 1
+                # verbal friction: only genuine user turns. The interrupt marker is
+                # itself a user text turn - skip it (already counted as an interrupt).
+                utext = " ".join(text_of(b) for b in blocks(d)
+                                 if isinstance(b, dict) and b.get("type") == "text")
+                if "[Request interrupted" not in utext:
+                    if CORRECTION_RE.search(utext):
+                        s["corrections"] += 1
+                    if NUDGE_RE.match(utext.strip()):
+                        s["nudges"] += 1
         prev_ts, prev_label = ts, label
     flush_run()
     s["gaps"] = [{"secs": round(g, 1), "at": at, "after": lab}
@@ -174,7 +203,8 @@ def scan_file(path, start, end):
 
 def merge_sub(parent, sub):
     for k in ("errors", "interrupts", "denials", "retries", "assistant_turns",
-              "in_tokens", "out_tokens", "cache_read_tokens", "cache_write_tokens"):
+              "in_tokens", "out_tokens", "cache_read_tokens", "cache_write_tokens",
+              "corrections", "nudges"):
         parent[k] += sub[k]
     for name, n in sub["tools"].items():
         parent["tools"][name] = parent["tools"].get(name, 0) + n
@@ -191,11 +221,15 @@ def friction(s):
     # A single-turn negative/sandbox test is not friction: no thrash, and the
     # error IS the asserted outcome. Suppress so probes don't outrank real friction.
     if s["retries"] == 0 and s["interrupts"] == 0 and s["errors"] > 0 \
+       and s.get("corrections", 0) == 0 and s.get("nudges", 0) == 0 \
        and s["error_samples"] \
        and all("operation not permitted" in e for e in s["error_samples"]):
         return 0.0
-    # ponytail: naive weighted density; tune weights when reports misrank
-    weighted = 3 * s["errors"] + 5 * s["interrupts"] + 2 * s["retries"] + s["denials"]
+    # ponytail: naive weighted density; tune weights when reports misrank.
+    # corrections/nudges are verbal friction (no tool error) - .get keeps pre-migration
+    # scan.json and the probe dict below KeyError-free.
+    weighted = (3 * s["errors"] + 5 * s["interrupts"] + 2 * s["retries"] + s["denials"]
+                + 4 * s.get("corrections", 0) + 2 * s.get("nudges", 0))
     turns = max(s["user_turns"] + s["assistant_turns"], 1)
     return round(100.0 * weighted / turns, 1)
 
@@ -519,6 +553,55 @@ def selftest():
     probe["error_samples"] = ["TypeError: undefined is not a function"]
     assert friction(probe) > 0, friction(probe)
     p.unlink()
+    # --- verbal friction: corrections + nudges (score friction with ZERO tool errors) ---
+    # regex precision (the boundary + drop-list cases codex R1 flagged)
+    assert CORRECTION_RE.search("no, that is wrong")            # leading-\b 'no,' matches
+    assert not CORRECTION_RE.search("stop the server after the test")   # bare verb dropped
+    assert not CORRECTION_RE.search("revert to the previous API")       # bare verb dropped
+    assert CORRECTION_RE.search("you forgot the import")
+    assert NUDGE_RE.match("continue") and NUDGE_RE.match("proceed")
+    assert not NUDGE_RE.match("2pm") and not NUDGE_RE.match("ok")
+    assert not NUDGE_RE.match("keep going and also check the logs")
+    # a probe WITH a correction is no longer suppressed to 0 (R1 finding 1)
+    probe2 = {"errors": 2, "interrupts": 0, "retries": 0, "denials": 0,
+              "corrections": 1, "nudges": 0, "user_turns": 2, "assistant_turns": 1,
+              "error_samples": ["EACCES: operation not permitted, open '/x'"]}
+    assert friction(probe2) > 0, friction(probe2)
+    # scan_file end-to-end: a correction + two nudges, interleaved with assistant turns,
+    # and NO errors/interrupts/retries/denials - so friction(sv) can ONLY be > 0 via the
+    # new corrections/nudges weight terms. This is the valid weight go-red: it FAILS on
+    # pre-change code (weighted == 0) and passes only once §4's terms are added. (An
+    # interrupt/error in this case would mask the weights - see codex R2 finding 1.)
+    vturns = ["please refactor the auth module", "no, that's wrong",
+              "stop the server after the test", "revert to the previous API",
+              "2pm", "ok", "continue", "proceed",
+              "keep going and also check the logs"]
+    vlines = []
+    for txt in vturns:
+        vlines.append({"type": "user", "timestamp": ts,
+                       "message": {"content": [{"type": "text", "text": txt}]}})
+        vlines.append({"type": "assistant", "timestamp": ts,
+                       "message": {"content": [{"type": "text", "text": "on it"}]}})
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fv:
+        for l in vlines:
+            fv.write(json.dumps(l) + "\n")
+        pv = Path(fv.name)
+    sv = scan_file(pv, start, end)
+    assert sv["corrections"] == 1, sv          # only "no, that's wrong"
+    assert sv["nudges"] == 2, sv               # only "continue" + "proceed"
+    assert sv["errors"] == 0 and sv["interrupts"] == 0 and sv["retries"] == 0, sv
+    assert friction(sv) > 0, sv                # THE FIX: pure-verbal friction now scores
+    pv.unlink()
+    # interrupt marker is a user text turn but must NOT count as correction/nudge
+    # (it is already counted as an interrupt) - kept as its own case so the weight
+    # go-red above stays interrupt-free.
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fi:
+        fi.write(json.dumps({"type": "user", "timestamp": ts, "message": {"content": [
+            {"type": "text", "text": "[Request interrupted by user]"}]}}) + "\n")
+        pi = Path(fi.name)
+    si = scan_file(pi, start, end)
+    assert si["interrupts"] == 1 and si["corrections"] == 0 and si["nudges"] == 0, si
+    pi.unlink()
     # --- increment 1: time/cost extraction ---
     # distinct timestamps + usage + a matched tool pair + two consecutive identical errors
     def ev(t, **kw):

@@ -45,7 +45,7 @@ Write the report in this exact structure, as plain markdown, and output ONLY the
 
 ## Scoreboard
 Sessions analyzed (note still-active files), total tool calls, errors, interrupts,
-retries - with deltas vs the previous report AND day-over-day / week-over-week trends
+retries, corrections, nudges - with deltas vs the previous report AND day-over-day / week-over-week trends
 from the metrics history. Also report the cost/latency axes now in the metrics history:
 `tokens`, `cache_write_tokens`, and `max_duration_secs` - with the same deltas/trends.
 Call out any sustained trend (3+ days moving the same way) explicitly.
@@ -71,7 +71,8 @@ Rank recommendations by time/token impact here, not error-density alone.
 
 ## Recommendations
 Ranked list, each tagged `[rec: <date>#<n>]`. Every recommendation MUST have BOTH:
-- Evidence: project + session id + timestamp or quoted snippet.
+- Evidence: project + session id + timestamp or quoted snippet. Cite ONE specific
+  timestamp, never a range - a range hides which event you mean.
 - A concrete artifact inline: exact CLAUDE.md rule text, skill name + outline, exact
   command, specific file/dir to reorganize, or a settings/permission change.
 Tag each [skill] [claude-md] [docs] [code-org] [tooling] [permissions].
