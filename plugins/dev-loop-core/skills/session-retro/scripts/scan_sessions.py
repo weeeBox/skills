@@ -44,6 +44,19 @@ CORRECTION_RE = re.compile(
 NUDGE_RE = re.compile(
     r"(?i)^\W*(?:continue|proceed|keep going|go on|carry on|go ahead|"
     r"next|resume|do it)\W*$")
+# codex/agy review-GATE activity in a tool call (matched against "<tool-name> <input-json>").
+# A slow gate - a codex adversarial-review / agy review that blocks for many minutes, or many
+# re-gate rounds - is a real, nameable time sink the neutral-gap rule would otherwise hide. Match
+# the reviewer runtimes, the codex/agy CLIs+skills, and the gate/land scripts+skills.
+# ponytail: heuristic substring match (may over-count adjacent gate TOOLING like grepping the
+# review-gate scripts dir); tighten only if it misattributes real waste.
+GATE_RE = re.compile(
+    r"(?i)"
+    r"adversarial-review|codex-companion|agy-companion|"                 # reviewer runtimes
+    r"codex\s+exec|/codex:|codex:(?:adversarial|rescue|task)|"           # codex CLI / skill
+    r"/agy:|agy:rescue|\bagy\s|"                                         # agy CLI / skill
+    r"lander\.sh|review-gate|gate-loop|"                                 # gate/land scripts
+    r'"skill":\s*"[^"]*(?:review-gate|gate-loop|:land|:ship)')           # gate skills via Skill
 
 
 def parse_ts(s):
@@ -100,6 +113,7 @@ def scan_file(path, start, end):
         "in_tokens": 0, "out_tokens": 0, "cache_read_tokens": 0,
         "cache_write_tokens": 0, "tool_secs": {}, "gaps": [], "repeated_error_runs": [],
         "corrections": 0, "nudges": 0,
+        "gate_calls": 0, "gate_wait_secs": 0.0, "max_gate_wait_secs": 0.0,
     }
     prev_call = None
     prev_ts = None          # datetime of the previous in-day event (transcript order)
@@ -153,6 +167,9 @@ def scan_file(path, start, end):
                     if call == prev_call:
                         s["retries"] += 1
                     prev_call = call
+                    if GATE_RE.search(name + " " + call[1]):
+                        s["gate_calls"] += 1
+                        label = "gate:" + name   # so the FOLLOWING gap is attributed to the gate
         elif t == "user":
             has_tool_result = False
             for b in blocks(d):
@@ -197,6 +214,12 @@ def scan_file(path, start, end):
     flush_run()
     s["gaps"] = [{"secs": round(g, 1), "at": at, "after": lab}
                  for g, at, lab in sorted(all_gaps, reverse=True)[:5]]
+    # wall-clock spent waiting on a codex/agy gate = the gaps that FOLLOW a gate call. Reuses the
+    # gap machinery (a gate that blocks 25 min shows as a big gap labeled "gate:*") instead of a
+    # stateful dispatch->verdict correlator.
+    gate_gaps = [g for g, _at, lab in all_gaps if lab and lab.startswith("gate:")]
+    s["gate_wait_secs"] = round(sum(gate_gaps), 1)
+    s["max_gate_wait_secs"] = round(max(gate_gaps), 1) if gate_gaps else 0.0
     s["repeated_error_runs"] = runs
     return s
 
@@ -204,8 +227,10 @@ def scan_file(path, start, end):
 def merge_sub(parent, sub):
     for k in ("errors", "interrupts", "denials", "retries", "assistant_turns",
               "in_tokens", "out_tokens", "cache_read_tokens", "cache_write_tokens",
-              "corrections", "nudges"):
+              "corrections", "nudges", "gate_calls"):
         parent[k] += sub[k]
+    # gate_wait_secs stays parent-only (gap-derived; a subagent's gaps aren't the parent's
+    # wall-clock - same rule as gaps/duration below)
     for name, n in sub["tools"].items():
         parent["tools"][name] = parent["tools"].get(name, 0) + n
     for name, sec in sub.get("tool_secs", {}).items():
@@ -403,6 +428,9 @@ def cmd_extract(day, top):
             "tool latency - NOT waste on its own)",
             "repeated_error_runs=" + (", ".join(f"{r['count']}x {r['snippet'][:60]!r}"
                                                 for r in rer) or "none"),
+            f"gate_calls={s.get('gate_calls', 0)} gate_wait_secs={s.get('gate_wait_secs', 0)} "
+            f"max_gate_wait_secs={s.get('max_gate_wait_secs', 0)}  (codex/agy review-gate "
+            "latency: many calls + high wait = slow/repeated gate rounds - a NAMEABLE cost)",
             "",
         ]
         size = sum(len(x) + 1 for x in out)
@@ -446,6 +474,8 @@ def cmd_metrics(day):
         "tokens": sum(s.get("total_tokens", 0) for s in ss),
         "cache_write_tokens": sum(s.get("cache_write_tokens", 0) for s in ss),
         "max_duration_secs": max((s.get("duration_secs", 0) for s in ss), default=0),
+        "gate_calls": sum(s.get("gate_calls", 0) for s in ss),
+        "max_gate_wait_secs": max((s.get("max_gate_wait_secs", 0) for s in ss), default=0),
     }
     _upsert_jsonl(REPORTS / "metrics.jsonl", line, key="date")
     print(f"metrics upserted for {line['date']}")
@@ -737,6 +767,31 @@ def selftest():
     si = scan_file(pi, start, end)
     assert si["interrupts"] == 1 and si["corrections"] == 0 and si["nudges"] == 0, si
     pi.unlink()
+    # --- codex/agy gate-latency detection ---
+    assert GATE_RE.search('Bash {"command": "node .../agy-companion.mjs adversarial-review --wait"}')
+    assert GATE_RE.search('Skill {"skill": "dev-loop-core:review-gate"}')
+    assert GATE_RE.search('Skill {"skill": "gated-land:gate-loop"}')
+    assert GATE_RE.search('Bash {"command": "codex exec resume abc \'re-gate\'"}')
+    assert not GATE_RE.search('Bash {"command": "git status --short"}')
+    assert not GATE_RE.search('Edit {"file_path": "ship_it.py"}')   # bare 'ship' in a name != gate
+    # scan_file attributes the wait AFTER a gate call to gate_wait_secs (a 40s block here stands
+    # in for a real 25-min codex wait). FAILS on pre-change code (no gate_* keys).
+    glines = [
+        {"type": "assistant", "timestamp": "2026-07-08T12:00:00.000Z", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "id": "g",
+             "input": {"command": "node codex-companion.mjs adversarial-review --base main --wait"}}]}},
+        {"type": "user", "timestamp": "2026-07-08T12:00:40.000Z", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "g", "content": "Verdict: needs-attention"}]}},
+    ]
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fg:
+        for l in glines:
+            fg.write(json.dumps(l) + "\n")
+        pg = Path(fg.name)
+    sg = scan_file(pg, start, end)
+    assert sg["gate_calls"] == 1, sg
+    assert sg["gate_wait_secs"] == 40.0 and sg["max_gate_wait_secs"] == 40.0, sg
+    assert sg["gaps"][0]["after"] == "gate:Bash", sg["gaps"]
+    pg.unlink()
     # --- increment 1: time/cost extraction ---
     # distinct timestamps + usage + a matched tool pair + two consecutive identical errors
     def ev(t, **kw):

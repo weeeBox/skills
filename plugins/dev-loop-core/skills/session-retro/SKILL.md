@@ -53,9 +53,16 @@ marker) and run the runner again.
 ## Closing the loop (metrics + actions ledger)
 
 - `session-reports/metrics.jsonl` - one wrapper-written JSON line per day (sessions,
-  errors, interrupts, retries, top friction); the reduce prompt reads the last 14 for
-  trends. Upserted atomically by `scan_sessions.py metrics --date D` after a report
+  errors, interrupts, retries, top friction, plus `gate_calls` and `max_gate_wait_secs` -
+  codex/agy review-gate volume and slowest single wait); the reduce prompt reads the last
+  14 for trends. Upserted atomically by `scan_sessions.py metrics --date D` after a report
   completes; safe to backfill manually.
+- **Slow gate detection**: `scan_sessions.py` tags codex/agy review-gate activity
+  (`GATE_RE`) in each session and reports `gate_calls` / `gate_wait_secs` /
+  `max_gate_wait_secs` in the extract header. A gate that blocks for many minutes, or many
+  re-gate rounds on one session, is the one wall-clock cost the map/reduce prompts treat as
+  nameable (not neutral async wait) - so a slow/thrashing codex or agy gate surfaces as a
+  finding instead of hiding inside `largest_gaps`.
 - `session-reports/actions-log.md` - recommendation-outcome ledger, STRICT schema:
   `- [YYYY-MM-DD] taken|rejected|deferred rec:<report-date>#<n> - <summary> (<reason>)`.
   When you act on (or reject) a report recommendation - including manually - append an

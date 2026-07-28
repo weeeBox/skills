@@ -19,10 +19,12 @@ which event you mean.
    repo reorganization, a permission/settings change, or a tool. If nothing would have
    helped, say so honestly.
 5. **Time sinks**: from the extract header (`duration_secs`, `largest_gaps`,
-   `slowest_tools_secs`, `repeated_error_runs`), note where wall-clock and tokens went.
-   Treat `largest_gaps` as NEUTRAL time (human think-time / model latency / async wait /
-   tool latency) - only call a gap wasted if you can cite thrash (a retry loop, a
-   re-read, a dead-tool volley). `repeated_error_runs` ARE waste; call them out.
+   `slowest_tools_secs`, `repeated_error_runs`, `gate_calls`/`gate_wait_secs`), note where
+   wall-clock and tokens went. Treat `largest_gaps` as NEUTRAL time (human think-time /
+   model latency / async wait / tool latency) - only call a gap wasted if you can cite
+   thrash (a retry loop, a re-read, a dead-tool volley). `repeated_error_runs` ARE waste;
+   call them out. A high `gate_wait_secs` or many `gate_calls` (codex/agy review gate) IS a
+   nameable cost, not neutral wait - flag it and note if it was repeated re-gate rounds.
 
 Be concrete and terse. No generic advice. Output only the analysis, nothing else.
 

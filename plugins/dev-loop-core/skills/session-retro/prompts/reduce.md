@@ -84,6 +84,15 @@ high-`duration_secs` low-friction session is a legitimate finding to surface her
 with zero errors - but describe it as "slow", not "wasteful", absent evidence of waste.
 Rank recommendations by time/token impact here, not error-density alone.
 
+**Slow codex/agy gates** are the ONE exception to the neutral-gap rule: the extract header's
+`gate_calls` / `gate_wait_secs` / `max_gate_wait_secs` (and the day's `max_gate_wait_secs` in
+metrics.jsonl) measure time spent blocked on a review gate. A large `gate_wait_secs`, and
+especially many `gate_calls` (repeated re-gate rounds) on one session, IS a nameable cost - not
+neutral wait - because the fix is concrete: fewer re-gate rounds (fix the whole finding-class in
+one round), resume a warm codex thread instead of cold re-dispatch, or scope the diff with
+`--base`. Call out any session with a high `max_gate_wait_secs` or many `gate_calls`, name the
+likely cause, and recommend the specific reduction.
+
 ## Fix effectiveness & chronic friction
 Report the wrapper-computed digest as facts, worst first:
 - Each `EFFECTIVENESS rec:<id> ... status:recurred-after-fix` = a TAKEN fix that did NOT
