@@ -44,19 +44,29 @@ CORRECTION_RE = re.compile(
 NUDGE_RE = re.compile(
     r"(?i)^\W*(?:continue|proceed|keep going|go on|carry on|go ahead|"
     r"next|resume|do it)\W*$")
-# codex/agy review-GATE activity in a tool call (matched against "<tool-name> <input-json>").
-# A slow gate - a codex adversarial-review / agy review that blocks for many minutes, or many
-# re-gate rounds - is a real, nameable time sink the neutral-gap rule would otherwise hide. Match
-# the reviewer runtimes, the codex/agy CLIs+skills, and the gate/land scripts+skills.
-# ponytail: heuristic substring match (may over-count adjacent gate TOOLING like grepping the
-# review-gate scripts dir); tighten only if it misattributes real waste.
+# codex/agy review-GATE activity. A slow gate - a codex/agy review that blocks for many minutes,
+# or many re-gate rounds - is the one wall-clock cost the neutral-gap rule would otherwise hide.
+# Detection is TWO-part: the tool must be a job DISPATCHER (GATE_TOOLS) AND its input must carry a
+# gate signature (GATE_RE). The tool-name gate is what stops an AskUserQuestion / Read / Edit that
+# merely MENTIONS a gate (a question about the review-gate no-ship, reading a codex job file) from
+# counting as gate time - that would mislabel human-answer + read latency as gate wait.
+GATE_TOOLS = {"Bash", "Agent", "Skill"}   # the only tools that dispatch/poll a codex/agy gate job
 GATE_RE = re.compile(
     r"(?i)"
-    r"adversarial-review|codex-companion|agy-companion|"                 # reviewer runtimes
-    r"codex\s+exec|/codex:|codex:(?:adversarial|rescue|task)|"           # codex CLI / skill
-    r"/agy:|agy:rescue|\bagy\s|"                                         # agy CLI / skill
-    r"lander\.sh|review-gate|gate-loop|"                                 # gate/land scripts
-    r'"skill":\s*"[^"]*(?:review-gate|gate-loop|:land|:ship)')           # gate skills via Skill
+    r"adversarial-review|codex-companion|agy-companion|"                    # reviewer runtimes
+    r"codex\s+exec|/codex:|codex:(?:adversarial|rescue|task)|codex-rescue|" # codex CLI/skill/subagent
+    r"/agy:|agy:rescue|agy-rescue|\bagy\s|"                                 # agy CLI/skill/subagent
+    r"lander\.sh|review-gate|gate-loop|"                                    # gate/land scripts
+    r'"skill":\s*"[^"]*(?:review-gate|gate-loop|:land|:ship)')              # gate skills via Skill
+
+
+def is_gate_call(name, input_json):
+    """True iff a tool call is a codex/agy gate dispatch/poll: a job-dispatcher tool (GATE_TOOLS)
+    whose input carries a gate signature. The name gate stops gate-MENTIONING reads/questions from
+    counting as gate time.
+    ponytail: a Bash that merely greps a codex/gate file still counts (gate-adjacent tooling) -
+    acceptable; the big inflation was AskUserQuestion/Read, now excluded by the name gate."""
+    return name in GATE_TOOLS and bool(GATE_RE.search(input_json))
 
 
 def parse_ts(s):
@@ -167,7 +177,7 @@ def scan_file(path, start, end):
                     if call == prev_call:
                         s["retries"] += 1
                     prev_call = call
-                    if GATE_RE.search(name + " " + call[1]):
+                    if is_gate_call(name, call[1]):
                         s["gate_calls"] += 1
                         label = "gate:" + name   # so the FOLLOWING gap is attributed to the gate
         elif t == "user":
@@ -767,13 +777,18 @@ def selftest():
     si = scan_file(pi, start, end)
     assert si["interrupts"] == 1 and si["corrections"] == 0 and si["nudges"] == 0, si
     pi.unlink()
-    # --- codex/agy gate-latency detection ---
-    assert GATE_RE.search('Bash {"command": "node .../agy-companion.mjs adversarial-review --wait"}')
-    assert GATE_RE.search('Skill {"skill": "dev-loop-core:review-gate"}')
-    assert GATE_RE.search('Skill {"skill": "gated-land:gate-loop"}')
-    assert GATE_RE.search('Bash {"command": "codex exec resume abc \'re-gate\'"}')
-    assert not GATE_RE.search('Bash {"command": "git status --short"}')
-    assert not GATE_RE.search('Edit {"file_path": "ship_it.py"}')   # bare 'ship' in a name != gate
+    # --- codex/agy gate-latency detection (name-gated: only job DISPATCHERS count) ---
+    assert is_gate_call("Bash", '{"command": "node .../agy-companion.mjs adversarial-review --wait"}')
+    assert is_gate_call("Skill", '{"skill": "dev-loop-core:review-gate"}')
+    assert is_gate_call("Skill", '{"skill": "gated-land:gate-loop"}')
+    assert is_gate_call("Bash", '{"command": "codex exec resume abc"}')
+    assert is_gate_call("Agent", '{"subagent_type": "codex:codex-rescue", "prompt": "re-gate"}')
+    assert not is_gate_call("Bash", '{"command": "git status --short"}')
+    # the tightening: a QUESTION / READ that only MENTIONS a gate must NOT count as gate time
+    assert not is_gate_call("AskUserQuestion",
+                            '{"questions": [{"question": "override the codex review-gate no-ship?"}]}')
+    assert not is_gate_call("Read", '{"file_path": "codex-adversarial-review-notes.md"}')
+    assert not is_gate_call("Edit", '{"file_path": "ship_it.py"}')   # bare 'ship' in a name != gate
     # scan_file attributes the wait AFTER a gate call to gate_wait_secs (a 40s block here stands
     # in for a real 25-min codex wait). FAILS on pre-change code (no gate_* keys).
     glines = [
