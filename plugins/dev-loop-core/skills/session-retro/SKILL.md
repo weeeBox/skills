@@ -9,6 +9,13 @@ Analyzes all Claude Code session transcripts for a day and writes a friction rep
 concrete improvement recommendations to
 `~/.claude/session-reports/<date>.md`.
 
+The reduce step is also fed a trusted snapshot of the user's global config
+(`~/.claude/CLAUDE.md`, `AGENTS.md` if present, `settings.json`) so it can DEDUP
+recommendations against rules that already exist and flag stale/ineffective ones today's
+sessions implicate (report section "Global rules & settings health"). The config is passed
+as DATA TO REVIEW in the trusted-first zone - it never gets tools and its imperatives are
+never obeyed (`prompts/reduce.md` enforces this).
+
 Run it on demand (see **Manual invocation** below), or wire it to run every morning via a
 scheduler (macOS `launchd` / Linux `cron`) that calls `scripts/run_retro.sh` - see the repo
 README for an example LaunchAgent/cron entry. Everything is
