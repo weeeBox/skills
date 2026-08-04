@@ -12,7 +12,11 @@ which event you mean.
 1. **Goal**: what was the user trying to do in this session?
 2. **Waste**: where were turns/time wasted? (error loops, retries, dead ends, repeated
    re-reads, permission stalls, verbal corrections / repeated nudges to continue) - cite
-   timestamps and quote the relevant snippet briefly.
+   timestamps and quote the relevant snippet briefly. The header's `self_retractions`
+   counts the AGENT retracting its own prior claim (distinct from `corrections`, which is
+   the USER correcting the agent); a high value means conclusions were asserted before
+   they were verified. It is a LOWER BOUND from a strict regex - treat it as a floor and
+   read the transcript for the real rate.
 3. **Repeated mistake**: what mistake, if any, happened more than once?
 4. **Prevention**: for each waste item, what SPECIFIC change would have prevented it -
    a CLAUDE.md rule (give exact text), a skill (name + 3-line outline), a doc, a code/

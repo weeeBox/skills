@@ -41,6 +41,20 @@ CORRECTION_RE = re.compile(
     r"isn'?t (?:right|correct)|"
     r"\bdon'?t do that\b|\bwhy did you\b|"
     r"you shouldn'?t have|\bthat'?s not what\b")
+# Agent SELF-retraction (assistant voice) - distinct from CORRECTION_RE, which is the USER
+# correcting the agent. Kept deliberately strict: precision beats recall for a trend metric, so
+# a bounded-gap variant ("my assessment THAT IT WAS CLEAN was wrong") was rejected after it
+# false-matched "My test covers the case where the input was wrong on purpose" (probe 2026-08-04).
+# Known recall gap: measured 6 on 2026-08-03 where the report's analysts qualitatively counted
+# ~14. Treat the output as a LOWER BOUND until the precision/recall gate in SKILL.md passes.
+RETRACTION_RE = re.compile(
+    r"(?i)"
+    r"(?:^|\n)\s*correction\b|"
+    r"\bcorrection to what i (?:just )?said\b|"
+    r"\bi (?:was wrong|misread|got that wrong|misstated|mis-stated)\b|"
+    r"\bmy (?:test|tests|assessment|claim|statement|conclusion) (?:was|were) wrong\b|"
+    r"\bthat (?:was|is) wrong[.,—-]|"
+    r"\bi need to correct\b")
 NUDGE_RE = re.compile(
     r"(?i)^\W*(?:continue|proceed|keep going|go on|carry on|go ahead|"
     r"next|resume|do it)\W*$")
@@ -119,7 +133,7 @@ def scan_file(path, start, end):
     s = {
         "user_turns": 0, "assistant_turns": 0, "tools": {}, "errors": 0,
         "error_samples": [], "interrupts": 0, "denials": 0, "perm_switches": 0,
-        "retries": 0, "first_ts": None, "last_ts": None, "events": 0,
+        "retries": 0, "self_retractions": 0, "first_ts": None, "last_ts": None, "events": 0,
         "in_tokens": 0, "out_tokens": 0, "cache_read_tokens": 0,
         "cache_write_tokens": 0, "tool_secs": {}, "gaps": [], "repeated_error_runs": [],
         "corrections": 0, "nudges": 0,
@@ -165,6 +179,14 @@ def scan_file(path, start, end):
             s["out_tokens"] += u.get("output_tokens", 0) or 0
             s["cache_read_tokens"] += u.get("cache_read_input_tokens", 0) or 0
             s["cache_write_tokens"] += u.get("cache_creation_input_tokens", 0) or 0
+            # NB: join with "\n", NOT " ". RETRACTION_RE anchors on (?:^|\n) for a leading
+            # "Correction:", and space-joining multiple text blocks erases the block boundary,
+            # so a block that STARTS with "Correction:" silently stops matching. Verified
+            # 2026-08-04: " ".join -> MISS, "\n".join -> MATCH on the same input.
+            atext = "\n".join(text_of(b) for b in blocks(d)
+                              if isinstance(b, dict) and b.get("type") == "text")
+            if RETRACTION_RE.search(atext):
+                s["self_retractions"] += 1
             for b in blocks(d):
                 if b.get("type") == "tool_use":
                     name = b.get("name", "?")
@@ -237,7 +259,7 @@ def scan_file(path, start, end):
 def merge_sub(parent, sub):
     for k in ("errors", "interrupts", "denials", "retries", "assistant_turns",
               "in_tokens", "out_tokens", "cache_read_tokens", "cache_write_tokens",
-              "corrections", "nudges", "gate_calls"):
+              "corrections", "nudges", "gate_calls", "self_retractions"):
         parent[k] += sub[k]
     # gate_wait_secs stays parent-only (gap-derived; a subagent's gaps aren't the parent's
     # wall-clock - same rule as gaps/duration below)
@@ -315,11 +337,12 @@ def cmd_scan(day):
     workdir = REPORTS / "work" / day.isoformat()
     workdir.mkdir(parents=True, exist_ok=True)
     (workdir / "scan.json").write_text(json.dumps(result, indent=1))
-    print(f"{'score':>6} {'err':>4} {'int':>4} {'rty':>4} {'turns':>6} {'tools':>6} "
+    print(f"{'score':>6} {'err':>4} {'int':>4} {'rty':>4} {'retr':>5} {'turns':>6} {'tools':>6} "
           f"{'dur_s':>7} {'ktok':>6}  session")
     for s in result["sessions"]:
         print(f"{s['friction_score']:>6} {s['errors']:>4} {s['interrupts']:>4} "
-              f"{s['retries']:>4} {s['user_turns']+s['assistant_turns']:>6} "
+              f"{s['retries']:>4} {s.get('self_retractions', 0):>5} "
+              f"{s['user_turns']+s['assistant_turns']:>6} "
               f"{sum(s['tools'].values()):>6} {s.get('duration_secs', 0):>7.0f} "
               f"{s.get('total_tokens', 0) / 1000:>6.0f}  {s['project']}/{s['session'][:8]}")
     if result["still_active"]:
@@ -428,7 +451,8 @@ def cmd_extract(day, top):
         out = [
             f"# Extract {s['project']}/{s['session']} ({day})",
             f"friction={s['friction_score']} errors={s['errors']} "
-            f"interrupts={s['interrupts']} retries={s['retries']} subagents={s['subagents']}",
+            f"interrupts={s['interrupts']} retries={s['retries']} "
+            f"self_retractions={s.get('self_retractions', 0)} subagents={s['subagents']}",
             f"duration_secs={s.get('duration_secs', 0)} total_tokens={s.get('total_tokens', 0)} "
             f"cache_write_tokens={s.get('cache_write_tokens', 0)}",
             "slowest_tools_secs=" + (", ".join(f"{n}:{v}" for n, v in top_tools) or "none"),
@@ -734,6 +758,22 @@ def selftest():
     assert not CORRECTION_RE.search("stop the server after the test")   # bare verb dropped
     assert not CORRECTION_RE.search("revert to the previous API")       # bare verb dropped
     assert CORRECTION_RE.search("you forgot the import")
+    # self_retractions: assistant-voice retraction, distinct from user-voice CORRECTION_RE
+    assert RETRACTION_RE.search("Correction: `.dev-loop.conf` **does** exist")
+    assert RETRACTION_RE.search("Correction to what I just said: I misread my own process tree")
+    assert RETRACTION_RE.search("My test was wrong - zsh doesn't word-split unquoted $c")
+    assert RETRACTION_RE.search("I was wrong about the trap firing")
+    assert RETRACTION_RE.search("I misread the process tree")
+    assert RETRACTION_RE.search("Actually, I need to correct that.")
+    # the ^|\n anchor must survive multi-block joining (assistant text is "\n"-joined, not " ")
+    assert RETRACTION_RE.search("Here is the analysis.\nCorrection: the log is destroyed.")
+    assert not RETRACTION_RE.search("Here is the analysis. Correction-free summary follows.")
+    # must NOT fire on ordinary prose that merely contains the words
+    assert not RETRACTION_RE.search("The test asserts the old value, which was wrong before the fix.")
+    assert not RETRACTION_RE.search("If the predicate is wrong the guard fails open.")
+    assert not RETRACTION_RE.search("The correction factor is 1.5 in the calibration table.")
+    # user-voice stays with CORRECTION_RE, not this one
+    assert not RETRACTION_RE.search("You forgot the import")
     assert NUDGE_RE.match("continue") and NUDGE_RE.match("proceed")
     assert not NUDGE_RE.match("2pm") and not NUDGE_RE.match("ok")
     assert not NUDGE_RE.match("keep going and also check the logs")

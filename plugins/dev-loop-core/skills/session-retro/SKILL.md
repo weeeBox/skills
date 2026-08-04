@@ -57,6 +57,20 @@ marker) and run the runner again.
   codex/agy review-gate volume and slowest single wait); the reduce prompt reads the last
   14 for trends. Upserted atomically by `scan_sessions.py metrics --date D` after a report
   completes; safe to backfill manually.
+- **`self_retractions` is a LOWER BOUND, not yet a trend axis.** It counts the AGENT
+  retracting its own prior claim, on assistant turns (`RETRACTION_RE`) - distinct from
+  `corrections`, which scans USER turns and measures the user correcting the agent. The
+  regex is deliberately strict: it measured 6 on 2026-08-03 where the report's analysts
+  qualitatively counted ~14, so it under-reports by design (precision beats recall when a
+  false positive would poison a trend). It is reported in the scan table (`retr`) and the
+  extract header, and is deliberately NOT part of `friction_score`.
+  **Acceptance gate before anyone trends it or gates on it:** hand-label every assistant
+  turn in one mid-sized session (~100 turns) as retraction / not, then compute precision
+  and recall of `RETRACTION_RE` against those labels. Require **precision >= 0.95** and
+  **recall >= 0.70**. Below 0.70 recall the count moves with phrasing rather than
+  behaviour and must stay a diagnostic aid only. Re-run this check before ever widening
+  the regex - a bounded-gap variant was already rejected in 2026-08-04 testing for
+  false-matching "My test covers the case where the input was wrong on purpose".
 - **Slow gate detection**: `scan_sessions.py` tags codex/agy review-gate activity
   (`GATE_RE`) in each session and reports `gate_calls` / `gate_wait_secs` /
   `max_gate_wait_secs` in the extract header. A gate that blocks for many minutes, or many
