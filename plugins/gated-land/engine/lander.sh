@@ -109,17 +109,23 @@ cmd_prepare() {
   trap 'git -C "$PRIMARY" worktree remove --force "$wt" 2>/dev/null; git -C "$PRIMARY" worktree prune 2>/dev/null' EXIT
   git -C "$PRIMARY" worktree add -q --detach "$wt" "$base" || die "could not create integration worktree"
 
-  if ! git -C "$wt" merge --no-ff --no-edit "$candidate" >/dev/null 2>&1; then
+  # Diagnostics go to SIBLING paths, never inside $wt: both failure branches below reach `die`,
+  # which exits and fires the EXIT trap that `worktree remove --force`s $wt - a log written inside
+  # it is destroyed on exactly the path it exists to diagnose. Plain `>` (not `tee`): this
+  # function's stdout is the machine-readable KEY=VALUE block the caller parses.
+  local merge_log="$wt.merge.log" suite_log="$wt.suite.log"
+
+  if ! git -C "$wt" merge --no-ff --no-edit "$candidate" >"$merge_log" 2>&1; then
     git -C "$wt" merge --abort 2>/dev/null
     log "land-conflict" "$candidate onto $target@$base"
-    die "MERGE CONFLICT integrating $candidate onto $target — aborted, target untouched" 3
+    die "MERGE CONFLICT integrating $candidate onto $target — aborted, target untouched (log: $merge_log)" 3
   fi
   local integ; integ="$(git -C "$wt" rev-parse HEAD)"
 
   # full suite on the EXACT integration commit (catches two-branches-broken-together)
-  if ! ( cd "$wt" && eval "$SUITE_CMD" ) >/dev/null 2>&1; then
+  if ! ( cd "$wt" && eval "$SUITE_CMD" ) >"$suite_log" 2>&1; then
     log "land-redsuite" "$candidate integ=$(git -C "$wt" rev-parse --short HEAD)"
-    die "SUITE RED on the integration commit — discarded, target untouched" 4
+    die "SUITE RED on the integration commit — discarded, target untouched (log: $suite_log)" 4
   fi
 
   local risk; risk="$(risk_of "$base" "$integ")"
@@ -305,10 +311,17 @@ rc=0; "$SELF" prepare session/c2 main >/dev/null 2>&1 || rc=$?
 check "conflict prepare fails" "[ $rc -eq 3 ]"
 check "target untouched on conflict" "[ \"$(git rev-parse main)\" = \"$mainc\" ]"
 
-# 5. RED SUITE -> prepare fails
+# 5. RED SUITE -> prepare fails, AND the diagnostic log outlives the cleanup trap.
+# The trap on the die path `worktree remove --force`s $wt, so the log must be a SIBLING of $wt,
+# never inside it - an in-worktree log is deleted on exactly the failure it exists to explain.
 git checkout -q -b session/red main; echo z>>docs/x.md; git commit -qam red
-rc=0; LANDER_SUITE_CMD='false' "$SELF" prepare session/red main >/dev/null 2>&1 || rc=$?
+rc=0; rederr="$(LANDER_SUITE_CMD='sh -c "echo RED_MARKER; exit 1"' "$SELF" prepare session/red main 2>&1 >/dev/null)" || rc=$?
 check "red-suite prepare fails" "[ $rc -eq 4 ]"
+redlog="$(printf '%s' "$rederr" | sed -n 's/.*(log: \(.*\))$/\1/p')"
+check "red-suite error names a log path" "[ -n \"$redlog\" ]"
+check "red-suite log survives cleanup with the failure output" "[ -s \"$redlog\" ] && grep -q RED_MARKER \"$redlog\""
+check "red-suite log is a sibling, not inside the removed worktree" "[ ! -e \"${redlog%.suite.log}\" ]"
+rm -f "$redlog"
 
 # 6. TARGET CHECKED OUT in primary -> update-ref CAS + reset --hard path (the real-world case)
 git checkout -q main                         # primary now ON the target
