@@ -68,7 +68,11 @@ cmd_acquire(){
 cmd_record(){
   _paths
   local c="${1:-}" a="${2:-}" r="${3:-}"
-  [ -n "$c" ] && [ -n "$a" ] || { echo "record: empty job id" >&2; return 1; }
+  # agy is advisory and OPT-IN: `-` (or omitted) records "not dispatched", so a RECONNECT knows there
+  # is no agy job to poll. codex is the blocking gate and its id stays REQUIRED - an empty codex id
+  # would leave a reconnect polling nothing, which must never read as a pass.
+  [ -n "$a" ] || a="-"
+  [ -n "$c" ] || { echo "record: empty codex job id" >&2; return 1; }
   local so=""; [ -f "$state" ] && so=$(val owner "$state")   # owner-guarded (codex): only the owner records,
   [ -z "$so" ] || [ "$so" = "$owner" ] || {                  # else a non-owner could hijack the owner field
     echo "record: lock owned by '$so', not me ('$owner') - refusing" >&2; return 1; }
@@ -116,6 +120,21 @@ if [ "${1:-}" = "--selftest" ]; then
   bh=$(val diff_hash "$tmp/.git/review-gate.lock.d/state")
   o=$(run CLAUDE_SESSION_ID=A "$S" acquire "$SC"); [ "$o" = "RECONNECT cx-1 ay-1 1" ] || fail "reconnect ($o)"
   echo "PASS: same session + unchanged diff -> RECONNECT cx-1 ay-1 1"
+
+  # 5b. agy opt-in: record with agy OMITTED stores `-` and still RECONNECTs (codex id still required)
+  run CLAUDE_SESSION_ID=A "$S" release >/dev/null 2>&1
+  run CLAUDE_SESSION_ID=A "$S" acquire "$SC" >/dev/null
+  run CLAUDE_SESSION_ID=A "$S" record cx-2 "" 1 >/dev/null || fail "record must accept an omitted agy id"
+  o=$(run CLAUDE_SESSION_ID=A "$S" acquire "$SC"); [ "$o" = "RECONNECT cx-2 - 1" ] || fail "agy-less reconnect ($o)"
+  echo "PASS: agy omitted -> recorded as '-', RECONNECT cx-2 - 1"
+  # 5c. an empty CODEX id is still refused (a reconnect polling nothing must never read as a pass)
+  run CLAUDE_SESSION_ID=A "$S" record "" ay-9 1 >/dev/null 2>&1 && fail "empty codex id must be refused"
+  echo "PASS: empty codex job id still refused"
+  # restore case 5's state for the checks that follow
+  run CLAUDE_SESSION_ID=A "$S" release >/dev/null 2>&1
+  run CLAUDE_SESSION_ID=A "$S" acquire "$SC" >/dev/null
+  run CLAUDE_SESSION_ID=A "$S" record cx-1 ay-1 1 >/dev/null
+  bh=$(val diff_hash "$tmp/.git/review-gate.lock.d/state")
 
   # 6. record preserved the bootstrap diff_hash (didn't recompute)
   ah=$(val diff_hash "$tmp/.git/review-gate.lock.d/state"); [ "$bh" = "$ah" ] || fail "record changed diff_hash"

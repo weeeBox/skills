@@ -44,6 +44,30 @@ to the lander. Not for a one-shot review - that is `/ship` (human-gated, one cod
 - Resolve `<base>` (usually `main`; ask only if genuinely ambiguous) and confirm
   `git diff <base>...HEAD` (plus any uncommitted work) is non-empty. Empty → STOP, "nothing to gate".
 
+## Step 0b - the class sweep (ONCE, before round 1)
+
+**Do this before the first codex dispatch, not after the first BLOCK.** Measured on a week of gate
+data, the single largest consumer of rounds is *whack-a-mole inside one defect class*: the reviewer
+names one instance, the fix patches that instance, and the next round finds a sibling. One branch spent
+**8 rounds** on a single leak class (a saved value escaping through a new path each round: candidate
+override, then the discovery response, then mixed queries, then a duplicate fact, then a value-scrub,
+then an address-derived id). Another found the *same* finding in three separate rounds.
+
+So, before dispatching:
+
+1. **Name the invariant in one sentence** - what must be true after this diff that was not before
+   ("no saved provider value reaches model context", "every retry path honours the deadline").
+2. **Enumerate every site that could violate it** - `grep` the whole class, do not reason from the
+   files you happened to edit: all return/raise sites, all callers, all branches of the adapter, all
+   admitting verbs, every consumer in the map. Quote the command you ran.
+3. **Fix or explicitly clear each site**, and add **one class-level regression** (not one per site).
+4. **Put the enumeration in the commit message / gate prompt.** It tells the reviewer the class was
+   swept, and it makes an omission visible to *you* first.
+
+If you cannot enumerate the class, say so in the prompt and ask codex to enumerate it - that is a far
+cheaper round than discovering the siblings one per round. A round that fixes exactly the one instance
+named in the prior verdict, with no sweep, is the failure mode this step exists to prevent.
+
 ## The loop (max 3 gate rounds)
 
 At loop entry, append one `gateloop-start` row to the audit log so the cap is counted from data, not
@@ -58,10 +82,14 @@ last `gateloop-start`), so it survives context compaction and clock drift.
    - Red → this is a fix pass: find the **root cause** and fix it, re-run affected + full suite until
      green. Making a real test pass is fine; **deleting or mocking it to go green is what Step 4
      catches** - never do it.
-2. **agy advisory on the UNCOMMITTED working tree, BEFORE commit.** agy cannot review a committed
-   branch, so it must see the working-tree/staged diff here or be marked N/A (clean tree → N/A, say so;
-   don't present an empty agy result as a pass). Advisory only - surface findings, weigh them, do not
-   block on agy alone.
+2. **agy advisory - OPT-IN, skipped by default** (see review-gate's role note: 78% of 91 measured
+   dispatches returned `revisit`/`rethink` on work codex then SHIP'd, and agy can never block). Run it
+   only for a specific reason - a domain codex has been weak on, an ambiguous codex verdict, or on
+   request. When skipped, report `agy: not run (advisory, opt-in)`; that is honest and is **not** a
+   pass. When you DO run it: agy cannot review a committed branch, so it must see the
+   working-tree/staged diff here, BEFORE commit, or be marked N/A (clean tree → N/A, say so; don't
+   present an empty agy result as a pass). Advisory only - surface findings, weigh them, never block or
+   spend a codex round on agy alone.
 3. **Commit** the work on `session/<slug>` (per-task commits as usual).
 4. **Test-tamper guard (hard brake, every round over the whole branch diff):**
    `${CLAUDE_PLUGIN_ROOT}/skills/gate-loop/scripts/tamper-check.sh <base>`.

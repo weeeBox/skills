@@ -42,8 +42,50 @@ the vendored `${CLAUDE_PLUGIN_ROOT}/engine/risk_classify.py` (allowlist + denyli
 - **Non-zero exit → STOP, target untouched.** Surface the reason verbatim: `3`=merge conflict (never
   auto-resolve - hand to a human), `4`=suite red on the integration commit (the semantic-conflict
   catch), `5`=dirty/stale, `2`=usage. Do not proceed.
-- **Exit 0 →** capture the printed `BASE`, `INTEGRATION`, `WORKTREE`, `RISK`. The throwaway worktree is
-  left in place holding the merged commit, for the gate and the commit.
+- **Exit 0 →** capture the printed `BASE`, `INTEGRATION`, `WORKTREE`, `RISK`, `OVERLAP`,
+  `OVERLAP_FILES`. The throwaway worktree is left in place holding the merged commit, for the gate and
+  the commit.
+
+## Step 1b - is there anything new to review? (the merge-interaction check)
+
+`prepare` prints `OVERLAP` = the count of files the candidate touched **that the target also moved
+since the fork**, and `OVERLAP_FILES` = those paths. This is the only surface a land-stage review can
+see that the **branch-stage** gate did not: everything else in `BASE...INTEGRATION` is either the
+candidate diff the branch gate already SHIP'd, or target commits that already landed through this same
+gate.
+
+**Skip Step 2's codex round only when ALL of these hold** (any doubt → run it):
+
+1. `OVERLAP` is exactly `0` - not `unknown`. **`unknown` means the engine could not compute the
+   surface (bad ref, unrelated histories) and is a GATE signal, never a pass.**
+2. The branch gate SHIP'd **this exact candidate tip**: a `gateloop-pass` row in
+   `.claude/state/verify.log` whose head equals `git rev-parse --short <candidate>`. No row, or a row
+   at a different head → the candidate was never gated → **gate it here**.
+3. The suite was green on the integration commit (guaranteed - `prepare` exits 4 otherwise).
+
+```bash
+CTIP="$(git rev-parse --short "$CANDIDATE")"
+if [ "$OVERLAP" = 0 ] && awk -F'\t' -v h="$CTIP" '$2=="gateloop-pass" && $3==h {f=1} END{exit !f}' \
+     "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/.claude/state/verify.log"
+then echo "SKIP-GATE"; else echo "GATE"; fi
+```
+
+- **SKIP-GATE →** log it, then go to Step 3 treating codex as **SHIP**, writing the verdict record with
+  the **branch-stage** codex artifact (it reviewed the same code, so `commit`'s `VERDICT: SHIP`
+  re-verification still has a real reviewer artifact behind it). Say plainly in your report that the
+  land-stage round was skipped and why - never present it as a fresh review.
+  ```bash
+  VLOG="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/.claude/state/verify.log"
+  printf '%s\tland-gate-skipped\t%s\tno merge interaction; branch SHIP at %s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${INTEGRATION:0:8}" "$CTIP" >> "$VLOG"
+  ```
+- **GATE →** Step 2 as normal. When `OVERLAP` is non-zero, **name `OVERLAP_FILES` in the codex prompt as the focus**: those files are where the two lines of work can interact, and that interaction is the question this gate exists to answer.
+
+Why this is safe, and where it is not: the branch gate reviewed the candidate, this gate exists for the
+*combination*, and `OVERLAP=0` means no file carries both. It does **not** prove semantic independence
+across files (branch adds a caller, target changes the callee's contract in a file the branch never
+touched) - the **full suite on the merged commit still runs either way** and is what catches that.
+`OVERLAP` only decides whether a *second LLM review of already-reviewed code* is bought.
 
 ## Step 2 - codex gate on the integration commit
 

@@ -9,8 +9,16 @@ Drive **codex** and **agy** as review gates over one unit of work - a **plan** (
 coding) or a **branch diff** (before merge) - then stop for a human decision.
 
 **Roles (fixed):** Claude orchestrates. **codex = ship/no-ship gate** (its BLOCK means do not ship).
-**agy = advisory** (surfaced and cross-checked, never blocks alone). **v1 boundary:** this skill always
+**agy = advisory, and OFF by default** (see below). **v1 boundary:** this skill always
 stops for a human; it never fixes findings, re-gates to verify, commits, merges, pushes, or ExitWorktrees.
+
+**agy is opt-in, not routine.** Over a measured week agy returned `revisit`/`rethink` on **78% of 91
+dispatches** (5 `proceed`, 11 empty) - on work codex went on to SHIP. A signal that fires almost
+always carries almost no information, and agy can never block, so paying it every round buys a
+near-constant negative plus the time to read it. **Dispatch agy only when you have a specific reason:**
+the diff is in a domain codex has been weak on, codex's verdict is ambiguous and you want a second
+read, or the user asks. Otherwise skip it and report `agy: not run (advisory, opt-in)` - which is
+honest, and is *not* an agy pass. Everything below about agy applies when you do run it.
 
 Scripts it uses live in `${CLAUDE_PLUGIN_ROOT}/skills/review-gate/scripts/` and are **NOT on `PATH`** - always
 call them by full path (or set `RG=${CLAUDE_PLUGIN_ROOT}/skills/review-gate/scripts` and use `"$RG/..."`). Both are
@@ -24,10 +32,21 @@ call them by full path (or set `RG=${CLAUDE_PLUGIN_ROOT}/skills/review-gate/scri
 
 Review a design/plan doc (or a staged change) before any code is written.
 
+**Hard cap: 2 rounds on a prose target.** A design doc has no fixed point - an adversarial reviewer can
+always find another hole in prose, because prose has no compiler and no suite to bound it. Measured: one
+design ran **11 rounds, every one `needs-attention`, and shipped nothing**. After round 2, stop
+gating and go build the smallest real slice; the code, its tests, and the diff-stage gate answer the
+remaining questions with evidence instead of argument. Round 2 ending in BLOCK is a signal the *design
+is not ready to be specified further*, not an invitation to round 3.
+
+(A staged change containing real code is a diff target, not a prose target - the 3-round `gate-loop`
+cap applies to that.)
+
 1. Stage the unit so it shows in `git diff --cached`.
 2. `review-gate-lock.sh acquire "git diff --cached -- <doc>"` and branch on the printed verdict
    (see **Concurrency**). On `ACQUIRED`, dispatch; on `RECONNECT`, poll the printed jobs.
-3. Dispatch **codex** and **agy** in parallel (both fire-and-forget background jobs):
+3. Dispatch **codex** (and **agy** only if you opted in above - then both in parallel, fire-and-forget
+   background jobs; with agy skipped, pass an empty agy job id to `record`):
    - **codex** via the `codex:codex-rescue` agent (or `/codex:adversarial-review`). Prompt: open with:
      **"Your context is read-only: Bash and Skill are DISABLED. The diff, base ref, and branch commit
      list are already inlined above - do not call Bash to reconstruct them (`git`, `ls`, `cat`, `find`
@@ -166,8 +185,8 @@ RG=${CLAUDE_PLUGIN_ROOT}/skills/review-gate/scripts        # bundled scripts are
 verdict=$("$RG/review-gate-lock.sh" acquire "<SCOPE_CMD>") || { echo "lock error -> FAIL CLOSED"; exit 1; }
 read -r tag j_codex j_agy round <<< "$verdict"  # `read` splits on IFS in BOTH bash and zsh; `set -- $verdict` does NOT split in zsh (the user's shell)
 case "$tag" in
-  ACQUIRED)   dispatch codex+agy; then "$RG/review-gate-lock.sh" record <codex_job> <agy_job> <round> ;;
-  RECONNECT)  poll $j_codex / $j_agy - do NOT re-dispatch ;;
+  ACQUIRED)   dispatch codex (+agy only if opted in); then "$RG/review-gate-lock.sh" record <codex_job> <agy_job|omit> <round> ;;
+  RECONNECT)  poll $j_codex / $j_agy - do NOT re-dispatch. $j_agy = `-` means agy was never dispatched (opt-in): there is nothing to poll and nothing to report as an agy result ;;
   RECLAIM)    cancel $j_codex $j_agy (may be empty); acquire again (lockdir already removed -> ACQUIRED); same fail-closed on the re-acquire ;;
   BLOCKED)    STOP now: another session is gating this checkout; use a separate worktree. Do NOT run `release` (you do not own the lock) and do NOT fall through to Reporting's release ;;
   *)          echo "unknown verdict '$verdict' -> FAIL CLOSED"; exit 1 ;;

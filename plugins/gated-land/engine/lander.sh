@@ -87,6 +87,24 @@ risk_of() { # base..integration -> prints HIGH|LOW
   [ "$rc" -eq 0 ] && echo LOW || echo HIGH
 }
 
+overlap_of() { # base candidate -> prints the merge INTERACTION SURFACE, one path per line
+  # Files the candidate touched INTERSECT files the target moved since the fork. Empty means the
+  # integration commit introduces no review surface beyond the candidate diff the BRANCH gate
+  # already SHIP'd, so the land-stage codex round is re-reviewing already-gated code. Non-empty
+  # names exactly the files where the two lines of work can interact semantically.
+  #
+  # FAIL-CLOSED: any git error prints `unknown`, and the /land skill MUST gate on `unknown`
+  # exactly as it gates on a non-empty overlap. Never infer "no overlap" from a failure.
+  local base="$1" candidate="$2" fork a b
+  fork="$(git merge-base "$base" "$candidate" 2>/dev/null)" || { echo unknown; return; }
+  [ -n "$fork" ] || { echo unknown; return; }
+  a="$(git diff --name-only "$fork" "$candidate" 2>/dev/null)" || { echo unknown; return; }
+  b="$(git diff --name-only "$fork" "$base"      2>/dev/null)" || { echo unknown; return; }
+  # `comm` needs sorted input; sed drops the empty line printf emits for an empty side.
+  comm -12 <(printf '%s\n' "$a" | sed '/^$/d' | sort -u) \
+           <(printf '%s\n' "$b" | sed '/^$/d' | sort -u)
+}
+
 target_clean() { # refuse to build on / land onto a dirty target checkout
   # LANDER_STATUS_EXCLUDES: space-separated extra pathspecs to ignore (e.g. a tracked generated dir).
   local ex=""; for p in .claude/state ${LANDER_STATUS_EXCLUDES:-}; do ex="$ex :(exclude)$p"; done
@@ -129,10 +147,22 @@ cmd_prepare() {
   fi
 
   local risk; risk="$(risk_of "$base" "$integ")"
+
+  # Merge interaction surface (see overlap_of). OVERLAP=0 means the branch gate already reviewed
+  # every line in this integration commit; OVERLAP=unknown means we could not tell -> treat as gate.
+  local ovf ovn
+  ovf="$(overlap_of "$base" "$candidate")"
+  if [ "$ovf" = unknown ]; then ovn=unknown
+  else ovn="$(printf '%s' "$ovf" | grep -c . )"; ovn="${ovn:-0}"; fi
+
   trap - EXIT                       # hand the worktree off to the gate; commit/abort will clean it
-  log "land-prepared" "$candidate risk=$risk integ=${integ:0:8}"
-  printf 'CANDIDATE=%s\nTARGET=%s\nBASE=%s\nINTEGRATION=%s\nWORKTREE=%s\nRISK=%s\n' \
-    "$candidate" "$target" "$base" "$integ" "$wt" "$risk"
+  log "land-prepared" "$candidate risk=$risk overlap=$ovn integ=${integ:0:8}"
+  # OVERLAP_FILES is single-quoted: the caller parses this block with `eval`, so an unquoted
+  # multi-file value would execute the second path as a command. Single quotes are stripped from
+  # paths for the same reason (they would close the quote).
+  printf "CANDIDATE=%s\nTARGET=%s\nBASE=%s\nINTEGRATION=%s\nWORKTREE=%s\nRISK=%s\nOVERLAP=%s\nOVERLAP_FILES='%s'\n" \
+    "$candidate" "$target" "$base" "$integ" "$wt" "$risk" "$ovn" \
+    "$(printf '%s' "$ovf" | tr -d "'" | tr '\n' ' ')"
 }
 
 # Re-read codex's OWN artifact; pass ONLY on a clean codex SHIP. Verdict = the LAST line beginning
@@ -486,6 +516,66 @@ out=$(LANDER_RISK_CLASSIFY="$SELF_CLASSIFIER" LANDER_RISK_EXTRA_FLAGS="--deny 'u
 check "extra-flags: malformed value fails closed -> HIGH" "[ '$RISK' = HIGH ]"
 "$SELF" abort "$WORKTREE" cleanup >/dev/null 2>&1 || true
 
+# ---- Task 4: merge INTERACTION SURFACE (OVERLAP) ----------------------------------------------
+# 21. target has NOT moved since the fork -> nothing to interact with -> OVERLAP=0
+git checkout -q main
+git checkout -q -b session/ov0 main; echo "print('ov0')">>src/a.py; git commit -qam ov0; git checkout -q main
+out=$("$SELF" prepare session/ov0 main); eval "$out"
+check "overlap: unmoved target -> 0" "[ '$OVERLAP' = 0 ]"
+"$SELF" abort "$WORKTREE" cleanup >/dev/null 2>&1 || true
+
+# 22. target moved in a DISJOINT file -> still no shared file -> OVERLAP=0
+git checkout -q -b session/ovd main; echo "print('ovd')">>src/a.py; git commit -qam ovd
+git checkout -q main; echo "print('side')" > src/side.py; git add src/side.py; git commit -qam side
+out=$("$SELF" prepare session/ovd main); eval "$out"
+check "overlap: disjoint target move -> 0" "[ '$OVERLAP' = 0 ]"
+"$SELF" abort "$WORKTREE" cleanup >/dev/null 2>&1 || true
+
+# 23. target moved in the SAME file (non-conflicting region) -> OVERLAP=1, file named.
+# src/wide.py gets a long body so the two edits land far apart and merge cleanly.
+git checkout -q main
+{ echo "# wide"; i=0; while [ $i -lt 40 ]; do echo "x$i = $i"; i=$((i+1)); done; } > src/wide.py
+git add src/wide.py; git commit -qam wide
+git checkout -q -b session/ovs main
+{ echo "# TOP EDIT (branch)"; cat src/wide.py; } > src/wide.py.t && mv src/wide.py.t src/wide.py
+git commit -qam ovs-top
+git checkout -q main; echo "# BOTTOM EDIT (target)" >> src/wide.py; git commit -qam ovs-bottom
+out=$("$SELF" prepare session/ovs main); eval "$out"
+check "overlap: same-file target move -> 1" "[ '$OVERLAP' = 1 ]"
+check "overlap: names the shared file" "case \"\$OVERLAP_FILES\" in *src/wide.py*) true;; *) false;; esac"
+"$SELF" abort "$WORKTREE" cleanup >/dev/null 2>&1 || true
+
+# 24. multi-file OVERLAP_FILES survives the caller's `eval` (unquoted would run the 2nd path).
+# Two long files; branch edits the TOP of each, target edits the BOTTOM -> shared files, no conflict.
+git checkout -q main
+for f in src/m1.py src/m2.py; do
+  { echo "# $f"; i=0; while [ $i -lt 40 ]; do echo "y$i = $i"; i=$((i+1)); done; } > "$f"
+done
+git add src/m1.py src/m2.py; git commit -qam multi
+git checkout -q -b session/ovm main
+for f in src/m1.py src/m2.py; do
+  { echo "# TOP (branch)"; cat "$f"; } > "$f.t" && mv "$f.t" "$f"
+done
+git commit -qam ovm-branch
+git checkout -q main
+echo "# BOTTOM (target)" >> src/m1.py; echo "# BOTTOM (target)" >> src/m2.py; git commit -qam ovm-target
+out=$("$SELF" prepare session/ovm main)
+rc=0; eval "$out" || rc=$?
+check "overlap: multi-file block evals cleanly" "[ $rc -eq 0 ]"
+check "overlap: multi-file count = 2" "[ '$OVERLAP' = 2 ]"
+"$SELF" abort "$WORKTREE" cleanup >/dev/null 2>&1 || true
+
+# 25. FAIL-CLOSED: an unresolvable ref makes overlap_of print `unknown`, never an empty/0 overlap
+check "overlap: bad ref fails closed to unknown" \
+  "[ \"\$(\"$SELF\" _overlap deadbeefdeadbeefdeadbeefdeadbeefdeadbeef main 2>/dev/null)\" = unknown ]"
+# 26. unrelated histories have no merge-base -> unknown (NOT 'no shared files')
+git checkout -q --orphan session/orphan
+git rm -rqf . >/dev/null 2>&1 || true
+mkdir -p src; echo "print('orphan')" > src/o.py; git add src/o.py; git commit -qam orphan
+git checkout -q main
+check "overlap: unrelated histories -> unknown" \
+  "[ \"\$(\"$SELF\" _overlap main session/orphan 2>/dev/null)\" = unknown ]"
+
 echo "lander selftest: $pass passed, $fail failed"
 [ $fail -eq 0 ]
 EOSELF
@@ -498,6 +588,7 @@ case "${1:-}" in
   prepare) shift; cmd_prepare "$@" ;;
   commit)  shift; cmd_commit  "$@" ;;
   abort)   shift; cmd_abort   "$@" ;;
+  _overlap) shift; overlap_of "$@" ;;   # introspection only (selftest covers the fail-closed path)
   --selftest) selftest ;;
   *) echo "usage: lander.sh prepare <candidate> [target] | commit <cand> <target> <base> <integ> <wt> | abort <wt> [reason] | --selftest" >&2; exit 2 ;;
 esac
