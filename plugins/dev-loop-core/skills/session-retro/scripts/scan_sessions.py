@@ -64,7 +64,10 @@ RETRACTION_RE = re.compile(
     r"\bthat (?:was|is) wrong[.,—-]|"
     r"\bi need to correct\b|"
     # "One correction to my earlier summary" - the line-start clause above misses mid-sentence use.
-    r"\b(?:one |a )?correction (?:to|i owe|i must)\b|"
+    # The object MUST be self-referential: a bare `correction to` false-matched "every correction
+    # to one has to be checked against the other" twice on 2026-08-05 (general prose about
+    # cross-document drift), which alone put precision at 24/26 = 0.92, under the 0.95 gate.
+    r"\b(?:one |a )?correction (?:to (?:my|what i|something i|the record)|i owe|i must)\b|"
     # "my published number was wrong", "my ad-hoc-entry test was wrong" (<=4 tokens, so the
     # rejected unbounded-gap variant stays rejected and the negative assert still holds).
     r"\bmy [a-z0-9_./-]{1,30}(?: [a-z0-9_./-]{1,30}){0,3} (?:was|were|is|are) wrong\b|"
@@ -804,6 +807,10 @@ def selftest():
     # and a bare "on me" that is not a self-attribution of error.
     assert not RETRACTION_RE.search("I assumed a 200-day span for this run, per the config.")
     assert not RETRACTION_RE.search("The dependency on me is what makes this serial.")
+    # the two real 2026-08-05 false positives that a bare `correction to` produced: prose ABOUT
+    # corrections is not a retraction. These are what took precision to 0.92 before narrowing.
+    assert not RETRACTION_RE.search("every correction to one has to be checked against the other")
+    assert not RETRACTION_RE.search("every correction to one needs checking against the other")
     # the >=5-token gap that the 2026-08-04 probe rejected must STILL be rejected
     assert not RETRACTION_RE.search("My test covers the case where the input was wrong on purpose")
     # must NOT fire on ordinary prose that merely contains the words
