@@ -549,8 +549,28 @@ def cmd_metrics(day):
         "gate_calls": sum(s.get("gate_calls", 0) for s in ss),
         "max_gate_wait_secs": max((s.get("max_gate_wait_secs", 0) for s in ss), default=0),
     }
+    # COVERAGE: first-to-last activity span, so a partial day cannot be read as a full one.
+    # 2026-08-03 covered 20:21-23:59 local (3.6h, the machine was provisioned that day) and was
+    # then used as a full-day baseline in every "three days moving the same way" claim in the
+    # 2026-08-05 report. Normalized per hour of actual coverage, ONE of those five axes survived;
+    # max_duration was pure censoring (no session that day COULD exceed 3.64h). Raw daily counts
+    # are only comparable between days of comparable coverage - emit the span so a reader can
+    # divide, and a low `coverage_hours` is a signal to normalize or to exclude the day entirely.
+    firsts = [s.get("first_ts") for s in ss if s.get("first_ts")]
+    lasts = [s.get("last_ts") for s in ss if s.get("last_ts")]
+    if firsts and lasts:
+        f_dt, l_dt = parse_ts(min(firsts)), parse_ts(max(lasts))
+        line["coverage_hours"] = (
+            round((l_dt - f_dt).total_seconds() / 3600.0, 2) if f_dt and l_dt else None
+        )
+    else:
+        line["coverage_hours"] = None
+    # Per-hour rates for the volume axes, so a trend claim never rests on a raw count alone.
+    ch = line["coverage_hours"]
+    line["tool_calls_per_hour"] = round(line["tool_calls"] / ch, 1) if ch else None
+    line["errors_per_hour"] = round(line["errors"] / ch, 2) if ch else None
     _upsert_jsonl(REPORTS / "metrics.jsonl", line, key="date")
-    print(f"metrics upserted for {line['date']}")
+    print(f"metrics upserted for {line['date']} (coverage_hours={line['coverage_hours']})")
 
 
 # full-schema match (anchored both ends): summary AND (reason) are mandatory -

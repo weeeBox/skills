@@ -65,6 +65,22 @@ from the metrics history. Also report the cost/latency axes now in the metrics h
 `tokens`, `cache_write_tokens`, and `max_duration_secs` - with the same deltas/trends.
 Call out any sustained trend (3+ days moving the same way) explicitly.
 
+**Every scoreboard number is the one in `scan.json` / `metrics.jsonl`. Copy it; never
+re-derive or re-total it.** The 2026-08-05 report printed 6,061 tool calls where both its own
+`scan.json` and `metrics.jsonl` said 5,677, and then built a "density is essentially flat"
+conclusion on the inflated denominator. Recomputed, that day's error rise was significant
+(z = 3.56). If a figure you want is not in those files, say it is unavailable.
+
+**Normalize before claiming a trend: divide by `coverage_hours`, not by the calendar day.**
+`coverage_hours` is first-to-last activity, and `tool_calls_per_hour` / `errors_per_hour`
+are precomputed. A day with materially lower coverage than its neighbours is NOT a valid
+trend baseline - state its coverage and either normalize or exclude it. Worked example:
+2026-08-03 covered 3.64h (machine provisioned that day) against 23.8h on each neighbour;
+the 2026-08-05 report used it raw and reported "five axes moving the same direction three
+days running", of which exactly ONE survived normalization. `max_duration_secs` is the
+worst offender - it is censored by the window itself (no session on a 3.64h day can exceed
+3.64h), so never read it as a trend across days of unequal coverage.
+
 ## Top friction patterns
 One subsection per pattern, worst first. A pattern also present in the previous report
 is flagged **REPEAT** and ranks above new one-offs. Each pattern: what happened
