@@ -42,11 +42,19 @@ CORRECTION_RE = re.compile(
     r"\bdon'?t do that\b|\bwhy did you\b|"
     r"you shouldn'?t have|\bthat'?s not what\b")
 # Agent SELF-retraction (assistant voice) - distinct from CORRECTION_RE, which is the USER
-# correcting the agent. Kept deliberately strict: precision beats recall for a trend metric, so
-# a bounded-gap variant ("my assessment THAT IT WAS CLEAN was wrong") was rejected after it
-# false-matched "My test covers the case where the input was wrong on purpose" (probe 2026-08-04).
-# Known recall gap: measured 6 on 2026-08-03 where the report's analysts qualitatively counted
-# ~14. Treat the output as a LOWER BOUND until the precision/recall gate in SKILL.md passes.
+# correcting the agent. Still precision-first: a bounded-gap variant ("my assessment THAT IT WAS
+# CLEAN was wrong") was rejected in 2026-08-04's probe after it false-matched "My test covers the
+# case where the input was wrong on purpose". That string is now a standing negative assert below.
+#
+# WIDENED 2026-08-06. The strict form measured ~13% recall: 5 matches on 2026-08-05 against an
+# independently sampled true rate of ~33-38 (precision ~0.42 on a broad recall regex, hand-judged
+# over 30 of 78 candidates). Four separate analysts flagged the counter as a false floor, and the
+# day's top friction pattern was invisible to the scoreboard for four consecutive days as a result.
+# Every clause added below was probed against the day's 1,960 real assistant text blocks BEFORE
+# being added, and each one's sampled hits were read: recall 5 -> 26, no measured precision loss.
+# Two candidates were deliberately NOT taken - bare `\bi assumed\b` (a statement of method at least
+# as often as a retraction; narrowed to `than i assumed` / `wrongly assumed`) and a bare `on me`
+# (anchored to `that's ... on me` instead).
 RETRACTION_RE = re.compile(
     r"(?i)"
     r"(?:^|\n)\s*correction\b|"
@@ -54,7 +62,19 @@ RETRACTION_RE = re.compile(
     r"\bi (?:was wrong|misread|got that wrong|misstated|mis-stated)\b|"
     r"\bmy (?:test|tests|assessment|claim|statement|conclusion) (?:was|were) wrong\b|"
     r"\bthat (?:was|is) wrong[.,—-]|"
-    r"\bi need to correct\b")
+    r"\bi need to correct\b|"
+    # "One correction to my earlier summary" - the line-start clause above misses mid-sentence use.
+    r"\b(?:one |a )?correction (?:to|i owe|i must)\b|"
+    # "my published number was wrong", "my ad-hoc-entry test was wrong" (<=4 tokens, so the
+    # rejected unbounded-gap variant stays rejected and the negative assert still holds).
+    r"\bmy [a-z0-9_./-]{1,30}(?: [a-z0-9_./-]{1,30}){0,3} (?:was|were|is|are) wrong\b|"
+    r"\bthat(?:'s| is) (?:the [^.]{0,40} )?(?:mistake|error|one)?,? ?on me\b|"
+    r"\bi (?:overstated|understated|conflated|misattributed|mislabel(?:l?ed)|"
+    r"wrongly assumed|incorrectly assumed)\b|"
+    r"\bthan i (?:assumed|thought)\b|"
+    r"\b(?:is|was|are|were) confounded\b|"
+    r"\b(?:names?|lists?|cites?) (?:it|them|that) wrongly\b|"
+    r"\b(?:is|was) now stale\b")
 NUDGE_RE = re.compile(
     r"(?i)^\W*(?:continue|proceed|keep going|go on|carry on|go ahead|"
     r"next|resume|do it)\W*$")
@@ -768,6 +788,24 @@ def selftest():
     # the ^|\n anchor must survive multi-block joining (assistant text is "\n"-joined, not " ")
     assert RETRACTION_RE.search("Here is the analysis.\nCorrection: the log is destroyed.")
     assert not RETRACTION_RE.search("Here is the analysis. Correction-free summary follows.")
+    # --- 2026-08-06 widening: one assert per added clause, each a real 2026-08-05 string ---
+    assert RETRACTION_RE.search("One correction to my earlier summary: it holds 11 project dirs")
+    assert RETRACTION_RE.search("One correction I owe you: I predicted LOW for this diff")
+    assert RETRACTION_RE.search("my published number was wrong")
+    assert RETRACTION_RE.search("The provenance check is right; my ad-hoc-entry test was wrong")
+    assert RETRACTION_RE.search("that's the class-fix mistake, on me")
+    assert RETRACTION_RE.search("I conflated \"needs headroom below the observed rate\" with the threshold")
+    assert RETRACTION_RE.search("hh113 is 13.24/home-month, not 11.25 - I understated it by 15%")
+    assert RETRACTION_RE.search("The flake root cause is sharper than I assumed")
+    assert RETRACTION_RE.search("The control line is confounded - it counts messages already dropped")
+    assert RETRACTION_RE.search("My design's 6.1 table names it wrongly")
+    assert RETRACTION_RE.search("my last line about it still being up is now stale")
+    # ...and the clauses deliberately NOT taken must stay un-matched: a bare statement of method,
+    # and a bare "on me" that is not a self-attribution of error.
+    assert not RETRACTION_RE.search("I assumed a 200-day span for this run, per the config.")
+    assert not RETRACTION_RE.search("The dependency on me is what makes this serial.")
+    # the >=5-token gap that the 2026-08-04 probe rejected must STILL be rejected
+    assert not RETRACTION_RE.search("My test covers the case where the input was wrong on purpose")
     # must NOT fire on ordinary prose that merely contains the words
     assert not RETRACTION_RE.search("The test asserts the old value, which was wrong before the fix.")
     assert not RETRACTION_RE.search("If the predicate is wrong the guard fails open.")
