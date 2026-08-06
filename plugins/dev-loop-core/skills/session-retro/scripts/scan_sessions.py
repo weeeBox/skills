@@ -134,6 +134,21 @@ def day_bounds(day):
     return start, end
 
 
+def hhmmss(ts):
+    """Wall-clock LOCAL time for an emitted timestamp.
+
+    Transcripts stamp UTC ("...Z"), so parse_ts returns a UTC-aware datetime and a bare
+    .strftime() on it prints UTC. day_bounds windows on LOCAL midnights, so before 2026-08-06
+    every timestamp quoted in an extract was offset from the day it had been selected into -
+    7h on PDT. A report citing "the sleep spam at 15:40:19" meant 08:40:19 local, and nothing
+    said so, which makes a cited time impossible to reconcile against any other local record
+    (verify.log rows, `ps` output, the user's own memory of the day).
+    Emit local everywhere a human or an analyst LLM will read it; keep first_ts/last_ts as
+    full ISO-8601 with offset, which is unambiguous either way.
+    """
+    return ts.astimezone().strftime("%H:%M:%S")
+
+
 def blocks(msg):
     content = (msg.get("message") or {}).get("content")
     if isinstance(content, list):
@@ -192,7 +207,7 @@ def scan_file(path, start, end):
         # latency, async wait, or tool latency - not waste on its own.
         if prev_ts is not None:
             all_gaps.append(((ts - prev_ts).total_seconds(),
-                             prev_ts.strftime("%H:%M:%S"), prev_label))
+                             hhmmss(prev_ts), prev_label))
         t = d.get("type")
         label = t
         if t == "assistant":
@@ -379,7 +394,7 @@ def prune_event(d, start, end, out):
     if ts is None or not (start <= ts < end):
         return
     t = d.get("type")
-    stamp = ts.strftime("%H:%M:%S")
+    stamp = hhmmss(ts)
     if t == "user":
         for b in blocks(d):
             if isinstance(b, dict) and b.get("type") == "tool_result":
@@ -419,7 +434,7 @@ def sub_errors(s, start, end, out, size):
                 continue
             for b in blocks(d):
                 if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error"):
-                    line = (f"[{sub.stem} {ts.strftime('%H:%M:%S')}] "
+                    line = (f"[{sub.stem} {hhmmss(ts)}] "
                             f"TOOL_ERROR: {text_of(b).strip()[:300]}")
                     out.append(line)
                     size += len(line) + 1
@@ -757,6 +772,16 @@ def selftest():
             f.write(json.dumps(l) + "\n")
         f.write('{"partial')  # simulated active writer
         p = Path(f.name)
+    # Emitted timestamps must be LOCAL, matching day_bounds' local windowing. A UTC-stamped
+    # transcript time rendered as UTC is unreconcilable against verify.log / ps / the user's
+    # own recollection; before 2026-08-06 every quoted extract time was offset by the UTC
+    # offset (7h on PDT). Assert against the zone's own conversion rather than a fixed
+    # expected string, so this passes wherever it runs.
+    _utc_noon = datetime(2026, 7, 8, 12, 0, 0, tzinfo=timezone.utc)
+    assert hhmmss(_utc_noon) == _utc_noon.astimezone().strftime("%H:%M:%S")
+    if _utc_noon.astimezone().utcoffset() != timedelta(0):
+        assert hhmmss(_utc_noon) != "12:00:00", "emitted stamp is still UTC, not local"
+
     start, end = day_bounds(date(2026, 7, 8))
     s = scan_file(p, start, end)
     assert s["user_turns"] == 2, s
