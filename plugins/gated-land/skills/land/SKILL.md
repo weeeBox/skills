@@ -112,14 +112,21 @@ with `--base <BASE>`, so codex sees `BASE...INTEGRATION` = the candidate's work 
   printf 'CODEX_RESULT=%s\n' "$CODEX_RESULT_JSON" > "$_t" && mv -f "$_t" "$RECDIR/$INTEGRATION.rec"
   ```
   `commit` re-runs the risk classifier (refuses non-LOW, exit 7) and re-reads that artifact, refusing
-  (exit 8) unless its last anchored `VERDICT:` line is exactly `SHIP`. `LANDER_HUMAN_OVERRIDE=1`
-  is the only bypass of the risk/verdict checks (never of integration validation) - an explicit,
-  `land-override`-logged, in-band escape hatch.
+  (exit 8) unless its last anchored `VERDICT:` line is exactly `SHIP`.
+- **The two waivers are SEPARATE (2026-08-06) - neither bypasses integration validation.**
+  `LANDER_HUMAN_OVERRIDE=1` (alias `LANDER_RISK_OVERRIDE=1`) waives the RISK CLASS ONLY, logged
+  `land-risk-override`. Waiving a missing or non-`SHIP` verdict needs `LANDER_VERDICT_OVERRIDE=1`,
+  logged `land-verdict-override`. They were one flag until 2026-08-06, and that conflation is why
+  **49 of 59 lands carried 10,498 of 10,890 landed src lines past BOTH checks** while only 392 src
+  lines (2.5%) cleared the interlock as designed. Because the classifier fails safe to `HIGH` (see
+  below), the risk waiver is the ROUTINE keystroke - so it must never be the one that also waives
+  the reviewer. **Setting `LANDER_VERDICT_OVERRIDE=1` means landing over an unmet gate: state that
+  in your report, and record it, rather than presenting the land as gated.**
 
 | codex | risk | action |
 |-------|------|--------|
 | SHIP  | LOW  | write the record (above), then **auto-land:** `${CLAUDE_PLUGIN_ROOT}/engine/lander.sh commit <candidate> <target> <BASE> <INTEGRATION> <WORKTREE>` |
-| SHIP  | HIGH | **STOP for a human** even though green - present the diff + risk; a human runs the same `commit` with `LANDER_HUMAN_OVERRIDE=1` |
+| SHIP  | HIGH | **STOP for a human** even though green - present the diff + risk; a human runs the same `commit` with `LANDER_HUMAN_OVERRIDE=1`. That waives the risk class only; the recorded `SHIP` still has to be there, which is the point - a HIGH-risk land is exactly where you want the reviewer's verdict enforced. |
 | SHIP-WITH-CHANGES | any | **not-a-pass:** `abort`, surface the requested changes, STOP for a human (never auto-land a conditional SHIP) |
 | BLOCK | any  | **abort:** `${CLAUDE_PLUGIN_ROOT}/engine/lander.sh abort <WORKTREE> "codex BLOCK"`, surface findings, STOP |
 
