@@ -47,23 +47,37 @@ cap applies to that.)
    (see **Concurrency**). On `ACQUIRED`, dispatch; on `RECONNECT`, poll the printed jobs.
 3. Dispatch **codex** (and **agy** only if you opted in above - then both in parallel, fire-and-forget
    background jobs; with agy skipped, pass an empty agy job id to `record`):
-   - **codex** via the `codex:codex-rescue` agent (or `/codex:adversarial-review`). Prompt: open with:
-     **"Your context is read-only: Bash and Skill are DISABLED. The diff, base ref, and branch commit
-     list are already inlined above - do not call Bash to reconstruct them (`git`, `ls`, `cat`, `find`
-     all fail) and do not `Read`/probe for suite-result artifacts (`.rc`/scratchpad files); treat suite
-     pass/fail as given by the payload, or flag 'suite result not provided' as a finding. Use
-     Read/Glob/Grep only."** Then point at the exact file; demand the two integration-bug classes
-     reviewers routinely miss - (1) **wiring/dead-code** (a module with correct logic that is never
-     imported/registered/wired -> a shipped no-op), (2) **concurrency-path routing** (a new
-     lock/queue/idempotency layer that one caller still bypasses); ask for a verdict line **SHIP /
-     SHIP-WITH-CHANGES / BLOCK** with findings tied to `file:line`.
+   - **codex.** THE PREAMBLE MUST MATCH THE DISPATCH PATH. The two paths have opposite tool sets, and
+     using one path's preamble on the other is what manufactures a spurious BLOCK (2026-08-06 audit:
+     this step previously prescribed the Read/Glob/Grep preamble while listing the `task` path first,
+     so every plan-stage round shipped a preamble that was false in both halves).
+     - **`/codex:adversarial-review` (PREFERRED for a diff).** Read-only sandbox, has Read/Glob/Grep,
+       no shell. Accepts `--base <ref>`; **only this path does.** Preamble: *"Your context is
+       read-only: Bash and Skill are DISABLED. Use Read/Glob/Grep only. Treat suite pass/fail as given
+       by the payload, or flag 'suite result not provided' as a finding; do not probe for `.rc`
+       /scratchpad artifacts."* **Do NOT claim the diff is inlined** - the plugin inlines it only when
+       the change touches <=2 files AND <=256 KB (`lib/git.mjs`), thresholds the caller cannot raise,
+       so on any realistic branch the reviewer is told to derive the diff itself. Claiming otherwise
+       while it cannot run git is the second spurious-BLOCK direction.
+     - **`codex:codex-rescue` / `task` (use when you need an anchored `VERDICT:` line, e.g. for the
+       lander interlock).** This agent's tool set is **Bash only - it has NO Read/Glob/Grep**. Never
+       send it the read-only preamble. Preamble: *"You have a shell and no file-reading tools. Derive
+       the diff yourself with `git diff <base>...HEAD`; nothing is inlined unless this prompt says so.
+       Treat suite pass/fail as given, or flag it as a finding."* Also request read-only explicitly:
+       `codex-rescue` defaults to `--write` (`workspace-write`) unless asked otherwise, so a gate that
+       merely *says* it is read-only is dispatching a write-capable reviewer. Prose is not a sandbox.
+     Then point at the exact file; demand the two integration-bug classes reviewers routinely miss -
+     (1) **wiring/dead-code** (a module with correct logic that is never imported/registered/wired ->
+     a shipped no-op), (2) **concurrency-path routing** (a new lock/queue/idempotency layer that one
+     caller still bypasses); ask for a verdict line **SHIP / SHIP-WITH-CHANGES / BLOCK** with findings
+     tied to `file:line`.
    - **agy** by a DIRECT Bash call to the companion - NOT the `agy:agy-rescue` subagent, which is a
      contractual `task`-only forwarder that refuses `adversarial-review` (it may run once then refuse
      mid-gate; do not depend on it). Resolve the wrapper version-robustly and invoke `adversarial-review`
      (its built-in adversarial prompt; agy verdict vocab is proceed/revisit/rethink - advisory only):
      ```
      AGY=$(ls ~/.claude/plugins/cache/agy-plugin-cc/agy/*/scripts/agy-companion.mjs | sort -V | tail -1)
-     node "$AGY" adversarial-review "Your context is read-only: Bash and Skill are DISABLED. The diff, base ref, and branch commit list are already inlined above - do not call Bash to reconstruct them (git, ls, cat, find all fail) and do not Read/probe for suite-result artifacts (.rc/scratchpad files); treat suite pass/fail as given by the payload, or flag 'suite result not provided' as a finding. Use Read/Glob/Grep only. Focus: wiring/dead-code + concurrency-path routing."
+     node "$AGY" adversarial-review "The full diff is inlined in this prompt - review it as given. Treat suite pass/fail as given, or flag 'suite result not provided' as a finding. Focus: wiring/dead-code + concurrency-path routing."
      ```
      With no `--base` it reviews `git diff HEAD`, falling back to `git diff --cached` - so a staged plan
      is picked up. It prints `Job ID:` and `Get results: /agy:result <id>` (NOT a `Log:` line - that is
@@ -81,18 +95,16 @@ Review a branch diff before merge (the path `/ship` delegates to). Same as plan 
 
 - Resolve `<base>` (usually `main`; ask if ambiguous). Confirm `git diff <base>...HEAD` is non-empty -
   if empty, STOP and report "nothing to ship" (never a clean verdict on empty input).
-- **codex:** `/codex:adversarial-review --base <base>` (scopes to the whole branch diff). Include the
-  same read-only preamble from the plan-stage codex prompt so the reviewer does not attempt disabled
-  Bash/Skill calls or probe suite-result artifacts.
-- **agy:** the companion `adversarial-review` NOW supports `--base`, so it reviews the SAME range as
+- **codex:** `/codex:adversarial-review --base <base>` (scopes to the whole branch diff). Use the
+  `adversarial-review` preamble from the plan stage - read-only, Read/Glob/Grep, and **no claim that
+  the diff is inlined**, since at >2 files the plugin tells the reviewer to derive it itself.
+- **agy:** the companion `adversarial-review` supports `--base`, so it reviews the SAME range as
   codex - dispatch it by the same direct Bash call as the plan stage (never the `agy:agy-rescue`
-  subagent), just add the base and the same read-only preamble/focus text: `node "$AGY"
-  adversarial-review --base <base> "Your context is read-only: Bash and Skill are DISABLED. The diff,
-  base ref, and branch commit list are already inlined above - do not call Bash to reconstruct them
-  (git, ls, cat, find all fail) and do not Read/probe for suite-result artifacts (.rc/scratchpad
-  files); treat suite pass/fail as given by the payload, or flag 'suite result not provided' as a
-  finding. Use Read/Glob/Grep only. Focus: wiring/dead-code + concurrency-path routing."` (runs
-  `git diff <base>...HEAD`). Caveat: the companion hard-rejects a diff >200 KB (`process.exit(1)`); on
+  subagent). agy is a SEPARATE CLI: Claude's tool set is irrelevant to it, and it genuinely does
+  receive the whole diff in its prompt, so it gets its own short preamble - never codex's:
+  `node "$AGY" adversarial-review --base <base> "The full diff is inlined in this prompt - review it
+  as given. Treat suite pass/fail as given, or flag 'suite result not provided' as a finding. Focus:
+  wiring/dead-code + concurrency-path routing."` (runs `git diff <base>...HEAD`). Caveat: the companion hard-rejects a diff >200 KB (`process.exit(1)`); on
   an oversized diff report the agy gap **honestly as a tooling limitation, never as an agy pass**.
 - **Reviewer-side fallback (any Bash-disabled reviewer, when a diff is somehow absent):** establish
   scope BEFORE reading source - `Glob` the files the branch's plan/commit doc claims to touch (a branch
