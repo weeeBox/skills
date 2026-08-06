@@ -193,20 +193,36 @@ cmd_commit() {
   git rev-parse --verify -q "$integ^{commit}" >/dev/null 2>&1 || die "integ is not a valid commit: $integ" 8
   [ "$(git -C "$wt" rev-parse HEAD 2>/dev/null)" = "$integ" ] || die "integration worktree HEAD != $integ — refusing" 8
 
-  # --- coded interlocks (skipped only via the explicit, logged trusted-caller escape hatch) ---
+  # --- coded interlocks (waived only via explicit, separately-logged escape hatches) ---
+  # TWO INDEPENDENT waivers. LANDER_HUMAN_OVERRIDE (and its alias LANDER_RISK_OVERRIDE) waives the
+  # RISK CLASS ONLY. Waiving the recorded codex verdict now requires LANDER_VERDICT_OVERRIDE=1 as a
+  # separate, deliberate act. Measured 2026-08-06: one combined flag carried 49 of 59 lands and
+  # 10,498 of 10,890 landed src lines past BOTH checks, so every routine risk waiver silently
+  # carried a verdict waiver with it, and only 392 src lines (2.5%) ever cleared the gate as
+  # designed - every one of those a flake fix, a test-only branch, or a small UI follow-up.
+  # The risk classifier is deliberately conservative (unclassified fails safe to HIGH), so the risk
+  # waiver is the ROUTINE keystroke - which is exactly why it must not also waive the verdict.
   local rec="$PRIMARY/.claude/state/land-verdicts/$integ.rec"
-  if [ "${LANDER_HUMAN_OVERRIDE:-0}" = "1" ]; then
-    log "land-override" "$candidate integ=${integ:0:8} reason=${LANDER_OVERRIDE_REASON:-human}"
+  local risk_waived="${LANDER_RISK_OVERRIDE:-${LANDER_HUMAN_OVERRIDE:-0}}"
+  local verdict_waived="${LANDER_VERDICT_OVERRIDE:-0}"
+
+  if [ "$risk_waived" = "1" ]; then
+    log "land-risk-override" "$candidate integ=${integ:0:8} reason=${LANDER_OVERRIDE_REASON:-human}"
   else
     local risk; risk="$(risk_of "$base" "$integ")"
     [ "$risk" = LOW ] || { log "land-risk-block" "$candidate risk=$risk"; \
       die "RISK=$risk — auto-land refused; a human reviews and re-runs with LANDER_HUMAN_OVERRIDE=1" 7; }
+  fi
+
+  if [ "$verdict_waived" = "1" ]; then
+    log "land-verdict-override" "$candidate integ=${integ:0:8} reason=${LANDER_OVERRIDE_REASON:-human}"
+  else
     [ -f "$rec" ] || { log "land-verdict-block" "$candidate no-record"; \
-      die "no verdict record for integration $integ — gate did not record a pass; refusing to land" 8; }
+      die "no verdict record for integration $integ — gate did not record a pass. Re-run the gate, or set LANDER_VERDICT_OVERRIDE=1 to land over a missing verdict" 8; }
     local cres
     cres="$(sed -n 's/^CODEX_RESULT=//p'    "$rec" | head -1)"
     _verdict_ok "$cres" || { log "land-verdict-block" "$candidate not-SHIP"; \
-      die "recorded codex verdict is not a clean SHIP for $integ — refusing to land" 8; }
+      die "recorded codex verdict is not a clean SHIP for $integ — refusing to land. Fix and re-gate, or set LANDER_VERDICT_OVERRIDE=1 to land over the verdict" 8; }
   fi
 
   local now; now="$(git rev-parse --verify "refs/heads/$target^{commit}")"
@@ -315,7 +331,7 @@ check "prepare RISK=HIGH on src/secrets" "[ '$RISK_SENS' = HIGH ]"
 
 # 2. commit lands it (target checked out is 'session/feat', not main -> CAS update-ref path)
 git checkout -q session/feat
-rc=0; LANDER_HUMAN_OVERRIDE=1 "$SELF" commit session/feat main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null || rc=$?
+rc=0; LANDER_HUMAN_OVERRIDE=1 LANDER_VERDICT_OVERRIDE=1 "$SELF" commit session/feat main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null || rc=$?
 check "commit ok" "[ $rc -eq 0 ]"
 check "main advanced to integration" "[ \"$(git rev-parse main)\" = '$INTEGRATION' ]"
 check "throwaway worktree cleaned" "[ ! -d '$WORKTREE' ]"
@@ -359,7 +375,7 @@ git checkout -q -b session/co main; echo "print('co')">>src/a.py; git commit -qa
 git checkout -q main                         # back on target, clean
 before6=$(git rev-parse main)
 out=$("$SELF" prepare session/co main); eval "$out"
-rc=0; LANDER_HUMAN_OVERRIDE=1 "$SELF" commit session/co main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null || rc=$?
+rc=0; LANDER_HUMAN_OVERRIDE=1 LANDER_VERDICT_OVERRIDE=1 "$SELF" commit session/co main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null || rc=$?
 check "checked-out commit ok" "[ $rc -eq 0 ]"
 check "checked-out main advanced" "[ \"$(git rev-parse main)\" = '$INTEGRATION' ]"
 check "checked-out HEAD==main (worktree synced)" "[ \"$(git rev-parse HEAD)\" = '$INTEGRATION' ]"
@@ -374,7 +390,7 @@ check "classifier-fail -> RISK=HIGH (fail closed)" "[ '$RISK' = HIGH ]"
 # 8. LANDER_PUSH=1 with no remote -> local land succeeds but push fails -> exit 6, target advanced
 git checkout -q -b session/pf main; echo "print('pf')">>src/a.py; git commit -qam pf; git checkout -q main
 out=$("$SELF" prepare session/pf main); eval "$out"
-rc=0; LANDER_PUSH=1 LANDER_HUMAN_OVERRIDE=1 "$SELF" commit session/pf main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
+rc=0; LANDER_PUSH=1 LANDER_HUMAN_OVERRIDE=1 LANDER_VERDICT_OVERRIDE=1 "$SELF" commit session/pf main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
 check "push-fail exits 6" "[ $rc -eq 6 ]"
 check "push-fail still landed locally" "[ \"$(git rev-parse main)\" = '$INTEGRATION' ]"
 
@@ -399,7 +415,7 @@ check "git-diff-fail -> nonzero (pipefail fail-closed)" "[ $rc -ne 0 ]"
 # exclude it via pathspec so commit is not refused. .claude/ is NOT in .git/info/exclude here.
 git checkout -q -b session/sd main; echo "print('sd')">>src/a.py; git commit -qam sd; git checkout -q main
 out=$("$SELF" prepare session/sd main); eval "$out"
-rc=0; LANDER_HUMAN_OVERRIDE=1 "$SELF" commit session/sd main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
+rc=0; LANDER_HUMAN_OVERRIDE=1 LANDER_VERDICT_OVERRIDE=1 "$SELF" commit session/sd main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
 check "self-dirty: commit succeeds despite .claude/state/verify.log" "[ $rc -eq 0 ]"
 
 # 12. LANDER_RISK_PYTHONPATH (P-D): a classifier that imports a module present ONLY via the trusted seam.
@@ -492,11 +508,38 @@ mk_rec "$INTEGRATION" "$(mk_codex SHIP hi)"
 rc=0; "$SELF" commit session/hi main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
 check "interlock: HIGH without override refused exit 7" "[ $rc -eq 7 ]"
 
-# 19. re-prepare (case 18's refused commit cleaned the worktree), then override -> commits
+# 19. THE SPLIT: a risk waiver alone must NOT waive the codex verdict.
+# Advance the branch first - re-preparing an UNCHANGED tree within the same second yields an
+# IDENTICAL merge sha (same parents/tree/message/author), so case 18's record would still match and
+# this case would silently pass for the wrong reason.
+git checkout -q session/hi; echo x=9>>src/secrets/k.py; git commit -qam hi-again; git checkout -q main
 out=$("$SELF" prepare session/hi main); eval "$out"
+before19=$(git rev-parse main)
+check "split: re-prepare produced a NEW integration sha" "[ ! -f '$D/.claude/state/land-verdicts/$INTEGRATION.rec' ]"
 rc=0; LANDER_HUMAN_OVERRIDE=1 "$SELF" commit session/hi main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
-check "interlock: HIGH with override commits" "[ $rc -eq 0 ]"
+check "split: risk waiver alone does NOT waive verdict (exit 8)" "[ $rc -eq 8 ]"
+check "split: target untouched when verdict missing" "[ \"$(git rev-parse main)\" = \"$before19\" ]"
+# exit 8 is shared with the integ/worktree validations above, so the code alone does not prove the
+# missing-verdict branch ran. Assert that branch's own log line.
+check "split: verdict branch actually ran (no-record logged)" "grep -q 'land-verdict-block	.*session/hi no-record' '$D/.claude/state/verify.log'"
+
+# 19b. risk waiver + a real recorded SHIP -> commits (the intended override path).
+# Re-prepare: case 19's die fired cmd_commit's EXIT trap, which removes the throwaway worktree, so
+# the previous $WORKTREE is gone and the integ-vs-worktree-HEAD check would fail first.
+out=$("$SELF" prepare session/hi main); eval "$out"
+mk_rec "$INTEGRATION" "$(mk_codex SHIP hi)"
+rc=0; LANDER_HUMAN_OVERRIDE=1 "$SELF" commit session/hi main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
+check "interlock: HIGH with risk waiver + SHIP commits" "[ $rc -eq 0 ]"
 check "interlock: override advanced main" "[ \"$(git rev-parse main)\" = '$INTEGRATION' ]"
+
+# 19c. explicit verdict waiver lands over a MISSING record, and logs under its own tag.
+# Fresh branch: session/hi is already merged into main by 19b.
+git checkout -q -b session/hi2 main; echo x=2>>src/secrets/k.py; git commit -qam hi2; git checkout -q main
+out=$("$SELF" prepare session/hi2 main); eval "$out"
+rc=0; LANDER_HUMAN_OVERRIDE=1 LANDER_VERDICT_OVERRIDE=1 "$SELF" commit session/hi2 main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
+check "split: explicit verdict waiver lands" "[ $rc -eq 0 ]"
+# Scoped to this candidate: an unscoped grep would match a land-verdict-override from an earlier case.
+check "split: verdict waiver logged under its own tag" "grep -q 'land-verdict-override	.*session/hi2' '$D/.claude/state/verify.log'"
 
 # ---- Task 3: LANDER_RISK_EXTRA_FLAGS forwarding (uses the REAL classifier) ---------------------
 SELF_CLASSIFIER="$(cd "$(dirname "$SELF")" && pwd)/risk_classify.py"
