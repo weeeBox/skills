@@ -441,17 +441,30 @@ def sub_errors(s, start, end, out, size):
     return size
 
 
-def cmd_extract(day, top):
-    import hashlib
-    workdir = REPORTS / "work" / day.isoformat()
-    scan_path = workdir / "scan.json"
-    result = json.loads(scan_path.read_text()) if scan_path.exists() else cmd_scan(day)
-    start, end = day_bounds(day)
-    cap = min(top, 8)
-    sessions = result["sessions"]
+SLOW_RESERVE_MIN_SECS = 1800
+
+
+def pick_sessions(sessions, cap):
+    """Choose which `cap` sessions get an evidence extract -> (picked, slow_reserved).
+
+    Reserves up to 2 slots for the LONGEST sessions the friction ranking would not
+    surface on its own, so "slow but quiet" sessions stop being invisible.
+
+    The reserve used to key on `friction_score == 0`, which is only a proxy for "friction
+    misses it" and is wrong on any day with more than `cap` friction-positive sessions. On
+    2026-08-06 (22 sessions, 13 friction-positive, cap 8) every friction==0 session was a
+    sub-5-minute stub, so the reserve spent 2 of the 8 analysis slots on a 56s and a 257s
+    session while a 9.1h and a 7.4h session - friction-positive, but ranked below the cut -
+    were dropped entirely. Key on the actual cut instead, with a duration floor so a quiet
+    day cannot reserve trivia.
+    """
     fric = [s for s in sessions if s["friction_score"] > 0]
-    slow = [s for s in sorted(sessions, key=lambda x: x.get("duration_secs", 0), reverse=True)
-            if s.get("duration_secs", 0) > 0]
+    above_cut = {(s["project"], s["session"]) for s in fric[:cap]}
+    slow = sorted((s for s in sessions if s.get("duration_secs", 0) > 0),
+                  key=lambda x: -x.get("duration_secs", 0))
+    reserve = [s for s in slow
+               if (s["project"], s["session"]) not in above_cut
+               and s.get("duration_secs", 0) >= SLOW_RESERVE_MIN_SECS]
     picked, seen, slow_added = [], set(), []
 
     def _add(s):
@@ -462,24 +475,28 @@ def cmd_extract(day, top):
         picked.append(s)
         return True
 
-    # Reserve up to 2 of the `cap` slots for the slowest sessions friction would NOT
-    # surface (friction==0 but long wall-clock) - so "slow but quiet" sessions stop
-    # being invisible. The rest go to friction; leftover slots backfill with slow.
-    # Note: when friction sessions exceed cap, this drops the 2 weakest to make room.
-    for s in [x for x in slow if x["friction_score"] == 0][:2]:
+    for s in reserve[:2]:
         if len(picked) < cap and _add(s):
             slow_added.append(s)
-    for s in fric:
-        if len(picked) >= cap:
-            break
-        _add(s)
-    for s in slow:
-        if len(picked) >= cap:
-            break
-        _add(s)
+    for pool in (fric, slow):
+        for s in pool:
+            if len(picked) >= cap:
+                break
+            _add(s)
     picked.sort(key=lambda x: (x["friction_score"], x.get("duration_secs", 0)), reverse=True)
+    return picked, slow_added
+
+
+def cmd_extract(day, top):
+    import hashlib
+    workdir = REPORTS / "work" / day.isoformat()
+    scan_path = workdir / "scan.json"
+    result = json.loads(scan_path.read_text()) if scan_path.exists() else cmd_scan(day)
+    start, end = day_bounds(day)
+    cap = min(top, 8)
+    picked, slow_added = pick_sessions(result["sessions"], cap)
     if slow_added:
-        print("slow-reserved extracts (friction=0, long wall-clock): "
+        print("slow-reserved extracts (long wall-clock, below the friction cut): "
               + ", ".join(f"{s['session'][:8]}({s.get('duration_secs', 0):.0f}s)"
                           for s in slow_added))
     for s in picked:
@@ -971,6 +988,22 @@ def selftest():
     dur = (parse_ts(s2["last_ts"]) - parse_ts(s2["first_ts"])).total_seconds()
     assert dur == 40.0, dur
     p2.unlink()
+    # extract slot allocation: the 2 reserved slots go to the longest sessions BELOW the
+    # friction cut - never to short stubs that merely happen to score 0 (the 2026-08-06
+    # defect: two <5min sessions took 2 of 8 slots while 9.1h and 7.4h sessions were cut).
+    def _s(sid, fs, dur):
+        return {"project": "p", "session": sid, "friction_score": fs, "duration_secs": dur}
+    day_sessions = ([_s(f"f{i}", 9 - i, 1000) for i in range(8)]     # the friction top-8
+                    + [_s("long", 0.5, 30000), _s("stub1", 0, 60), _s("stub2", 0, 57)])
+    picked, reserved = pick_sessions(day_sessions, 8)
+    ids = [s["session"] for s in picked]
+    assert len(picked) == 8, ids
+    assert "long" in ids and [s["session"] for s in reserved] == ["long"], (ids, reserved)
+    assert "stub1" not in ids and "stub2" not in ids, ids
+    # floor: on a quiet day nothing below SLOW_RESERVE_MIN_SECS may be reserved
+    _, quiet = pick_sessions([_s("f0", 5, 100), _s("stub1", 0, 60)], 8)
+    assert quiet == [], quiet
+
     # metrics upsert is idempotent per date (atomic replace-by-date)
     global REPORTS
     real_reports = REPORTS
