@@ -34,7 +34,20 @@ to the lander. Not for a one-shot review - that is `/ship` (human-gated, one cod
   lock. Drive codex/agy **through the `review-gate` skill** (from the `dev-loop-core` plugin, a hard dependency), do not reinvent the mechanics.
 - `${CLAUDE_PLUGIN_ROOT}/skills/gate-loop/scripts/tamper-check.sh <base> [HEAD]` - the coded test-tamper guard
   (exit 3 = tamper). `--selftest`ed.
-- `.claude/state/verify.log` - the append-only audit trail (tab-separated `ts<TAB>event<TAB>head<TAB>detail`).
+- **`$VLOG` - the append-only audit trail** (tab-separated `ts<TAB>event<TAB>head<TAB>detail`), resolved
+  ONCE at Step 0 and used for every write below. It lives in the **primary checkout**, never the worktree:
+
+  ```bash
+  VLOG="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/.claude/state/verify.log"
+  ```
+
+  **Never write it as a bare `.claude/state/verify.log`.** This skill *requires* running in a worktree
+  (Step 0), and `.claude/state/` is gitignored, so a cwd-relative append creates a SEPARATE log inside
+  the worktree. The `land` skill and `lander.sh` both read the primary checkout's copy - so a
+  `gateloop-pass` written cwd-relative is structurally invisible to land's Step-1b SKIP-GATE check,
+  and every land pays a second codex round on code the branch gate already SHIP'd. Measured on one
+  repo 2026-08-07: 8 `gateloop-pass` rows, 87% of prepares at `OVERLAP=0`, and `land-gate-skipped`
+  had fired exactly **once** in the repo's entire history.
 
 ## Step 0 - preflight
 
@@ -43,6 +56,15 @@ to the lander. Not for a one-shot review - that is `/ship` (human-gated, one cod
   the integration target.
 - Resolve `<base>` (usually `main`; ask only if genuinely ambiguous) and confirm
   `git diff <base>...HEAD` (plus any uncommitted work) is non-empty. Empty → STOP, "nothing to gate".
+- **Resolve `$VLOG` now** (see Reused pieces) and use it for every audit write in this skill. Sanity-check
+  it points OUTSIDE the worktree - if `$VLOG` starts with `$(git rev-parse --show-toplevel)`, you
+  resolved it wrong and `land` will not see your `gateloop-pass`:
+
+  ```bash
+  VLOG="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/.claude/state/verify.log"
+  case "$VLOG" in "$(git rev-parse --show-toplevel)"/*) echo "VLOG resolved INTO the worktree - abort"; exit 1 ;; esac
+  mkdir -p "$(dirname "$VLOG")"
+  ```
 
 ## Step 0b - the class sweep (ONCE, before round 1)
 
@@ -71,10 +93,10 @@ named in the prior verdict, with no sweep, is the failure mode this step exists 
 ## The loop (max 3 gate rounds)
 
 At loop entry, append one `gateloop-start` row to the audit log so the cap is counted from data, not
-memory: `printf '%s\tgateloop-start\t%s\t-\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse --short HEAD)" >> .claude/state/verify.log`.
+memory: `printf '%s\tgateloop-start\t%s\t-\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse --short HEAD)" >> "$VLOG"`.
 
 Repeat the round below. A **round** = one gate attempt (codex). **Cap from data, not memory:**
-at the top of each round, if `${CLAUDE_PLUGIN_ROOT}/skills/gate-loop/scripts/round-count.sh .claude/state/verify.log`
+at the top of each round, if `${CLAUDE_PLUGIN_ROOT}/skills/gate-loop/scripts/round-count.sh "$VLOG"`
 returns `>=3`, take the Cap-out path (do NOT start a 4th round). The count is positional (rows after the
 last `gateloop-start`), so it survives context compaction and clock drift.
 
@@ -132,14 +154,20 @@ last `gateloop-start`), so it survives context compaction and clock drift.
 
 ## verify.log rows
 
-Append one tab-separated row per terminal event to your audit log (`.claude/state/verify.log`):
+Append one tab-separated row per terminal event to `$VLOG` (resolved at Step 0 - the PRIMARY
+checkout's log, never the worktree's):
 
 ```
-printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" <event> "$(git rev-parse --short HEAD)" "<detail>" >> .claude/state/verify.log
+printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" <event> "$(git rev-parse --short HEAD)" "<detail>" >> "$VLOG"
 ```
 
 Events: `gateloop-pass` (detail = base + rounds used), `gateloop-block` (per BLOCK round, detail =
 one-line findings), `gateloop-capout`, `gateloop-tamper` (detail = offending paths).
+
+`gateloop-pass` is the one row another skill CONSUMES: `land`'s Step 1b skips its codex round only
+when `OVERLAP=0` **and** a `gateloop-pass` row exists whose head equals
+`git rev-parse --short <candidate>`. So it must be written to `$VLOG` at the FINAL candidate tip - a
+row at an earlier head, or in the worktree's log, silently costs a full extra codex round at land.
 
 ## Ceiling
 
