@@ -22,13 +22,21 @@ which event you mean.
    a CLAUDE.md rule (give exact text), a skill (name + 3-line outline), a doc, a code/
    repo reorganization, a permission/settings change, or a tool. If nothing would have
    helped, say so honestly.
-5. **Time sinks**: from the extract header (`duration_secs`, `largest_gaps`,
-   `slowest_tools_secs`, `repeated_error_runs`, `gate_calls`/`gate_wait_secs`), note where
-   wall-clock and tokens went. Treat `largest_gaps` as NEUTRAL time (human think-time /
-   model latency / async wait / tool latency) - only call a gap wasted if you can cite
-   thrash (a retry loop, a re-read, a dead-tool volley). `repeated_error_runs` ARE waste;
-   call them out. A high `gate_wait_secs` or many `gate_calls` (codex/agy review gate) IS a
-   nameable cost, not neutral wait - flag it and note if it was repeated re-gate rounds.
+5. **Time sinks**: from the extract header (`duration_secs`, `wall_clock`, `bg_jobs`,
+   `largest_gaps`, `slowest_tools_secs`, `repeated_error_runs`, `gate_calls`/`gate_wait_secs`),
+   note where wall-clock and tokens went. Treat `largest_gaps` as NEUTRAL time (human
+   think-time / model latency / async wait / tool latency) - only call a gap wasted if you can
+   cite thrash (a retry loop, a re-read, a dead-tool volley). `repeated_error_runs` ARE waste;
+   call them out. THREE things in that header are NAMEABLE costs, not neutral wait:
+   - a high `gate_wait_secs` or many `gate_calls` (codex/agy review gate) - note if it was
+     repeated re-gate rounds;
+   - a large `human_wait` share in `wall_clock` - the agent ended its turn with nothing
+     running. For each such stop, say whether the next step was already known (a queued item,
+     a named follow-up) or whether it genuinely needed a human decision. The first is waste;
+     the second is not;
+   - a `parallelism` near 1.0x with several `bg_jobs` - the jobs ran strictly one after
+     another. Say what could have run alongside, or say nothing could.
+   Do not call `work` time waste; that bucket is the agent actually working.
 
 Be concrete and terse. No generic advice. Output only the analysis, nothing else.
 

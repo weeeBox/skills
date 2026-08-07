@@ -54,9 +54,31 @@ marker) and run the runner again.
 
 - `session-reports/metrics.jsonl` - one wrapper-written JSON line per day (sessions,
   errors, interrupts, retries, top friction, plus `gate_calls` and `max_gate_wait_secs` -
-  codex/agy review-gate volume and slowest single wait); the reduce prompt reads the last
-  14 for trends. Upserted atomically by `scan_sessions.py metrics --date D` after a report
-  completes; safe to backfill manually.
+  codex/agy review-gate volume and slowest single wait, and the wall-clock partition below);
+  the reduce prompt reads the last 14 for trends. Upserted atomically by
+  `scan_sessions.py metrics --date D` after a report completes; safe to backfill manually.
+- **Wall-clock partition (`work_secs` / `human_wait_secs` / `blocked_secs`).** Every
+  inter-event gap lands in exactly one bucket, so the three sum to the session's span:
+  `blocked` = the gap follows a tool/gate dispatch, or the agent ended its turn while a
+  background job was still in flight; `human_wait` = the agent ended its turn with NOTHING
+  running, so only a human could restart it; `work` = everything else. The two waits are
+  indistinguishable without the in-flight set - which is why they used to be one undifferentiated
+  "NEUTRAL wall-clock" bucket that no finding could name. Background jobs are correlated exactly:
+  a completion `<task-notification>` carries its dispatching tool_use's id (`BG_NOTIFY_RE`), which
+  also yields `bg_jobs` / `bg_job_secs` / `bg_blocked_secs` and a **parallelism ratio** (job time
+  / wall-clock blocked); ~1.0x with several jobs means they ran strictly one after another.
+  Validated against an independent hand-analysis of session `3f02f940` (2026-08-07): that
+  session's 1.09x hand-computed parallelism reads 1.07x here, and its ~64/27/8 human/blocked/work
+  split reads 54/35/10 over a wider window. Day-level sums in metrics.jsonl are session-hours
+  across overlapping sessions, NOT clock-hours - compare the buckets to each other, not to the day.
+  Jobs still in flight when the day window closes are uncounted, so `bg_*` is a lower bound.
+- **The gap timeline is built from `user`/`assistant` rows only** (`TIMELINE_TYPES`). Transcripts
+  also carry `system` / `attachment` / `queue-operation` / `file-history-delta` rows that are not
+  agent steps; letting them terminate a gap destroys the attribution the label exists for. Measured
+  on `3f02f940`, 83% of gap-seconds - including that session's 7.25h stall - were reported as
+  "after system", and a gate gap with a system row after the dispatch was dropped from
+  `gate_wait_secs` entirely. Gates dispatched as background jobs are now charged from dispatch to
+  completion notification (the same session read 8 min of gate wait against a ~1.6h hand count).
 - **`self_retractions` is a LOWER BOUND, not yet a trend axis.** It counts the AGENT
   retracting its own prior claim, on assistant turns (`RETRACTION_RE`) - distinct from
   `corrections`, which scans USER turns and measures the user correcting the agent. It is

@@ -97,6 +97,32 @@ GATE_RE = re.compile(
     r'"skill":\s*"[^"]*(?:review-gate|gate-loop|:land|:ship)')              # gate skills via Skill
 
 
+# A background job (a `run_in_background` Bash, or an async Agent) reports completion as a
+# <task-notification> user turn carrying the DISPATCHING tool_use's id - so dispatch->completion
+# correlates exactly, no heuristics. This is what makes "blocked on a background job" measurable
+# and separable from "waiting on a human": both look like an assistant turn followed by a long
+# gap, and only the in-flight set tells them apart.
+BG_NOTIFY_RE = re.compile(r"<task-notification>.*?<tool-use-id>([^<]+)</tool-use-id>", re.S)
+# Row types that ARE agent steps. Everything else in a transcript is meta bookkeeping.
+TIMELINE_TYPES = {"user", "assistant"}
+
+
+def merge_intervals(iv):
+    """Union length of [start, end) intervals, in seconds. Overlapping background jobs are
+    concurrent wall-clock, so their waits must not be summed twice."""
+    total, cur_s, cur_e = 0.0, None, None
+    for s0, e0 in sorted(iv):
+        if cur_e is None or s0 > cur_e:
+            if cur_e is not None:
+                total += (cur_e - cur_s).total_seconds()
+            cur_s, cur_e = s0, e0
+        elif e0 > cur_e:
+            cur_e = e0
+    if cur_e is not None:
+        total += (cur_e - cur_s).total_seconds()
+    return total
+
+
 def is_gate_call(name, input_json):
     """True iff a tool call is a codex/agy gate dispatch/poll: a job-dispatcher tool (GATE_TOOLS)
     whose input carries a gate signature. The name gate stops gate-MENTIONING reads/questions from
@@ -176,12 +202,19 @@ def scan_file(path, start, end):
         "cache_write_tokens": 0, "tool_secs": {}, "gaps": [], "repeated_error_runs": [],
         "corrections": 0, "nudges": 0,
         "gate_calls": 0, "gate_wait_secs": 0.0, "max_gate_wait_secs": 0.0,
+        "work_secs": 0.0, "human_wait_secs": 0.0, "blocked_secs": 0.0,
+        "bg_jobs": 0, "bg_job_secs": 0.0, "bg_blocked_secs": 0.0,
     }
     prev_call = None
     prev_ts = None          # datetime of the previous in-day event (transcript order)
     prev_label = None       # what the previous event was, for gap attribution
     pending = {}            # tool_use id -> (name, ts) awaiting its tool_result
-    all_gaps = []           # (secs, at_hms, after_label) - top-5 kept at the end
+    dispatched = {}         # tool_use id -> ts, kept for the whole scan (a background Bash
+                            # gets its tool_result immediately; completion arrives much later)
+    bg_iv = []              # (dispatch_ts, completion_ts) per correlated background job
+    gate_ids = set()        # tool_use ids that dispatched a codex/agy gate
+    gate_bg = []            # durations of gate jobs that ran in the BACKGROUND
+    all_gaps = []           # (secs, at_hms, after_label, gap_start_ts)
     cur_err = None          # first line of the current consecutive-error run
     cur_err_count = 0
     runs = []               # completed runs of >=2 identical consecutive errors
@@ -202,13 +235,22 @@ def scan_file(path, start, end):
         s["events"] += 1
         s["first_ts"] = s["first_ts"] or ts.isoformat()
         s["last_ts"] = ts.isoformat()
+        t = d.get("type")
+        # The gap timeline is built from user/assistant rows ONLY. A transcript also carries
+        # meta rows (system, attachment, queue-operation, file-history-delta) that are not agent
+        # steps, and letting them terminate a gap destroys the attribution the label exists for:
+        # measured on 3f02f940, 48,882 of 59,204 gap-seconds (83%) - including the session's
+        # 7.25h stall - were attributed to "after system", and any gate gap with a system row
+        # after the dispatch was silently dropped from gate_wait_secs.
+        if t not in TIMELINE_TYPES:
+            continue
         # inter-event gap in TRANSCRIPT order (not sorted), attributed to what the
         # previous event was. NEUTRAL wall-clock: may be human think-time, model
         # latency, async wait, or tool latency - not waste on its own.
         if prev_ts is not None:
-            all_gaps.append(((ts - prev_ts).total_seconds(),
-                             hhmmss(prev_ts), prev_label))
-        t = d.get("type")
+            # max(0): rows are not strictly monotonic (a file-history-delta can back-date)
+            all_gaps.append((max(0.0, (ts - prev_ts).total_seconds()),
+                             hhmmss(prev_ts), prev_label, prev_ts))
         label = t
         if t == "assistant":
             s["assistant_turns"] += 1
@@ -233,6 +275,7 @@ def scan_file(path, start, end):
                     bid = b.get("id")
                     if bid:
                         pending[bid] = (name, ts)  # local to this file: never crosses scans
+                        dispatched[bid] = ts
                     call = (name, json.dumps(b.get("input", {}), sort_keys=True))
                     if call == prev_call:
                         s["retries"] += 1
@@ -240,7 +283,20 @@ def scan_file(path, start, end):
                     if is_gate_call(name, call[1]):
                         s["gate_calls"] += 1
                         label = "gate:" + name   # so the FOLLOWING gap is attributed to the gate
+                        if bid:
+                            gate_ids.add(bid)
         elif t == "user":
+            # background-job completion: correlates to its dispatching tool_use by id.
+            # content is a bare string on these turns, so read it raw, not via blocks().
+            raw = (d.get("message") or {}).get("content")
+            raw_text = raw if isinstance(raw, str) else " ".join(
+                text_of(b) for b in blocks(d) if isinstance(b, dict))
+            for nm_ in BG_NOTIFY_RE.finditer(raw_text):
+                t0 = dispatched.get(nm_.group(1))
+                if t0 is not None and ts > t0:
+                    bg_iv.append((t0, ts))
+                    if nm_.group(1) in gate_ids:
+                        gate_bg.append((ts - t0).total_seconds())
             has_tool_result = False
             for b in blocks(d):
                 if isinstance(b, dict) and b.get("type") == "tool_result":
@@ -283,13 +339,39 @@ def scan_file(path, start, end):
         prev_ts, prev_label = ts, label
     flush_run()
     s["gaps"] = [{"secs": round(g, 1), "at": at, "after": lab}
-                 for g, at, lab in sorted(all_gaps, reverse=True)[:5]]
+                 for g, at, lab, _t0 in sorted(all_gaps, key=lambda x: -x[0])[:5]]
     # wall-clock spent waiting on a codex/agy gate = the gaps that FOLLOW a gate call. Reuses the
     # gap machinery (a gate that blocks 25 min shows as a big gap labeled "gate:*") instead of a
     # stateful dispatch->verdict correlator.
-    gate_gaps = [g for g, _at, lab in all_gaps if lab and lab.startswith("gate:")]
+    # ...plus the gates dispatched as BACKGROUND jobs, whose following gap is ~0s (the tool_result
+    # returns at once) and whose real wait only ends at the completion notification. Measured on
+    # 3f02f940, the gap-only rule saw 8 min of gate wait against a hand-count of ~1.6h.
+    gate_gaps = [g for g, _at, lab, _t0 in all_gaps if lab and lab.startswith("gate:")] + gate_bg
     s["gate_wait_secs"] = round(sum(gate_gaps), 1)
     s["max_gate_wait_secs"] = round(max(gate_gaps), 1) if gate_gaps else 0.0
+    # ponytail: a job still in flight when the window closed is simply uncounted - a dispatch id
+    # with no notification is indistinguishable from an ordinary synchronous tool call. That makes
+    # bg_* a LOWER bound; charge it to the window edge only if the undercount is ever shown to bite.
+    s["bg_jobs"] = len(bg_iv)
+    s["bg_job_secs"] = round(sum((e - b).total_seconds() for b, e in bg_iv), 1)
+    s["bg_blocked_secs"] = round(merge_intervals(bg_iv), 1)
+    # WALL-CLOCK PARTITION of the session's span, one bucket per inter-event gap:
+    #   blocked     - the gap follows a tool_use/gate dispatch (synchronous tool latency), OR
+    #                 the agent ended its turn while a background job was still in flight
+    #   human_wait  - the agent ended its turn with NOTHING running: only a human unblocks it
+    #   work        - everything else (model thinking between a result and the next call)
+    # The two are indistinguishable without the in-flight set, which is why they were previously
+    # lumped into one NEUTRAL bucket and neither could be named.
+    for g, _at, lab, t0 in all_gaps:
+        if lab and (lab.startswith("tool_use:") or lab.startswith("gate:")):
+            s["blocked_secs"] += g
+        elif lab == "assistant":
+            in_flight = any(b <= t0 < e for b, e in bg_iv)
+            s["blocked_secs" if in_flight else "human_wait_secs"] += g
+        else:
+            s["work_secs"] += g
+    for k in ("work_secs", "human_wait_secs", "blocked_secs"):
+        s[k] = round(s[k], 1)
     s["repeated_error_runs"] = runs
     return s
 
@@ -444,6 +526,32 @@ def sub_errors(s, start, end, out, size):
 SLOW_RESERVE_MIN_SECS = 1800
 
 
+def _pct(part, whole):
+    return f"{100.0 * part / whole:.0f}%" if whole else "n/a"
+
+
+def wallclock_line(s):
+    """Where the session's span actually went. The three buckets partition duration_secs."""
+    dur = s.get("duration_secs", 0) or 0
+    w, h, b = (s.get("work_secs", 0), s.get("human_wait_secs", 0), s.get("blocked_secs", 0))
+    return (f"wall_clock: work={w}s ({_pct(w, dur)}) human_wait={h}s ({_pct(h, dur)}) "
+            f"blocked={b}s ({_pct(b, dur)}) of duration_secs={dur}  "
+            "(human_wait = the agent ended its turn with NOTHING running, so only a human "
+            "could unblock it - a NAMEABLE cost when the next step was already known; "
+            "blocked = waiting on a tool or a background job)")
+
+
+def bg_line(s):
+    """Background-job serialization. par ~1.0x with many jobs = they ran one after another."""
+    n, jobsec, blocked = (s.get("bg_jobs", 0), s.get("bg_job_secs", 0),
+                          s.get("bg_blocked_secs", 0))
+    par = f"{jobsec / blocked:.2f}x" if blocked else "n/a"
+    return (f"bg_jobs={n} bg_job_secs={jobsec} bg_blocked_secs={blocked} parallelism={par}  "
+            "(parallelism = total job time / wall-clock actually blocked on jobs. ~1.0x with "
+            "several long jobs means they ran strictly one after another with nothing queued "
+            "alongside - serialization is a NAMEABLE cost, not neutral async wait)")
+
+
 def pick_sessions(sessions, cap):
     """Choose which `cap` sessions get an evidence extract -> (picked, slow_reserved).
 
@@ -515,6 +623,8 @@ def cmd_extract(day, top):
                                          for g in gaps) or "none")
             + "  (NEUTRAL wall-clock: human think-time / model latency / async wait / "
             "tool latency - NOT waste on its own)",
+            wallclock_line(s),
+            bg_line(s),
             "repeated_error_runs=" + (", ".join(f"{r['count']}x {r['snippet'][:60]!r}"
                                                 for r in rer) or "none"),
             f"gate_calls={s.get('gate_calls', 0)} gate_wait_secs={s.get('gate_wait_secs', 0)} "
@@ -565,6 +675,14 @@ def cmd_metrics(day):
         "max_duration_secs": max((s.get("duration_secs", 0) for s in ss), default=0),
         "gate_calls": sum(s.get("gate_calls", 0) for s in ss),
         "max_gate_wait_secs": max((s.get("max_gate_wait_secs", 0) for s in ss), default=0),
+        # wall-clock partition, summed across sessions (they overlap, so these are
+        # session-hours, not clock-hours - compare the three against each other, not the day)
+        "work_secs": round(sum(s.get("work_secs", 0) for s in ss), 1),
+        "human_wait_secs": round(sum(s.get("human_wait_secs", 0) for s in ss), 1),
+        "blocked_secs": round(sum(s.get("blocked_secs", 0) for s in ss), 1),
+        "bg_jobs": sum(s.get("bg_jobs", 0) for s in ss),
+        "bg_job_secs": round(sum(s.get("bg_job_secs", 0) for s in ss), 1),
+        "bg_blocked_secs": round(sum(s.get("bg_blocked_secs", 0) for s in ss), 1),
     }
     # COVERAGE: first-to-last activity span, so a partial day cannot be read as a full one.
     # 2026-08-03 covered 20:21-23:59 local (3.6h, the machine was provisioned that day) and was
@@ -988,6 +1106,45 @@ def selftest():
     dur = (parse_ts(s2["last_ts"]) - parse_ts(s2["first_ts"])).total_seconds()
     assert dur == 40.0, dur
     p2.unlink()
+    # --- wall-clock partition + background-job correlation ---
+    # A background gate job: dispatched at t=1, completion notification at t=203. The agent
+    # ends its turn at t=3 (blocked on the job, NOT on a human), gets the notification, ends
+    # its turn again at t=204 with nothing running (now genuinely waiting on a human).
+    def evt(sec, **kw):
+        mi, se = divmod(sec, 60)
+        return dict(timestamp=f"2026-07-08T12:{mi:02d}:{se:02d}.000Z", **kw)
+    notif = ("<task-notification>\n<task-id>j1</task-id>\n"
+             "<tool-use-id>bg1</tool-use-id>\n<status>completed</status>\n</task-notification>")
+    wlines = [
+        evt(0, type="user", message={"content": [{"type": "text", "text": "go"}]}),
+        evt(1, type="assistant", message={"content": [
+            {"type": "tool_use", "name": "Bash", "id": "bg1",
+             "input": {"command": "bash lander.sh prepare", "run_in_background": True}}]}),
+        evt(2, type="user", message={"content": [
+            {"type": "tool_result", "tool_use_id": "bg1", "content": "started"}]}),
+        evt(3, type="assistant", message={"content": [{"type": "text", "text": "dispatched"}]}),
+        evt(100, type="system", content="a meta row must not terminate a gap"),
+        evt(203, type="user", message={"content": notif}),
+        evt(204, type="assistant", message={"content": [{"type": "text", "text": "done"}]}),
+        evt(304, type="user", message={"content": [{"type": "text", "text": "next"}]}),
+    ]
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f3:
+        for l in wlines:
+            f3.write(json.dumps(l) + "\n")
+        p3 = Path(f3.name)
+    w = scan_file(p3, start, end)
+    assert (w["bg_jobs"], w["bg_job_secs"], w["bg_blocked_secs"]) == (1, 202.0, 202.0), w
+    # blocked = 1s tool latency + 200s turn-ended-while-job-in-flight; human_wait = the 100s
+    # after the job finished; work = the three model-thinking gaps
+    assert (w["blocked_secs"], w["human_wait_secs"], w["work_secs"]) == (201.0, 100.0, 3.0), w
+    span = (parse_ts(w["last_ts"]) - parse_ts(w["first_ts"])).total_seconds()
+    assert w["blocked_secs"] + w["human_wait_secs"] + w["work_secs"] == span == 304.0, (w, span)
+    # the `system` row at t=100 must not steal the gap's attribution from the assistant turn
+    assert (w["gaps"][0]["secs"], w["gaps"][0]["after"]) == (200.0, "assistant"), w["gaps"]
+    # a gate dispatched into the background: its wait ends at the notification, not at the
+    # tool_result that returns immediately (1s tool gap + 202s job)
+    assert (w["gate_calls"], w["gate_wait_secs"]) == (1, 203.0), w
+    p3.unlink()
     # extract slot allocation: the 2 reserved slots go to the longest sessions BELOW the
     # friction cut - never to short stubs that merely happen to score 0 (the 2026-08-06
     # defect: two <5min sessions took 2 of 8 slots while 9.1h and 7.4h sessions were cut).

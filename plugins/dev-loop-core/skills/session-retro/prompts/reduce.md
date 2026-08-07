@@ -100,7 +100,25 @@ high-`duration_secs` low-friction session is a legitimate finding to surface her
 with zero errors - but describe it as "slow", not "wasteful", absent evidence of waste.
 Rank recommendations by time/token impact here, not error-density alone.
 
-**Slow codex/agy gates** are the ONE exception to the neutral-gap rule: the extract header's
+**Where the span actually went** is measured, not inferred: each extract header carries a
+`wall_clock` line partitioning `duration_secs` into `work` / `human_wait` / `blocked`, and a
+`bg_jobs` line with `bg_job_secs`, `bg_blocked_secs` and a `parallelism` ratio. Report the day's
+totals from metrics.jsonl (`work_secs`, `human_wait_secs`, `blocked_secs` - these sum across
+overlapping sessions, so they are session-hours, not clock-hours; compare them against each
+other, never against the day). Two of the three buckets are NAMEABLE:
+- **`human_wait`** is the agent having ended its turn with NOTHING running, so only a human
+  could restart it. Where a session's `human_wait` share is large, find the stop in the extract
+  and classify it: the next step was already named (a queued item, an approved follow-up) =
+  waste, and the fix is behavioural (do the next queued thing in the same turn, batch approvals
+  into one checkpoint); it genuinely needed a human decision = not waste, say so.
+- **`parallelism` near 1.0x with several `bg_jobs`** means the jobs ran strictly one after
+  another with nothing queued alongside. That is serialization, not latency, and the fix is
+  concrete: overlap independent jobs, or start the next unit while one runs. Name what could
+  have run alongside; if nothing could, say so.
+`work` is never waste. Do not double-count: a background gate's wait appears in both `blocked`
+and `gate_wait_secs` by design (one is the partition, the other is a subset view).
+
+**Slow codex/agy gates** are the other exception to the neutral-gap rule: the extract header's
 `gate_calls` / `gate_wait_secs` / `max_gate_wait_secs` (and the day's `max_gate_wait_secs` in
 metrics.jsonl) measure time spent blocked on a review gate. A large `gate_wait_secs`, and
 especially many `gate_calls` (repeated re-gate rounds) on one session, IS a nameable cost - not
