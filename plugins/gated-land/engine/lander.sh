@@ -107,15 +107,28 @@ overlap_of() { # base candidate -> prints the merge INTERACTION SURFACE, one pat
 
 target_clean() { # refuse to build on / land onto a dirty target checkout
   # LANDER_STATUS_EXCLUDES: space-separated extra pathspecs to ignore (e.g. a tracked generated dir).
+  #
+  # $1 = "tracked-only" -> also ignore UNTRACKED files (`-uno`). ONLY `prepare` may pass it, and only
+  # because prepare never touches the target's working tree: it creates a throwaway worktree at $base
+  # OUTSIDE the repo, merges there, and runs the suite there. A stray untracked file in the target
+  # therefore cannot change prepare's result - it only blocks a land for a file nobody is landing.
+  # Measured on one repo 2026-08-07: 44 of 46 "target checkout dirty" refusals came from prepare, 2
+  # from commit; one of the 44 was a single untracked markdown file.
+  #
+  # `commit` keeps the STRICT check (untracked included) on purpose: it merges into the target's
+  # CHECKED-OUT branch, where an incoming path can collide with an untracked file of the same name
+  # and git would refuse mid-merge. Tracked modifications still block BOTH phases - those mean
+  # someone is mid-edit, and failing at prepare is kinder than after a full suite run.
+  local u=""; [ "${1:-}" = "tracked-only" ] && u="-uno"
   local ex=""; for p in .claude/state ${LANDER_STATUS_EXCLUDES:-}; do ex="$ex :(exclude)$p"; done
-  [ -z "$(git -C "$PRIMARY" status --porcelain -- . $ex 2>/dev/null)" ]
+  [ -z "$(git -C "$PRIMARY" status --porcelain $u -- . $ex 2>/dev/null)" ]
 }
 
 cmd_prepare() {
   local candidate="${1:?usage: prepare <candidate-branch> [target]}" target="${2:-main}"
   git rev-parse --verify -q "$candidate" >/dev/null || die "no such candidate branch: $candidate" 2
   git rev-parse --verify -q "$target"    >/dev/null || die "no such target branch: $target" 2
-  target_clean || die "target checkout dirty ($PRIMARY) — commit/stash/clean it first"
+  target_clean tracked-only || die "target checkout dirty ($PRIMARY) — commit/stash/clean it first"
 
   local base wt
   base="$(git rev-parse --verify "refs/heads/$target^{commit}")"
@@ -417,6 +430,25 @@ git checkout -q -b session/sd main; echo "print('sd')">>src/a.py; git commit -qa
 out=$("$SELF" prepare session/sd main); eval "$out"
 rc=0; LANDER_HUMAN_OVERRIDE=1 LANDER_VERDICT_OVERRIDE=1 "$SELF" commit session/sd main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
 check "self-dirty: commit succeeds despite .claude/state/verify.log" "[ $rc -eq 0 ]"
+
+# 11b. UNTRACKED STRAY: prepare must IGNORE an untracked file in the target (it merges + runs the
+# suite in a throwaway worktree at $base, so a stray cannot affect its result), while a TRACKED
+# modification must still block it. 44 of 46 measured "target checkout dirty" refusals were prepare.
+git checkout -q -b session/untr main; echo "print('untr')">>src/a.py; git commit -qam untr; git checkout -q main
+printf 'stray, untracked, unrelated to any merge\n' > STRAY_NOTE.md
+rc=0; out=$("$SELF" prepare session/untr main 2>&1) || rc=$?
+check "untracked stray does NOT block prepare" "[ $rc -eq 0 ]"
+eval "$out"; "$SELF" abort "$WORKTREE" "selftest 11b" >/dev/null 2>&1
+# commit keeps the STRICT check: the same untracked file must still refuse the land.
+out=$("$SELF" prepare session/untr main); eval "$out"
+rc=0; LANDER_HUMAN_OVERRIDE=1 LANDER_VERDICT_OVERRIDE=1 "$SELF" commit session/untr main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
+check "untracked stray STILL blocks commit (strict)" "[ $rc -ne 0 ]"
+rm -f STRAY_NOTE.md
+# ...and a TRACKED modification must still block prepare, stray or not.
+echo "print('dirty-tracked')" >> src/a.py
+rc=0; "$SELF" prepare session/untr main >/dev/null 2>&1 || rc=$?
+check "tracked modification STILL blocks prepare" "[ $rc -ne 0 ]"
+git checkout -q -- src/a.py
 
 # 12. LANDER_RISK_PYTHONPATH (P-D): a classifier that imports a module present ONLY via the trusted seam.
 mkdir -p "$D/trusted"; printf 'OK = True\n' > "$D/trusted/trustedmod.py"
