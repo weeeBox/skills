@@ -105,6 +105,35 @@ overlap_of() { # base candidate -> prints the merge INTERACTION SURFACE, one pat
            <(printf '%s\n' "$b" | sed '/^$/d' | sort -u)
 }
 
+reap_abandoned_worktrees() { # remove integration worktrees a dead prepare left behind
+  # `prepare` deliberately RELEASES its EXIT trap (`trap - EXIT`) to hand the integration worktree to
+  # the gate, so only `commit` or `abort` ever clean it up. A session that dies - or simply ends -
+  # between prepare and either one leaks that worktree permanently. Measured 2026-08-07 on one repo:
+  # 10 leaked, 7 of them from a single branch with 7 prepares and 0 lands.
+  #
+  # Reaped by AGE ALONE, against the lander's own `lander-` naming. Deliberately NOT by "no process
+  # is inside it": the gate wait is precisely the window where nothing is running, so a liveness
+  # probe would reap live work. A whole prepare -> gate -> commit cycle is minutes, so anything older
+  # than LANDER_WT_STALE (default 6h) is abandoned by construction.
+  #
+  # Best-effort throughout: this runs on prepare's critical path and must never be able to fail a
+  # land. Concurrent prepares may race to reap the same path - the loser's `remove` just fails.
+  local stale="${LANDER_WT_STALE:-21600}" now m age w
+  now="$(date +%s)"
+  git -C "$PRIMARY" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}' |
+  while IFS= read -r w; do
+    case "$w" in */lander-*) ;; *) continue ;; esac   # only our own throwaways
+    [ -d "$w" ] || continue                            # vanished dir: `prune` below handles the ref
+    m="$(stat -f %m "$w" 2>/dev/null || stat -c %Y "$w" 2>/dev/null || echo "$now")"
+    age=$(( now - m ))
+    [ "$age" -gt "$stale" ] || continue
+    if git -C "$PRIMARY" worktree remove --force "$w" 2>/dev/null; then
+      log "land-reaped" "abandoned integration worktree $(basename "$w") (idle ${age}s)"
+    fi
+  done
+  git -C "$PRIMARY" worktree prune 2>/dev/null || true
+}
+
 target_clean() { # refuse to build on / land onto a dirty target checkout
   # LANDER_STATUS_EXCLUDES: space-separated extra pathspecs to ignore (e.g. a tracked generated dir).
   #
@@ -129,6 +158,7 @@ cmd_prepare() {
   git rev-parse --verify -q "$candidate" >/dev/null || die "no such candidate branch: $candidate" 2
   git rev-parse --verify -q "$target"    >/dev/null || die "no such target branch: $target" 2
   target_clean tracked-only || die "target checkout dirty ($PRIMARY) — commit/stash/clean it first"
+  reap_abandoned_worktrees   # self-healing: clear leaks from prepares that never reached commit/abort
 
   local base wt
   base="$(git rev-parse --verify "refs/heads/$target^{commit}")"
@@ -449,6 +479,22 @@ echo "print('dirty-tracked')" >> src/a.py
 rc=0; "$SELF" prepare session/untr main >/dev/null 2>&1 || rc=$?
 check "tracked modification STILL blocks prepare" "[ $rc -ne 0 ]"
 git checkout -q -- src/a.py
+
+# 11c. REAPER: prepare releases its EXIT trap so the gate can use the integration worktree, so an
+# abandoned prepare leaks it forever (10 leaked in one real repo, 7 from one branch). The NEXT
+# prepare must reap a STALE one - and must NOT reap a fresh one, which would delete a live gate's
+# worktree out from under it. Both directions are load-bearing.
+stalewt="${TMPDIR:-/tmp}/lander-STALE-selftest-$$"
+freshwt="${TMPDIR:-/tmp}/lander-FRESH-selftest-$$"
+git worktree add -q --detach "$stalewt" main
+git worktree add -q --detach "$freshwt" main
+touch -t 202001010000 "$stalewt"        # backdate well past LANDER_WT_STALE
+out=$("$SELF" prepare session/untr main); eval "$out"
+check "stale abandoned worktree is reaped" "[ ! -d '$stalewt' ]"
+check "FRESH worktree is NOT reaped (a live gate holds it)" "[ -d '$freshwt' ]"
+check "reap is audited in verify.log" "grep -q land-reaped '$D/.claude/state/verify.log'"
+"$SELF" abort "$WORKTREE" "selftest 11c" >/dev/null 2>&1
+git worktree remove --force "$freshwt" 2>/dev/null; git worktree prune
 
 # 12. LANDER_RISK_PYTHONPATH (P-D): a classifier that imports a module present ONLY via the trusted seam.
 mkdir -p "$D/trusted"; printf 'OK = True\n' > "$D/trusted/trustedmod.py"
