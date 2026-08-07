@@ -79,6 +79,20 @@ marker) and run the runner again.
   "after system", and a gate gap with a system row after the dispatch was dropped from
   `gate_wait_secs` entirely. Gates dispatched as background jobs are now charged from dispatch to
   completion notification (the same session read 8 min of gate wait against a ~1.6h hand count).
+- **Calibrate a counter against ONE hand-measured session before any report leans on it.**
+  This tool's whole job is measurement, so an uncalibrated counter is not a rough number - it
+  is an unfalsified claim that a report will state as fact. The precedent that works is
+  `self_retractions` below: it has a written acceptance gate, and running that gate is what
+  caught a defect in its own regex widening. The counter-precedent is everything else. Gap
+  attribution and `gate_wait_secs` shipped uncalibrated for weeks and were wrong by 83% and
+  ~12x respectively, discovered only on 2026-08-07 when an outside analysis measured the same
+  session (`3f02f940`) by hand and disagreed with the report. Neither error needed new data to
+  find - only someone counting the same thing twice.
+  **When you add or widen a counter:** pick one real session, measure the same quantity by
+  hand, record BOTH numbers and the session id in this file (as the `bg_*` and `RETRACTION_RE`
+  bullets do). If the two disagree, the counter is wrong until shown otherwise - a plausible
+  implementation is not evidence. A counter with no recorded hand-check is a diagnostic aid,
+  never a trend axis and never the basis of a recommendation.
 - **`self_retractions` is a LOWER BOUND, not yet a trend axis.** It counts the AGENT
   retracting its own prior claim, on assistant turns (`RETRACTION_RE`) - distinct from
   `corrections`, which scans USER turns and measures the user correcting the agent. It is
