@@ -89,11 +89,45 @@ touched) - the **full suite on the merged commit still runs either way** and is 
 
 ## Step 2 - codex gate on the integration commit
 
-Drive codex through the `review-gate` skill's **diff-stage** mechanics (dispatch + wedge watchdog +
-lock - do not hand-roll them), but scope it to the **integration commit**, not the candidate branch in
-isolation: run the review **from the throwaway `$WORKTREE`** (its detached HEAD *is* the merged commit)
-with `--base <BASE>`, so codex sees `BASE...INTEGRATION` = the candidate's work applied onto the
-*current* target. That combined diff is what surfaces a semantic conflict a per-branch review misses.
+Scope the review to the **integration commit**, not the candidate branch in isolation: point codex at
+the throwaway `$WORKTREE` (its detached HEAD *is* the merged commit) so it sees `BASE...INTEGRATION` =
+the candidate's work applied onto the *current* target. That combined diff is what surfaces a semantic
+conflict a per-branch review misses.
+
+**Dispatch this gate with `codex task`, NOT `adversarial-review`.** This is the one place in the
+pipeline where the reviewer's OUTPUT FORMAT is load-bearing: `lander.sh commit` re-reads the artifact
+and requires a **line-anchored** `VERDICT: SHIP` (`_verdict_ok`). `codex task` writes `rawOutput` as
+plain text, so an anchored line survives. `adversarial-review` serialises its result as ONE LINE of
+JSON with the verdict inside a `summary` string - no line is anchored, so a genuine SHIP is refused
+with exit 8, and the only way past that is `LANDER_VERDICT_OVERRIDE=1`: waiving the REVIEWER to work
+around a FORMAT mismatch, which is exactly the reflex the risk/verdict flag split exists to prevent.
+
+> Teaching the interlock to read prose was tried and reverted (2026-08-07). Three codex rounds found
+> three distinct fail-opens in it - a shared token rule that relaxed the plain-text path, a whole-line
+> token search that read `VERDICT: DO NOT SHIP` as approval, and a boundary check that a zero-width
+> space walked through. A fail-closed release interlock should not parse free-form prose; dispatch a
+> reviewer whose output is already machine-checkable instead.
+
+```bash
+CODEX="$(ls ~/.claude/plugins/cache/openai-codex/codex/*/scripts/codex-companion.mjs | sort -V | tail -1)"
+# Write the prompt to a FILE. A prompt containing backticks or $(...) is command-substituted by the
+# shell when passed inline, which silently deletes words from the review request.
+# $PROMPT_FILE MUST BE ABSOLUTE: the companion resolves it with path.resolve(cwd, ...), i.e. against
+# --cwd, so a path relative to your own directory silently resolves inside $WORKTREE and fails.
+node "$CODEX" task --background --cwd "$WORKTREE" --prompt-file "$PROMPT_FILE"
+```
+
+- `--cwd "$WORKTREE"` is what scopes the review to the merged commit. There is no `--base` on this
+  path, so the PROMPT must tell codex to derive the diff itself: `git diff <BASE>...HEAD`.
+- **Preamble must match the task path:** this agent has **Bash only - no Read/Glob/Grep**. Never send
+  it the read-only `adversarial-review` preamble ("use Read/Glob/Grep"); it will answer that its
+  environment exposes no such tools, which reads as a BLOCK but is a dispatch error.
+- Do **not** pass `--write`. The companion's `task` is read-only by default; a gate must stay that way.
+- **Require the anchored line explicitly**, as its own line: ask for
+  `VERDICT: SHIP` / `VERDICT: SHIP-WITH-CHANGES` / `VERDICT: BLOCK` and nothing else on that line.
+  Trailing prose on the verdict line is refused by the interlock, by design.
+- Poll the job JSON's `result` for completion and arm the wedge watchdog, exactly as `review-gate`
+  does - do not hand-roll those mechanics.
 
 - agy: **N/A** (committed diff, no base option) - say so honestly, do not imply agy reviewed.
 - Collect codex's verdict (SHIP / SHIP-WITH-CHANGES / BLOCK). Do not fix findings here.
@@ -111,6 +145,18 @@ with `--base <BASE>`, so codex sees `BASE...INTEGRATION` = the candidate's work 
   _t="$(mktemp "$RECDIR/.${INTEGRATION}.rec.XXXXXX")" || { echo "mktemp failed"; exit 1; }
   printf 'CODEX_RESULT=%s\n' "$CODEX_RESULT_JSON" > "$_t" && mv -f "$_t" "$RECDIR/$INTEGRATION.rec"
   ```
+  **Check the artifact PARSES before you run `commit`**, so a format mismatch surfaces here as a gate
+  problem to re-run, not later as an exit-8 that looks like something to override. Ask the interlock
+  itself - do NOT hand-mirror its grep, which drifts on whitespace and CR handling:
+  ```bash
+  "$CLAUDE_PLUGIN_ROOT/engine/lander.sh" verdict "$CODEX_RESULT_JSON" || {
+    echo "artifact is not a clean anchored SHIP — re-gate via 'codex task' (Step 2)." >&2
+    echo "Do NOT reach for LANDER_VERDICT_OVERRIDE: that waives the reviewer, not the format." >&2
+    exit 1
+  }
+  ```
+  Non-zero here means either a real non-SHIP verdict or an unparseable artifact, and both are stop
+  conditions - it must `exit`, not just warn, or the very next line runs `commit` anyway.
   `commit` re-runs the risk classifier (refuses non-LOW, exit 7) and re-reads that artifact, refusing
   (exit 8) unless its last anchored `VERDICT:` line is exactly `SHIP`.
 - **The two waivers are SEPARATE (2026-08-06) - neither bypasses integration validation.**

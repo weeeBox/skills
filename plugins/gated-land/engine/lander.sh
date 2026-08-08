@@ -212,6 +212,25 @@ cmd_prepare() {
 # 'VERDICT:' (CR stripped for CRLF artifacts); its value must be EXACTLY one verdict token (anchored +
 # exact-match), so 'VERDICT: BLOCK' + later prose containing SHIP/SPACESHIP fails closed. Missing file /
 # unparseable JSON / absent verdict line -> non-zero (fail closed).
+#
+# THIS GRAMMAR IS DELIBERATELY NARROW - DO NOT WIDEN IT TO FIT A REVIEWER. It reads plain text only,
+# which is what `codex task` produces. `codex adversarial-review` serialises its result as one line of
+# JSON with the verdict inside a `summary` string, so nothing here is anchored and a genuine SHIP is
+# refused. The fix for that is at the DISPATCH layer - gate lands through `task` (land SKILL Step 2) -
+# NOT here.
+#
+# Teaching this function to read prose was tried and reverted on 2026-08-07. Three codex rounds found
+# three distinct FAIL-OPENS in three successive attempts:
+#   1. the token rule is SHARED by both shapes, so allowing a delimiter after the token also let
+#      plain-text 'VERDICT: SHIP BLOCK' and 'VERDICT: SHIP, pending fixes' through;
+#   2. searching the line for "exactly one recognised token" turned 'VERDICT: DO NOT SHIP',
+#      'VERDICT: DO-NOT-SHIP' and 'VERDICT: BLOCKED; do not SHIP' into approvals, and stripping \r
+#      rebuilt 'SH\rIP' into 'SHIP';
+#   3. the token-boundary lookahead rejects only word characters and ASCII hyphen, so a zero-width
+#      space or bidi mark terminated the token and 'VERDICT: SHIP<U+200B>-WITH-CHANGES' passed.
+# Each round narrowed the grammar and the next found another encoding. A fail-closed release interlock
+# should not parse free-form prose - the false NEGATIVE it produces costs an override; every fix for
+# it so far has produced a fail-OPEN, which is worse.
 _verdict_ok() { # <codex_result_json>
   local cres="$1" craw cverd
   [ -f "$cres" ] || return 1
@@ -556,6 +575,21 @@ mk_rec "$INTEGRATION" "$D/.claude/state/codex_crlf.json"
 rc=0; "$SELF" commit session/crlf main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
 check "interlock: CRLF verdict parses -> commits" "[ $rc -eq 0 ]"
 
+# 15d-g. `verdict` subcommand: the SAME judgement `commit` makes, exposed so the land skill can
+# pre-check an artifact instead of hand-mirroring the grep (which drifted on whitespace/CR). It must
+# agree with the interlock on every shape, including the ones the mirrored grep got wrong, and must
+# touch no ref.
+before15d="$(git rev-parse main)"
+rc=0; "$SELF" verdict "$(mk_codex SHIP vsub)" >/dev/null 2>&1 || rc=$?
+check "verdict: clean SHIP -> exit 0" "[ $rc -eq 0 ]"
+rc=0; "$SELF" verdict "$(mk_codex BLOCK vsub2)" >/dev/null 2>&1 || rc=$?
+check "verdict: BLOCK -> non-zero" "[ $rc -ne 0 ]"
+rc=0; "$SELF" verdict "$D/.claude/state/codex_crlf.json" >/dev/null 2>&1 || rc=$?
+check "verdict: agrees with the interlock on CRLF (the mirrored grep did not)" "[ $rc -eq 0 ]"
+rc=0; "$SELF" verdict "$D/.claude/state/does_not_exist.json" >/dev/null 2>&1 || rc=$?
+check "verdict: missing artifact -> non-zero (fail closed)" "[ $rc -ne 0 ]"
+check "verdict: touches no ref" "[ \"$(git rev-parse main)\" = \"$before15d\" ]"
+
 # 16. codex SHIP-WITH-CHANGES -> exit 8
 git checkout -q -b session/swc main; echo "print('swc')">>src/a.py; git commit -qam swc; git checkout -q main
 out=$("$SELF" prepare session/swc main); eval "$out"
@@ -710,6 +744,11 @@ case "${1:-}" in
   commit)  shift; cmd_commit  "$@" ;;
   abort)   shift; cmd_abort   "$@" ;;
   _overlap) shift; overlap_of "$@" ;;   # introspection only (selftest covers the fail-closed path)
+  # Ask the interlock itself whether an artifact would pass, BEFORE running `commit`. Exists so the
+  # land skill's pre-check cannot DRIFT from the real rule: a hand-mirrored grep in prose got the
+  # whitespace and CR handling wrong and would have raised false alarms on artifacts `commit` accepts
+  # (codex, [medium]). Same function, one source of truth. Read-only: touches no ref and no lock.
+  verdict) shift; _verdict_ok "${1:?usage: lander.sh verdict <codex_result_json>}" ;;
   --selftest) selftest ;;
-  *) echo "usage: lander.sh prepare <candidate> [target] | commit <cand> <target> <base> <integ> <wt> | abort <wt> [reason] | --selftest" >&2; exit 2 ;;
+  *) echo "usage: lander.sh prepare <candidate> [target] | commit <cand> <target> <base> <integ> <wt> | abort <wt> [reason] | verdict <codex_result_json> | --selftest" >&2; exit 2 ;;
 esac
