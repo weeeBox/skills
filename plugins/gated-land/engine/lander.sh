@@ -265,19 +265,38 @@ if not isinstance(summary, str):
     raise SystemExit(0)
 
 last = None
-for line in summary.replace("\r", "").split("\n"):
+for line in summary.split("\n"):
+    if line.endswith("\r"):                  # a CRLF line ending, not embedded data
+        line = line[:-1]
     if line.startswith("VERDICT:"):          # line-anchored, same as the shell rule
         last = line                          # last one wins, same as the shell rule
 if last is None:
     raise SystemExit(0)
 
-# Longest alternative first (Python alternation is leftmost-FIRST, not longest), and a negative
-# lookahead so SHIP cannot match inside SHIP-WITH-CHANGES or SHIPPING, nor at the tail of SPACESHIP.
-found = re.findall(r"\b(?:SHIP-WITH-CHANGES|BLOCK|SHIP)(?![\w-])", last)
-# EXACTLY one token on the line. Two means the conclusion contradicts itself ('SHIP ... BLOCK'),
-# and an interlock must not pick a winner from an ambiguous verdict - it refuses.
-if len(found) == 1:
-    print("VERDICT: %s" % found[0])
+# NO CONTROL CHARACTERS (tab excepted, it is legitimate spacing after the colon). An earlier cut
+# stripped every \r from the summary before matching, so 'VERDICT: SH\rIP' was RECONSTRUCTED into
+# 'VERDICT: SHIP' and accepted (codex, [high]). Normalising bytes before deciding a verdict is how
+# a refusal becomes an approval; refuse the line instead.
+if any((ord(c) < 0x20 and c != "\t") or ord(c) == 0x7F for c in last):
+    raise SystemExit(0)
+
+# The token must sit in the VALUE POSITION, immediately after 'VERDICT:'. Searching the whole line
+# for "exactly one recognised word" was a fail-OPEN release-interlock bypass (codex, [high]):
+# 'VERDICT: DO NOT SHIP', 'VERDICT: DO-NOT-SHIP' and 'VERDICT: BLOCKED; do not SHIP' each contain
+# exactly one match (SHIP) and were normalised into a trusted 'VERDICT: SHIP'. An explicit refusal
+# read as an approval is the worst failure this interlock has. Longest alternative first (Python
+# alternation is leftmost-FIRST, not longest); the negative lookahead stops SHIP matching inside
+# SHIP-WITH-CHANGES, SHIPPING, or the tail of SPACESHIP.
+TOKEN = r"(?:SHIP-WITH-CHANGES|BLOCK|SHIP)(?![\w-])"
+m = re.match(r"VERDICT:[ \t]*(" + TOKEN + r")", last)
+if m is None:
+    raise SystemExit(0)
+
+# ...and the line must still carry EXACTLY one token overall. Two means the conclusion contradicts
+# itself ('VERDICT: SHIP. This is not a BLOCK.'), and an interlock must not pick a winner from an
+# ambiguous verdict - it refuses and asks for a clean re-gate.
+if len(re.findall(r"\b" + TOKEN, last)) == 1:
+    print("VERDICT: %s" % m.group(1))
 PYEOF
 )" || return 1
   cverd="$(printf '%s\n' "$craw" | tr -d '\r' | grep -E '^VERDICT:' | tail -1 | sed 's/^VERDICT:[[:space:]]*//' | grep -oE '^(SHIP-WITH-CHANGES|BLOCK|SHIP)$')"
@@ -675,6 +694,23 @@ plain_case pfocol 'VERDICT: SHIP: BLOCK' 8 "plain text: 'SHIP: BLOCK' still refu
 plain_case pfocom 'VERDICT: SHIP, pending fixes' 8 "plain text: 'SHIP, pending fixes' still refused"
 plain_case pfoprose 'VERDICT: SHIP the release once tests pass' 8 \
   "plain text: 'SHIP <prose>' still refused"
+
+# 15m-q. NEGATION AND CONTROL-CHARACTER RECONSTRUCTION. Searching the whole line for "exactly one
+# recognised word" turned an explicit REFUSAL into an approval - 'VERDICT: DO NOT SHIP' contains
+# one token and normalised to 'VERDICT: SHIP' (codex, [high]). Stripping every \r did the same by
+# rebuilding SH\rIP into SHIP. The token must sit in the VALUE POSITION and the line must carry no
+# control characters (tab excepted). These are the four strings codex named, plus the tab case that
+# must keep working.
+env_case negdns 'needs-attention' 'VERDICT: DO NOT SHIP' 8 \
+  "envelope: 'DO NOT SHIP' is a refusal, not a SHIP"
+env_case negdash 'needs-attention' 'VERDICT: DO-NOT-SHIP' 8 \
+  "envelope: 'DO-NOT-SHIP' refused"
+env_case negblkd 'needs-attention' 'VERDICT: BLOCKED; do not SHIP' 8 \
+  "envelope: 'BLOCKED; do not SHIP' refused"
+env_case negcr approve "$(printf 'VERDICT: SH\rIP')" 8 \
+  "envelope: CR inside the token is not reconstructed into SHIP"
+env_case tabok approve "$(printf 'VERDICT:\tSHIP')" 0 \
+  "envelope: TAB after the colon is legitimate spacing -> commits"
 
 # 16. codex SHIP-WITH-CHANGES -> exit 8
 git checkout -q -b session/swc main; echo "print('swc')">>src/a.py; git commit -qam swc; git checkout -q main
