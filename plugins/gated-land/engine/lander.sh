@@ -209,14 +209,47 @@ cmd_prepare() {
 }
 
 # Re-read codex's OWN artifact; pass ONLY on a clean codex SHIP. Verdict = the LAST line beginning
-# 'VERDICT:' (CR stripped for CRLF artifacts); its value must be EXACTLY one verdict token (anchored +
-# exact-match), so 'VERDICT: BLOCK' + later prose containing SHIP/SPACESHIP fails closed. Missing file /
+# 'VERDICT:' (CR stripped for CRLF artifacts); its value must be one verdict token, and the token must
+# END there - terminated by end-of-line or one of [space . , ; :] - so 'VERDICT: BLOCK' + later prose
+# containing SHIP/SPACESHIP fails closed, and 'VERDICT: SHIPPING' matches nothing. Missing file /
 # unparseable JSON / absent verdict line -> non-zero (fail closed).
+#
+# TWO REVIEWER OUTPUT SHAPES, one verdict rule. `codex task` writes rawOutput as PLAIN TEXT, so the
+# verdict is already a line. `codex adversarial-review` writes rawOutput as a SINGLE LINE OF JSON
+# ({"verdict":..,"summary":..,"findings":..}), so no line begins 'VERDICT:' and this returned 1 on a
+# genuine SHIP - a false NEGATIVE that pushed the operator toward LANDER_VERDICT_OVERRIDE=1, i.e.
+# waiving the reviewer to work around a FORMAT bug. That is precisely the reflex the 2026-08-06
+# risk/verdict flag split exists to prevent, so the parser learns the second shape instead.
+#
+# The fallback reads that envelope's `summary` STRING and applies the identical rule to it. It does
+# NOT trust the envelope's own `verdict` field: a codex turn that dies mid-review (model capacity,
+# wedge) still serialises {"verdict":"approve", summary:<the model's opening plan sentence>}, so
+# `approve` there can mean "crashed before reviewing anything". The model-emitted VERDICT token is
+# the only signal that requires the review to have actually reached a conclusion - observed twice on
+# 2026-08-08, both crashes rendering as "Verdict: approve".
 _verdict_ok() { # <codex_result_json>
   local cres="$1" craw cverd
   [ -f "$cres" ] || return 1
-  craw="$("$PY" -c 'import json,sys,os;print(json.load(open(os.path.expanduser(sys.argv[1]),encoding="utf-8",errors="replace"))["result"].get("rawOutput",""))' "$cres" 2>/dev/null)" || return 1
-  cverd="$(printf '%s\n' "$craw" | tr -d '\r' | grep -E '^VERDICT:' | tail -1 | sed 's/^VERDICT:[[:space:]]*//' | grep -oE '^(SHIP-WITH-CHANGES|BLOCK|SHIP)$')"
+  craw="$("$PY" - "$cres" <<'PYEOF' 2>/dev/null
+import json, os, re, sys
+d = json.load(open(os.path.expanduser(sys.argv[1]), encoding="utf-8", errors="replace"))
+raw = d["result"].get("rawOutput", "") or ""
+# Plain-text artifact already carries the line: leave it exactly as it was (unchanged path).
+# Only when NO line begins 'VERDICT:' do we consider the structured-envelope shape.
+if not re.search(r"^VERDICT:", raw, re.M):
+    try:
+        inner = json.loads(raw)
+    except Exception:
+        inner = None
+    if isinstance(inner, dict) and isinstance(inner.get("summary"), str):
+        raw = inner["summary"]
+print(raw)
+PYEOF
+)" || return 1
+  cverd="$(printf '%s\n' "$craw" | tr -d '\r' | grep -E '^VERDICT:' | tail -1 \
+           | sed 's/^VERDICT:[[:space:]]*//' \
+           | grep -oE '^(SHIP-WITH-CHANGES|BLOCK|SHIP)([[:space:].,;:]|$)' \
+           | sed 's/[[:space:].,;:]*$//')"
   [ "$cverd" = SHIP ] || return 1
   return 0
 }
@@ -555,6 +588,39 @@ printf '{"result":{"rawOutput":"body\\r\\nVERDICT: SHIP\\r\\n"}}\n' > "$D/.claud
 mk_rec "$INTEGRATION" "$D/.claude/state/codex_crlf.json"
 rc=0; "$SELF" commit session/crlf main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
 check "interlock: CRLF verdict parses -> commits" "[ $rc -eq 0 ]"
+
+# 15d-h. THE SECOND REVIEWER SHAPE. `codex adversarial-review` writes rawOutput as ONE LINE of JSON,
+# so no line begins 'VERDICT:' and the verdict lives inside the `summary` string. Before this was
+# handled, a genuine SHIP was REFUSED (exit 8) and the only way past it was LANDER_VERDICT_OVERRIDE=1
+# - waiving the reviewer to route around a format bug. These pin the fix AND the three ways it must
+# not fail open. `env_json` builds the real envelope shape, `verdict` field included, because the
+# parser must ignore that field (see _verdict_ok).
+# The selftest body re-execs under `env -i` (see selftest()), so `$PY` from line 29 is NOT in scope
+# here - only LANDER_PY is exported. Using $PY makes every case below fail on an unbound variable,
+# and because these cases assert exit 8, four of the five would still "pass" - on a broken artifact
+# rather than on the parser. A negative case that cannot tell a real refusal from a missing file is
+# not a test, so the interpreter is resolved the same way the selftest harness resolves it.
+_tpy(){ echo "${LANDER_PY:-python3}"; }
+env_json(){ "$(_tpy)" -c 'import json,sys;print(json.dumps({"verdict":sys.argv[1],"summary":sys.argv[2],"findings":[],"next_steps":[]}))' "$1" "$2"; }
+mk_env(){ mkdir -p "$D/.claude/state"; "$(_tpy)" -c 'import json,sys;json.dump({"result":{"rawOutput":sys.argv[2]}},open(sys.argv[1],"w"))' "$D/.claude/state/codex_$1.json" "$2"; echo "$D/.claude/state/codex_$1.json"; }
+env_case(){ # <slug> <envelope-verdict> <summary> <expected-rc> <label>
+  git checkout -q -b "session/$1" main; echo "print('$1')">>src/a.py; git commit -qam "$1"; git checkout -q main
+  out=$("$SELF" prepare "session/$1" main); eval "$out"
+  mk_rec "$INTEGRATION" "$(mk_env "$1" "$(env_json "$2" "$3")")" >/dev/null
+  rc=0; "$SELF" commit "session/$1" main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
+  check "$5" "[ $rc -eq $4 ]"
+  [ "$rc" -eq 0 ] || "$SELF" abort "$WORKTREE" cleanup >/dev/null 2>&1 || true
+}
+env_case advship approve 'VERDICT: SHIP. No material blocking issue.' 0 \
+  "adversarial-review: SHIP inside summary -> commits"
+env_case advcrash approve 'I am applying the code-review skill to inspect the diff.' 8 \
+  "adversarial-review: CRASHED turn (verdict=approve, no token) refused"
+env_case advswc 'needs-attention' 'VERDICT: SHIP-WITH-CHANGES. Fix the guard first.' 8 \
+  "adversarial-review: SHIP-WITH-CHANGES never reads as SHIP"
+env_case advblk 'needs-attention' 'VERDICT: BLOCK. After fixing we could SHIP the SPACESHIP.' 8 \
+  "adversarial-review: BLOCK with SHIP prose refused"
+env_case advpfx approve 'VERDICT: SHIPPING SOON. we think' 8 \
+  "adversarial-review: SHIPPING is a prefix, not the token"
 
 # 16. codex SHIP-WITH-CHANGES -> exit 8
 git checkout -q -b session/swc main; echo "print('swc')">>src/a.py; git commit -qam swc; git checkout -q main
