@@ -209,10 +209,10 @@ cmd_prepare() {
 }
 
 # Re-read codex's OWN artifact; pass ONLY on a clean codex SHIP. Verdict = the LAST line beginning
-# 'VERDICT:' (CR stripped for CRLF artifacts); its value must be one verdict token, and the token must
-# END there - terminated by end-of-line or one of [space . , ; :] - so 'VERDICT: BLOCK' + later prose
-# containing SHIP/SPACESHIP fails closed, and 'VERDICT: SHIPPING' matches nothing. Missing file /
-# unparseable JSON / absent verdict line -> non-zero (fail closed).
+# 'VERDICT:' (CR stripped for CRLF artifacts), EXACT-match one verdict token, so 'VERDICT: BLOCK'
+# + later prose containing SHIP/SPACESHIP fails closed. That shell rule is UNCHANGED and is the only
+# definition of a valid token. Missing file / unparseable JSON / absent verdict line -> non-zero
+# (fail closed).
 #
 # TWO REVIEWER OUTPUT SHAPES, one verdict rule. `codex task` writes rawOutput as PLAIN TEXT, so the
 # verdict is already a line. `codex adversarial-review` writes rawOutput as a SINGLE LINE OF JSON
@@ -221,12 +221,18 @@ cmd_prepare() {
 # waiving the reviewer to work around a FORMAT bug. That is precisely the reflex the 2026-08-06
 # risk/verdict flag split exists to prevent, so the parser learns the second shape instead.
 #
-# The fallback reads that envelope's `summary` STRING and applies the identical rule to it. It does
-# NOT trust the envelope's own `verdict` field: a codex turn that dies mid-review (model capacity,
-# wedge) still serialises {"verdict":"approve", summary:<the model's opening plan sentence>}, so
-# `approve` there can mean "crashed before reviewing anything". The model-emitted VERDICT token is
-# the only signal that requires the review to have actually reached a conclusion - observed twice on
-# 2026-08-08, both crashes rendering as "Verdict: approve".
+# The envelope branch parses `summary` in PYTHON and hands the shell a NORMALISED bare verdict line,
+# so prose tolerance never touches the plain-text path. An earlier cut of this fix instead widened
+# the SHARED shell rule to allow a delimiter after the token; because it is shared, that silently
+# relaxed plain text too, and 'VERDICT: SHIP BLOCK' / 'VERDICT: SHIP: BLOCK' / 'VERDICT: SHIP,
+# pending fixes' went from rejected to ACCEPTED (codex, [high]) - a fail-OPEN introduced by a fix
+# for a fail-closed nuisance. Prose tolerance belongs only where prose is expected.
+#
+# It does NOT trust the envelope's own `verdict` field: a codex turn that dies mid-review (model
+# capacity, wedge) still serialises {"verdict":"approve", summary:<the model's opening plan
+# sentence>}, so `approve` there can mean "crashed before reviewing anything". The model-emitted
+# VERDICT token is the only signal that requires the review to have actually reached a conclusion -
+# observed twice on 2026-08-08, both crashes rendering as "Verdict: approve".
 _verdict_ok() { # <codex_result_json>
   local cres="$1" craw cverd
   [ -f "$cres" ] || return 1
@@ -234,22 +240,47 @@ _verdict_ok() { # <codex_result_json>
 import json, os, re, sys
 d = json.load(open(os.path.expanduser(sys.argv[1]), encoding="utf-8", errors="replace"))
 raw = d["result"].get("rawOutput", "") or ""
-# Plain-text artifact already carries the line: leave it exactly as it was (unchanged path).
-# Only when NO line begins 'VERDICT:' do we consider the structured-envelope shape.
-if not re.search(r"^VERDICT:", raw, re.M):
-    try:
-        inner = json.loads(raw)
-    except Exception:
-        inner = None
-    if isinstance(inner, dict) and isinstance(inner.get("summary"), str):
-        raw = inner["summary"]
-print(raw)
+
+# PLAIN TEXT: emit verbatim. The shell rule below then applies EXACT-match, exactly as it always
+# has. An earlier revision of this fix widened that shell rule to tolerate a delimiter, and because
+# the rule is SHARED, it silently relaxed this path too: 'VERDICT: SHIP BLOCK', 'VERDICT: SHIP:
+# BLOCK' and 'VERDICT: SHIP, pending fixes' all went from rejected to ACCEPTED (codex, [high]) -
+# a fail-OPEN in the interlock, introduced by a change meant to fix a fail-closed nuisance. Prose
+# tolerance belongs ONLY where prose is expected, so it lives below, after the envelope decodes.
+if re.search(r"^VERDICT:", raw, re.M):
+    print(raw)
+    raise SystemExit(0)
+
+# STRUCTURED ENVELOPE (codex adversarial-review): rawOutput is one line of JSON and the verdict
+# sits in `summary` as prose. Parse it HERE and hand the shell a NORMALISED bare verdict line, so
+# the shell's exact-match rule stays the single definition of a valid token and never has to learn
+# about prose. The envelope's own `verdict` field is deliberately ignored: a codex turn that dies
+# mid-review still serialises {"verdict":"approve", summary:<opening plan sentence>}.
+try:
+    inner = json.loads(raw)
+except Exception:
+    raise SystemExit(0)                      # unparseable -> emit nothing -> fail closed
+summary = inner.get("summary") if isinstance(inner, dict) else None
+if not isinstance(summary, str):
+    raise SystemExit(0)
+
+last = None
+for line in summary.replace("\r", "").split("\n"):
+    if line.startswith("VERDICT:"):          # line-anchored, same as the shell rule
+        last = line                          # last one wins, same as the shell rule
+if last is None:
+    raise SystemExit(0)
+
+# Longest alternative first (Python alternation is leftmost-FIRST, not longest), and a negative
+# lookahead so SHIP cannot match inside SHIP-WITH-CHANGES or SHIPPING, nor at the tail of SPACESHIP.
+found = re.findall(r"\b(?:SHIP-WITH-CHANGES|BLOCK|SHIP)(?![\w-])", last)
+# EXACTLY one token on the line. Two means the conclusion contradicts itself ('SHIP ... BLOCK'),
+# and an interlock must not pick a winner from an ambiguous verdict - it refuses.
+if len(found) == 1:
+    print("VERDICT: %s" % found[0])
 PYEOF
 )" || return 1
-  cverd="$(printf '%s\n' "$craw" | tr -d '\r' | grep -E '^VERDICT:' | tail -1 \
-           | sed 's/^VERDICT:[[:space:]]*//' \
-           | grep -oE '^(SHIP-WITH-CHANGES|BLOCK|SHIP)([[:space:].,;:]|$)' \
-           | sed 's/[[:space:].,;:]*$//')"
+  cverd="$(printf '%s\n' "$craw" | tr -d '\r' | grep -E '^VERDICT:' | tail -1 | sed 's/^VERDICT:[[:space:]]*//' | grep -oE '^(SHIP-WITH-CHANGES|BLOCK|SHIP)$')"
   [ "$cverd" = SHIP ] || return 1
   return 0
 }
@@ -621,6 +652,29 @@ env_case advblk 'needs-attention' 'VERDICT: BLOCK. After fixing we could SHIP th
   "adversarial-review: BLOCK with SHIP prose refused"
 env_case advpfx approve 'VERDICT: SHIPPING SOON. we think' 8 \
   "adversarial-review: SHIPPING is a prefix, not the token"
+env_case advcontra approve 'VERDICT: SHIP BLOCK' 8 \
+  "adversarial-review: two tokens on the line is ambiguous -> refused"
+env_case advlast approve 'VERDICT: SHIP. good
+VERDICT: BLOCK. actually no' 8 \
+  "adversarial-review: last verdict line wins even when it blocks"
+
+# 15i-l. PLAIN TEXT MUST NOT HAVE BEEN RELAXED. The first cut of envelope support widened the SHARED
+# shell rule to tolerate a delimiter after the token, which silently relaxed plain text too:
+# 'VERDICT: SHIP BLOCK' went from rejected to ACCEPTED (codex, [high]). These pin that it stayed
+# exact-match now that prose tolerance lives only inside the envelope branch.
+plain_case(){ # <slug> <rawOutput> <expected-rc> <label>
+  git checkout -q -b "session/$1" main; echo "print('$1')">>src/a.py; git commit -qam "$1"; git checkout -q main
+  out=$("$SELF" prepare "session/$1" main); eval "$out"
+  mk_rec "$INTEGRATION" "$(mk_env "$1" "$2")" >/dev/null
+  rc=0; "$SELF" commit "session/$1" main "$BASE" "$INTEGRATION" "$WORKTREE" >/dev/null 2>&1 || rc=$?
+  check "$4" "[ $rc -eq $3 ]"
+  [ "$rc" -eq 0 ] || "$SELF" abort "$WORKTREE" cleanup >/dev/null 2>&1 || true
+}
+plain_case pfospc 'VERDICT: SHIP BLOCK' 8 "plain text: 'SHIP BLOCK' still refused (exact-match)"
+plain_case pfocol 'VERDICT: SHIP: BLOCK' 8 "plain text: 'SHIP: BLOCK' still refused"
+plain_case pfocom 'VERDICT: SHIP, pending fixes' 8 "plain text: 'SHIP, pending fixes' still refused"
+plain_case pfoprose 'VERDICT: SHIP the release once tests pass' 8 \
+  "plain text: 'SHIP <prose>' still refused"
 
 # 16. codex SHIP-WITH-CHANGES -> exit 8
 git checkout -q -b session/swc main; echo "print('swc')">>src/a.py; git commit -qam swc; git checkout -q main
