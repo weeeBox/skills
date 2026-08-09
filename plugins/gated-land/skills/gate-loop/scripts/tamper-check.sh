@@ -24,6 +24,15 @@ is_guarded() {
     requirements*.txt|*/requirements*.txt)             return 0 ;;  # deps (mock the world)
     verify.sh|*/verify.sh|run_all.sh|*/run_all.sh)     return 0 ;;  # common verify-script names
     .dev-loop.conf|*/.dev-loop.conf)                   return 0 ;;  # suite/base/classifier selector
+    # THE GATE MACHINERY ITSELF. Everything above protects evidence the gate READS; these are the
+    # things that RENDER THE VERDICT, and until 2026-08-09 none of them was substrate. A repo that
+    # vendors them (or the plugin's own repo) could edit an interlock and self-approve the change
+    # through the interlock it just weakened. Not hypothetical: on 2026-08-07 three successive edits
+    # to `_verdict_ok` each introduced a distinct FAIL-OPEN - one of them read `VERDICT: DO NOT SHIP`
+    # as approval - and this guard returned 0 (clean) on every one of them.
+    lander.sh|*/lander.sh)                             return 0 ;;  # merge queue + verdict/risk interlocks
+    tamper-check.sh|*/tamper-check.sh)                 return 0 ;;  # THIS guard - it must guard itself
+    risk_classify.py|*/risk_classify.py)               return 0 ;;  # the static risk gate
   esac
   # Repo-specific substrate a self-driving session could edit to force a green run (an in-repo
   # risk/policy classifier, a coverage gate, etc.) that the built-in patterns above don't cover: set
@@ -67,14 +76,18 @@ selftest() {
       pytest.ini pyproject.toml a/pyproject.toml \
       requirements.txt requirements-dev.txt tools/requirements.txt \
       verify.sh .claude/hooks/verify.sh run_all.sh tests/run_all.sh \
-      .dev-loop.conf sub/.dev-loop.conf; do
+      .dev-loop.conf sub/.dev-loop.conf \
+      lander.sh scripts/lander.sh plugins/gated-land/engine/lander.sh \
+      tamper-check.sh skills/gate-loop/scripts/tamper-check.sh \
+      risk_classify.py engine/risk_classify.py src/cuj_loop/risk_classify.py; do
     is_guarded "$p" || { echo "FAIL: expected GUARDED: $p"; fails=$((fails+1)); }
   done
   # clean paths - note the edge cases that must NOT trip the guard
   for p in \
       src/app/main.py docs/x.md README.md \
       testdata/foo.py src/mytests.py verify_thing.py my_pyproject.toml \
-      src/lib/util.py docs/dev-loop.conf.md; do
+      src/lib/util.py docs/dev-loop.conf.md \
+      docs/lander.sh.md src/mylander.shim.py notes/tamper-check.md; do
     is_guarded "$p" && { echo "FAIL: expected CLEAN: $p"; fails=$((fails+1)); }
   done
   # fail-closed: an unresolvable base must return TAMPER (3), never a false all-clear
