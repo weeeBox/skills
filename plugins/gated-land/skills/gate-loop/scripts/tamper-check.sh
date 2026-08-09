@@ -33,6 +33,18 @@ is_guarded() {
     lander.sh|*/lander.sh)                             return 0 ;;  # merge queue + verdict/risk interlocks
     tamper-check.sh|*/tamper-check.sh)                 return 0 ;;  # THIS guard - it must guard itself
     risk_classify.py|*/risk_classify.py)               return 0 ;;  # the static risk gate
+    # ...and the CONTROL PLANE, which in an LLM-driven pipeline is prose. These four SKILL.md files
+    # are what tell the agent to run the tamper check at all, to stop on exit 3, and to require a
+    # codex SHIP. Weaken those lines and every coded brake above is still intact but never invoked,
+    # and this guard reports clean because no guarded CODE path was touched - the same self-approval
+    # class, one level up (codex, [high]). "Prose, not code" is the wrong axis; "does it decide
+    # whether the gate runs and what clears it" is the right one.
+    # Scoped to the four gate skills ON PURPOSE: guarding every SKILL.md would trip on ordinary
+    # skill edits and train people to wave the guard through.
+    gate-loop/SKILL.md|*/gate-loop/SKILL.md)           return 0 ;;
+    land/SKILL.md|*/land/SKILL.md)                     return 0 ;;
+    ship/SKILL.md|*/ship/SKILL.md)                     return 0 ;;
+    review-gate/SKILL.md|*/review-gate/SKILL.md)       return 0 ;;
   esac
   # Repo-specific substrate a self-driving session could edit to force a green run (an in-repo
   # risk/policy classifier, a coverage gate, etc.) that the built-in patterns above don't cover: set
@@ -79,7 +91,10 @@ selftest() {
       .dev-loop.conf sub/.dev-loop.conf \
       lander.sh scripts/lander.sh plugins/gated-land/engine/lander.sh \
       tamper-check.sh skills/gate-loop/scripts/tamper-check.sh \
-      risk_classify.py engine/risk_classify.py src/cuj_loop/risk_classify.py; do
+      risk_classify.py engine/risk_classify.py src/cuj_loop/risk_classify.py \
+      .agents/skills/gate-loop/SKILL.md plugins/gated-land/skills/gate-loop/SKILL.md \
+      plugins/gated-land/skills/land/SKILL.md plugins/gated-land/skills/ship/SKILL.md \
+      plugins/dev-loop-core/skills/review-gate/SKILL.md; do
     is_guarded "$p" || { echo "FAIL: expected GUARDED: $p"; fails=$((fails+1)); }
   done
   # clean paths - note the edge cases that must NOT trip the guard
@@ -87,13 +102,16 @@ selftest() {
       src/app/main.py docs/x.md README.md \
       testdata/foo.py src/mytests.py verify_thing.py my_pyproject.toml \
       src/lib/util.py docs/dev-loop.conf.md \
-      docs/lander.sh.md src/mylander.shim.py notes/tamper-check.md; do
+      docs/lander.sh.md src/mylander.shim.py notes/tamper-check.md \
+      .agents/skills/research/SKILL.md .agents/skills/code-review/SKILL.md \
+      docs/land/SKILL.md.draft skills/landing-page/SKILL.md; do
     is_guarded "$p" && { echo "FAIL: expected CLEAN: $p"; fails=$((fails+1)); }
   done
-  # fail-closed: an unresolvable base must return TAMPER (3), never a false all-clear
-  if tamper_check __definitely_no_such_ref__ HEAD 2>/dev/null; then
-    echo "FAIL: bad-base tamper_check returned clean (should fail closed)"; fails=$((fails+1))
-  fi
+  # fail-closed: an unresolvable base must return TAMPER - and EXACTLY 3, not merely non-zero. A
+  # test that accepts any non-zero would pass on exit 1 or 2, which callers do not treat as tamper.
+  local rc=0
+  tamper_check __definitely_no_such_ref__ HEAD 2>/dev/null || rc=$?
+  [ "$rc" -eq 3 ] || { echo "FAIL: bad-base should return exactly 3, got $rc"; fails=$((fails+1)); }
   # TAMPER_EXTRA_SUBSTR: repo-specific substrate guard, additive to the built-ins above
   local TAMPER_EXTRA_SUBSTR="src/cuj_loop/classify.py"
   is_guarded "src/cuj_loop/classify.py" || { echo "FAIL: expected GUARDED via TAMPER_EXTRA_SUBSTR"; fails=$((fails+1)); }
