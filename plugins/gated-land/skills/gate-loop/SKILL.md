@@ -100,11 +100,7 @@ at the top of each round, if `${CLAUDE_PLUGIN_ROOT}/skills/gate-loop/scripts/rou
 returns `>=3`, take the Cap-out path (do NOT start a 4th round). The count is positional (rows after the
 last `gateloop-start`), so it survives context compaction and clock drift.
 
-1. **Full suite.** your full-suite command (`$TEST_COMMAND` from `.dev-loop.conf`).
-   - Red → this is a fix pass: find the **root cause** and fix it, re-run affected + full suite until
-     green. Making a real test pass is fine; **deleting or mocking it to go green is what Step 4
-     catches** - never do it.
-2. **agy advisory - OPT-IN, skipped by default** (see review-gate's role note: 78% of 91 measured
+1. **agy advisory - OPT-IN, skipped by default** (see review-gate's role note: 78% of 91 measured
    dispatches returned `revisit`/`rethink` on work codex then SHIP'd, and agy can never block). Run it
    only for a specific reason - a domain codex has been weak on, an ambiguous codex verdict, or on
    request. When skipped, report `agy: not run (advisory, opt-in)`; that is honest and is **not** a
@@ -112,18 +108,37 @@ last `gateloop-start`), so it survives context compaction and clock drift.
    working-tree/staged diff here, BEFORE commit, or be marked N/A (clean tree → N/A, say so; don't
    present an empty agy result as a pass). Advisory only - surface findings, weigh them, never block or
    spend a codex round on agy alone.
-3. **Commit** the work on `session/<slug>` (per-task commits as usual).
-4. **Test-tamper guard (hard brake, every round over the whole branch diff):**
+2. **Commit** the work on `session/<slug>` (per-task commits as usual).
+3. **Test-tamper guard (hard brake, every round over the whole branch diff):**
    `${CLAUDE_PLUGIN_ROOT}/skills/gate-loop/scripts/tamper-check.sh <base>`.
    - Exit 3 → **STOP. Do not self-approve, even if the suite is green and codex would SHIP.** Log
      `gateloop-tamper` to verify.log and hand the branch diff to a human, or dispatch a **dedicated
      codex pass whose sole job is to judge that test/config/deps diff** - the loop cannot clear it.
    - Exit 0 → continue. **Only exit 0 continues; ANY non-zero (2 usage, 3 tamper, or anything else) is a
      fail-closed STOP** - never "exit != 3 means proceed".
-5. **codex gate on the branch diff.** Drive it through review-gate's **diff-stage**
-   mechanics (`/codex:adversarial-review --base <base>`), arming the wedge watchdog in the same breath.
-   **Round 2+: resume the SAME codex agent** (`codex:rescue --resume`) so it re-judges with warm context,
-   feeding it the prior verdict; do not cold-dispatch codex each round.
+   This runs BEFORE the concurrent dispatch below and must clear first: a tamper hit means no codex
+   verdict can be accepted at all, so there is nothing to overlap it with.
+4. **Full suite AND the codex gate - dispatch BOTH in the same turn, both `run_in_background: true`,
+   then wait.** They read the same committed tree, so neither blocks the other; the only ordering
+   constraint is that both come after the commit at Step 2. Waiting for the suite before dispatching
+   the gate is the largest recoverable serialization in this loop - measured 2026-08-09,
+   `parallelism=1.00x` across 24 background jobs in one session, a 4-minute dead gap between the suite
+   finishing and the codex dispatch going out, and 45% of that session's wall clock blocked.
+   - **Suite** = your full-suite command (`$TEST_COMMAND` from `.dev-loop.conf`).
+   - **codex gate on the branch diff** - drive it through review-gate's **diff-stage**
+     mechanics (`/codex:adversarial-review --base <base>`), arming the wedge watchdog in the same breath.
+     **Round 2+: resume the SAME codex agent** (`codex:rescue --resume`) so it re-judges with warm
+     context, feeding it the prior verdict; do not cold-dispatch codex each round.
+   - **A RED suite still rejects the round, exactly as before - this is a concurrency change, not a
+     policy change.** Discard this round's codex verdict (a SHIP on a red tree is never a pass), find
+     the **root cause** and fix it, re-run affected + full suite until green, then start the next
+     round. Making a real test pass is fine; **deleting or mocking it to go green is what Step 3
+     catches** - never do it.
+   - **The price of overlapping is one wasted codex job per RED round.** That is the intended trade:
+     codex spend is plan quota, the suite is ~3.5 min of wall clock on every round, and green rounds
+     are the majority. If a repo's suite is habitually red on entry to the loop, fix that rather than
+     re-serializing these two.
+5. **Verdict** (both results in hand).
    - **codex SHIP** + tamper-clean + suite green → **DONE.**
      Log `gateloop-pass` to verify.log. Report the green `session/<slug>` branch and **STOP before
      integration** (Stage 1 hands off to the lander / `/ship`, it does not merge).
@@ -135,7 +150,7 @@ last `gateloop-start`), so it survives context compaction and clock drift.
      - **full re-gate** (any blocking-severity finding - bug/security/correctness/race/fail-open/
        provenance/money - or a risk-sensitive diff) → fix the **root cause of the whole defect class**
        (enumerate siblings, add one class regression), re-run the affected suite, and start the next
-       round. If a fix must touch a test/config/deps file, that is a Step-4 tamper stop, not an
+       round. If a fix must touch a test/config/deps file, that is a Step-3 tamper stop, not an
        autonomous fix.
      - **batch** (all findings are style/design nits on a low-risk diff) → apply **all** the nit fixes
        in ONE commit, then run ONE **confirmation** gate (codex on the batched commit).
