@@ -141,6 +141,17 @@ marker) and run the runner again.
   `corrections` broken, dump the session's real user turns and point at one the regex
   missed. (Related, still open: `user_turns` counts those harness-injected blocks as user
   turns, so it overstates human involvement - `a59acf3f` reads 36 against 6 real ones.)
+- **`still_active` names only sessions that HAVE a record in `sessions[]`** (invariant
+  asserted in the selftest since 2026-08-10). Still-active files have always been scanned;
+  a record is omitted only when the file has ZERO events inside the day window - i.e. the
+  session belongs to a later day. Those are now counted in `active_no_in_day_events`
+  rather than named, because naming them implied their figures were missing from the day's
+  totals, and a reader acted on exactly that: the 2026-08-09 report opened with a caveat
+  about a session "absent from every figure above" which in fact had 889 events, all dated
+  2026-08-10. Do **not** "fix" this by emitting a partial all-nulls record for such a
+  session (`rec:2026-08-09#7`'s proposed artifact, rejected 2026-08-10 after checking the
+  transcript) - that fabricates a row for a session with no data on the date, and the
+  report then has to explain a row of nulls.
 - **Slow gate detection**: `scan_sessions.py` tags codex/agy review-gate activity
   (`GATE_RE`) in each session and reports `gate_calls` / `gate_wait_secs` /
   `max_gate_wait_secs` in the extract header. A gate that blocks for many minutes, or many

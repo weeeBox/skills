@@ -467,6 +467,7 @@ def scan_day(day):
     start, end = day_bounds(day)
     now = datetime.now(timezone.utc)
     sessions, active = [], []
+    active_no_events = 0
     day_start_epoch = start.timestamp()
     for proj in sorted(PROJECTS.iterdir()):
         if not proj.is_dir():
@@ -478,11 +479,23 @@ def scan_day(day):
             # still-active files ARE scanned: target-day events are already
             # written (new appends are a later day) and iter_lines tolerates a
             # partial final line; 'active' is informational only
-            if now.timestamp() - st.st_mtime < ACTIVE_GRACE_SECS:
-                active.append(f"{proj.name}/{f.stem}")
+            is_active = now.timestamp() - st.st_mtime < ACTIVE_GRACE_SECS
             s = scan_file(f, start, end)
             if s["events"] == 0:
+                # Recent mtime but NO in-day events: the session belongs to a LATER
+                # day and legitimately has nothing here. Naming it in `still_active`
+                # implied its figures were missing from the day's totals, and a
+                # reader acted on exactly that - the 2026-08-09 report opened with a
+                # caveat about a session "absent from every figure above" which in
+                # fact had 889 events, all dated 2026-08-10. Count it instead of
+                # naming it: nothing hidden, nothing implied. Do NOT emit a partial
+                # all-nulls record for it (rec:2026-08-09#7's proposed artifact) -
+                # that fabricates a row for a session with no data on this date.
+                if is_active:
+                    active_no_events += 1
                 continue
+            if is_active:
+                active.append(f"{proj.name}/{f.stem}")
             subdir = f.parent / f.stem / "subagents"
             subs = list(subdir.glob("*.jsonl")) if subdir.is_dir() else []
             for sub in subs:
@@ -501,7 +514,10 @@ def scan_day(day):
             sessions.append(s)
     sessions.sort(key=lambda x: x["friction_score"], reverse=True)
     return {"date": day.isoformat(), "generated": now.isoformat(),
-            "sessions": sessions, "still_active": active}
+            "sessions": sessions, "still_active": active,
+            # every name in `still_active` HAS a record in `sessions`; this is the
+            # count of live files that contributed no in-day events at all.
+            "active_no_in_day_events": active_no_events}
 
 
 def cmd_scan(day):
@@ -518,7 +534,11 @@ def cmd_scan(day):
               f"{sum(s['tools'].values()):>6} {s.get('duration_secs', 0):>7.0f} "
               f"{s.get('total_tokens', 0) / 1000:>6.0f}  {s['project']}/{s['session'][:8]}")
     if result["still_active"]:
-        print(f"still-active files scanned: {len(result['still_active'])}")
+        print(f"still-active files scanned: {len(result['still_active'])} "
+              f"(all have records above)")
+    if result.get("active_no_in_day_events"):
+        print(f"live files with no {day} events (belong to a later day, "
+              f"correctly excluded): {result['active_no_in_day_events']}")
     print(f"scan.json: {workdir / 'scan.json'}")
     return result
 
@@ -1349,6 +1369,35 @@ def selftest():
         with _rso(_io.StringIO()):
             cmd_effectiveness(date(2026, 7, 10))
     REPORTS = real_reports
+
+    # --- still_active must name only sessions that HAVE a record (2026-08-10) ---
+    # A live file whose events all belong to a LATER day is correctly excluded from
+    # sessions[]; naming it in still_active told a reader its figures were missing
+    # from the totals, and the 2026-08-09 report opened with exactly that wrong
+    # caveat. Two files, both freshly mtimed so both look "active": one with in-day
+    # events, one with next-day events only.
+    global PROJECTS
+    real_projects = PROJECTS
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            PROJECTS = Path(td)
+            proj = PROJECTS / "-proj"
+            proj.mkdir()
+            def _row(stamp):
+                return json.dumps({"type": "user", "timestamp": stamp,
+                                   "message": {"content": [{"type": "text", "text": "x"}]}}) + "\n"
+            (proj / "inday.jsonl").write_text(_row("2026-07-08T12:00:00.000Z"))
+            (proj / "nextday.jsonl").write_text(_row("2026-07-09T12:00:00.000Z"))
+            r = scan_day(date(2026, 7, 8))
+            ids = {s["session"] for s in r["sessions"]}
+            assert ids == {"inday"}, ids
+            # the invariant the fix exists to hold
+            for name in r["still_active"]:
+                assert name.split("/", 1)[1] in ids, (name, ids)
+            assert r["still_active"] == ["-proj/inday"], r["still_active"]
+            assert r["active_no_in_day_events"] == 1, r["active_no_in_day_events"]
+    finally:
+        PROJECTS = real_projects
     print("selftest OK")
 
 
