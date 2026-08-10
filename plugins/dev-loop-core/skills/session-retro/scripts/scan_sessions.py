@@ -77,7 +77,51 @@ RETRACTION_RE = re.compile(
     r"\bthan i (?:assumed|thought)\b|"
     r"\b(?:is|was|are|were) confounded\b|"
     r"\b(?:names?|lists?|cites?) (?:it|them|that) wrongly\b|"
-    r"\b(?:is|was) now stale\b")
+    # NARROWED 2026-08-10. The bare form matched "the verdict record ... is now stale" -
+    # a fact about an artifact, not a self-retraction. It was the ONLY false positive in
+    # the 128-block hand-labelled set, so it alone put precision at 0.500.
+    r"\b(?:my|our) [^.\n]{0,45}?(?:is|was) now stale\b|"
+    # WIDENED 2026-08-10 (rec:2026-08-03#13, chronic 6 days). The 2026-08-06 widening was
+    # probed on 2026-08-05 text and still measured recall 0.091 / precision 0.500 against
+    # the first FULL hand-label of a session (a59acf3f, 2026-08-09, all 128 assistant text
+    # blocks). Every clause below was probed individually against those 128 blocks AND the
+    # 297 blocks of held-out session 8d7a8a76, and each one's hits were read before it was
+    # added - the discipline the 2026-08-06 note prescribes. Post-change on the labelled
+    # set: precision 0.952 (strict) / 1.000 (counting the one hand-labelled borderline as
+    # correct), recall 0.952. Held-out session: 8 -> 16 hits, all 16 read as genuine.
+    r"\bhollow\b|"
+    r"\bmutation (?:still )?passes\b|"
+    r"\bpass(?:es|ed) pre-fix\b|"
+    r"\bmy [^.\n]{0,40}? claim (?:may be|might be|was|is) wrong\b|"
+    r"\bmy arithmetic\b|"
+    r"\bi missed\b|\b(?:i'?d|i had) missed\b|"
+    r"\b(?:i'?d|i would) have shipped\b|"
+    r"\bnever asserted (?:anything|it|that)\b|\basserted nothing\b|"
+    r"\b(?:was|were) vacuous\b|\bvacuous assertion\b|"
+    r"\bunverified assertion\b|"
+    r"\brefutes (?:my|a) claim\b|"
+    r"\bovercla(?:im|ims|imed|iming)\w*\b|"
+    r"\bmy (?:own )?mutation evidence\b|"
+    r"\bi never (?:measured|ran|checked|verified|tested|proved)\b|"
+    # First-person + emphasis-tolerant: [095] writes "I asserted *absence after the
+    # fence*". A BARE `asserted absence` also matched two running-tally restatements
+    # ("Six tests this session asserted absence...") which are reports, not retractions.
+    r"\bi asserted \**absence\b|"
+    r"\bdid(?:n'?t| not) prove what i claimed\b")
+# Quoted/citation spans are EVIDENCE the agent is reporting, not a live retraction: a
+# reviewer verdict in a blockquote, a commit log in a fence, a timestamped citation.
+# Strip them before matching. NB the DOTALL scoping - a global re.S makes the `>` branch
+# swallow every line after the first blockquote, which silently deleted a real retraction
+# from the labelled set until it was measured.
+QUOTE_STRIP_RE = re.compile(
+    r"(?s:```.*?```)"
+    r"|^[ \t]*>.*$"
+    r"|^.*\b\d{2}:\d{2}:\d{2}\b.*$",
+    re.M)
+
+
+def strip_quoted(t):
+    return QUOTE_STRIP_RE.sub(" ", t)
 NUDGE_RE = re.compile(
     r"(?i)^\W*(?:continue|proceed|keep going|go on|carry on|go ahead|"
     r"next|resume|do it)\W*$")
@@ -265,7 +309,7 @@ def scan_file(path, start, end):
             # 2026-08-04: " ".join -> MISS, "\n".join -> MATCH on the same input.
             atext = "\n".join(text_of(b) for b in blocks(d)
                               if isinstance(b, dict) and b.get("type") == "text")
-            if RETRACTION_RE.search(atext):
+            if RETRACTION_RE.search(strip_quoted(atext)):
                 s["self_retractions"] += 1
             for b in blocks(d):
                 if b.get("type") == "tool_use":
@@ -373,6 +417,14 @@ def scan_file(path, start, end):
     for k in ("work_secs", "human_wait_secs", "blocked_secs"):
         s[k] = round(s[k], 1)
     s["repeated_error_runs"] = runs
+    # A retro STUB - the pipeline analysing its own output - is one user turn, one or two
+    # assistant turns, and zero tool calls, under the "-" project. Its assistant text is
+    # QUOTING transcript evidence, so any retraction phrasing in it belongs to the session
+    # being analysed, not to this agent. Hard-zero both verbal counters there: 2026-08-09
+    # scored self_retractions=1 on such a stub (session 17d87756).
+    if s.get("project") in ("-", None, "") and not s["tools"] and s["user_turns"] <= 1:
+        s["self_retractions"] = 0
+        s["corrections"] = 0
     return s
 
 
@@ -991,6 +1043,39 @@ def selftest():
     # corrections is not a retraction. These are what took precision to 0.92 before narrowing.
     assert not RETRACTION_RE.search("every correction to one has to be checked against the other")
     assert not RETRACTION_RE.search("every correction to one needs checking against the other")
+    # --- 2026-08-10 widening: one assert per added clause, each a VERBATIM 2026-08-09 string
+    # from the hand-labelled session a59acf3f or the held-out session 8d7a8a76 ---
+    assert RETRACTION_RE.search("The starvation test is hollow - the mutation passes.")
+    assert RETRACTION_RE.search("test_the_source_actually_sets_body_truncated passes pre-fix")
+    assert RETRACTION_RE.search('so my "identical for contacts" claim may be wrong')
+    assert RETRACTION_RE.search("My arithmetic, not the code: the prefix is 22 chars, not 21")
+    assert RETRACTION_RE.search("the same vacuity class again, in a subtler form I missed")
+    assert RETRACTION_RE.search("and it caught something I'd have shipped")
+    assert RETRACTION_RE.search("my contact fixture never asserted anything")
+    assert RETRACTION_RE.search("so that half was vacuous in the failing direction")
+    assert RETRACTION_RE.search("My 'id-keyed, so no collision' claim was an unverified assertion")
+    assert RETRACTION_RE.search("it refutes a claim I made: latest_signal is an overwrite path")
+    assert RETRACTION_RE.search("Deleting the hollow test and correcting the overclaiming comment")
+    assert RETRACTION_RE.search("my own mutation evidence is worth checking, not trusting")
+    assert RETRACTION_RE.search("My commit 64c6b3d1 does state that measurement - and I never ran it")
+    assert RETRACTION_RE.search("I asserted *absence after the fence* without ever proving presence")
+    assert RETRACTION_RE.search("my mutation evidence was real and still didn't prove what I claimed")
+    assert RETRACTION_RE.search("Four codex rounds, each finding a real layer I'd missed")
+    # ...and the 2026-08-10 narrowings must hold. The bare `(is|was) now stale` matched a
+    # fact about an ARTIFACT - the single false positive in the 128-block labelled set.
+    assert not RETRACTION_RE.search("The verdict record keyed to 1c17fb1f is now stale")
+    assert RETRACTION_RE.search("my last line about it still being up is now stale")
+    # A bare `asserted absence` matched running-tally RESTATEMENTS, which report a prior
+    # retraction rather than making one. Require first person.
+    assert not RETRACTION_RE.search("Six tests this session asserted absence without establishing presence")
+    # --- quote/citation stripping: reported evidence is not a live retraction ---
+    assert not RETRACTION_RE.search(strip_quoted("> my published number was wrong"))
+    assert not RETRACTION_RE.search(strip_quoted("```\nfix: stop overclaiming the guard\n```"))
+    assert not RETRACTION_RE.search(strip_quoted("at 21:31:27 the agent said the test is hollow"))
+    # ...but stripping must NOT eat the whole block after a blockquote. A global re.S made
+    # the `>` branch swallow every following line, silently deleting a real retraction.
+    assert RETRACTION_RE.search(strip_quoted(
+        "> codex: the CAS proves nothing here\n\nI asserted *absence* without proving presence."))
     # the >=5-token gap that the 2026-08-04 probe rejected must STILL be rejected
     assert not RETRACTION_RE.search("My test covers the case where the input was wrong on purpose")
     # must NOT fire on ordinary prose that merely contains the words

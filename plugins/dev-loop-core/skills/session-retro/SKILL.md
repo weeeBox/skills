@@ -93,7 +93,8 @@ marker) and run the runner again.
   bullets do). If the two disagree, the counter is wrong until shown otherwise - a plausible
   implementation is not evidence. A counter with no recorded hand-check is a diagnostic aid,
   never a trend axis and never the basis of a recommendation.
-- **`self_retractions` is a LOWER BOUND, not yet a trend axis.** It counts the AGENT
+- **`self_retractions` PASSES its acceptance gate as of 2026-08-10 and is now a trend
+  axis.** It counts the AGENT
   retracting its own prior claim, on assistant turns (`RETRACTION_RE`) - distinct from
   `corrections`, which scans USER turns and measures the user correcting the agent. It is
   reported in the scan table (`retr`) and the extract header, and is deliberately NOT part
@@ -105,17 +106,41 @@ marker) and run the runner again.
   behaviour and must stay a diagnostic aid only. Re-run this check before ever widening
   the regex - a bounded-gap variant was already rejected in 2026-08-04 testing for
   false-matching "My test covers the case where the input was wrong on purpose".
-  **Status after the 2026-08-06 widening: precision PASSES, recall does NOT yet.**
-  Pre-widening it matched 5 of an independently estimated 33-38 true retractions on
-  2026-08-05 (~13% recall), and four of that day's analysts each flagged the counter as a
-  false floor. Post-widening it matches 24, all hand-labelled: 23-24 true, so
-  **precision 0.958-1.00**. Recall is ~0.63-0.73 against an ESTIMATED denominator, which
-  straddles the bar and was not produced by the hand-labelled session this gate specifies,
-  so the recall half stays OPEN and the count stays a diagnostic aid, not a trend axis.
-  Running this gate is what caught the widening's own defect: the first attempt scored 0.92
-  because a bare `correction to` matched "every correction to one has to be checked against
-  the other" - prose ABOUT corrections. Do not widen from a pattern list alone; probe each
-  candidate clause against real assistant text and read its hits before adding it.
+  **Status 2026-08-10: BOTH halves PASS, on the first properly-executed run of this gate.**
+  Session `a59acf3f` (2026-08-09), all **128** assistant text blocks hand-labelled in full:
+  **precision 0.952** (conservative reading; 1.000 if the one hand-labelled borderline
+  counts as correct), **recall 0.952** (20 of 21). Held-out session `8d7a8a76` (297 blocks,
+  never label-fitted): 8 hits -> 16, all 16 read and all genuine. Before this change the
+  same regex measured **recall 0.091 / precision 0.500** on that labelled set - the
+  2026-08-06 status line above was written against 2026-08-05 text and an ESTIMATED
+  denominator, and it overstated both halves.
+  Two defects only the labelled run could find, both now pinned by asserts:
+  (1) the bare `(is|was) now stale` clause matched *"the verdict record ... is now stale"* -
+  a fact about an artifact, and the single false positive that put precision at 0.500;
+  (2) the new quote-stripper's global `re.S` made its `>` branch swallow every line after
+  the first blockquote, silently deleting a real retraction until it was measured.
+  **The labelling method is part of the gate.** A first pass that labelled from 300-char
+  previews found 11 retractions; re-reading all 128 blocks IN FULL found 21. Ten sat past
+  the truncation point (`[052]`'s retraction is its final paragraph). Never label from a
+  preview - the resulting recall denominator is wrong in the flattering direction.
+  Running this gate is also what caught the 2026-08-06 widening's own defect: that attempt
+  scored 0.92 because a bare `correction to` matched "every correction to one has to be
+  checked against the other" - prose ABOUT corrections. Do not widen from a pattern list
+  alone; probe each candidate clause against real assistant text and read its hits before
+  adding it. Both narrowings above were found this way, not by inspection.
+- **`corrections=0` is usually CORRECT, and reports keep misreading it as a broken
+  counter.** `CORRECTION_RE` scans USER turns for the user correcting the agent.
+  `self_retractions` scans ASSISTANT turns for the agent retracting itself. They are
+  different measurements, and a report that cites first-person agent quotes
+  (*"my claim was an unverified assertion"*) as evidence that `corrections` is
+  under-counting has made a category error. Verified 2026-08-10 on 2026-08-09's
+  `a59acf3f`: of its 36 counted user turns, every one is a genuine non-corrective request
+  (*"what is the current state"*, *"take the next recommended step"*, *"clear all"*) or a
+  harness-injected `<task-notification>` / skill preamble. **There was no user correction
+  to find.** `rec:2026-08-03#13` carried this conflation for six days. Before calling
+  `corrections` broken, dump the session's real user turns and point at one the regex
+  missed. (Related, still open: `user_turns` counts those harness-injected blocks as user
+  turns, so it overstates human involvement - `a59acf3f` reads 36 against 6 real ones.)
 - **Slow gate detection**: `scan_sessions.py` tags codex/agy review-gate activity
   (`GATE_RE`) in each session and reports `gate_calls` / `gate_wait_secs` /
   `max_gate_wait_secs` in the extract header. A gate that blocks for many minutes, or many
