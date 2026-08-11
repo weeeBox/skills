@@ -26,6 +26,20 @@ auto-resolves a merge conflict, never runs on every turn. This is the expensive 
   else ask) and the **target** (default `main`; ask only if ambiguous).
 - The candidate should already be `gate-loop`-green. This skill re-verifies from scratch anyway (the
   lander re-runs the suite on the *merged* commit), so a stale green is caught, not trusted.
+- **REFUSE to land from inside the candidate's own worktree.** Check it before anything else:
+
+  ```bash
+  git rev-parse --show-toplevel      # must NOT be the candidate branch's worktree
+  git worktree list                  # shows which worktree holds <candidate>
+  ```
+
+  If this session's toplevel is the worktree checked out on the candidate branch, stop and say:
+  *"land from a different worktree - a successful land deletes this one."* A successful land removes
+  the candidate worktree, and a session pinned to it wedges instantly and totally: every later Bash
+  call is refused as resolving to the shared checkout, **including the `git push` that finishes the
+  land**. Recovery is `ExitWorktree` with `action: "keep"` - one call, no session restart, and
+  neither `cd`, an absolute path, nor `git -C` gets out of it. On 2026-08-10 a land succeeded and
+  then burned four dead calls rediscovering this before handing the unpushed push to the user.
 
 ## Step 1 - prepare (mechanical, in a throwaway worktree)
 
@@ -42,9 +56,13 @@ the vendored `${CLAUDE_PLUGIN_ROOT}/engine/risk_classify.py` (allowlist + denyli
 - **Non-zero exit → STOP, target untouched.** Surface the reason verbatim: `3`=merge conflict (never
   auto-resolve - hand to a human), `4`=suite red on the integration commit (the semantic-conflict
   catch), `5`=dirty/stale, `2`=usage. Do not proceed.
-- **Exit 0 →** capture the printed `BASE`, `INTEGRATION`, `WORKTREE`, `RISK`, `OVERLAP`,
+- **Exit 0 →** capture the printed `BASE`, `INTEGRATION`, `WORKTREE`, `RISK`, `SUITE`, `OVERLAP`,
   `OVERLAP_FILES`. The throwaway worktree is left in place holding the merged commit, for the gate and
   the commit.
+- `SUITE` is `RAN` or `SKIPPED_DOCS_ONLY`. The skip fires only when **every** path in the
+  integration diff ends `.md`/`.txt`/`.rst` - one code file, one unlisted extension, or an empty
+  diff and the suite runs. State the value in the Step 4 report and in the reviewer prompt, so a
+  green land on prose is never mistaken for a green land on a tested diff.
 
 ## Step 1b - is there anything new to review? (the merge-interaction check)
 
