@@ -19,9 +19,21 @@ BASE_BRANCH="${BASE_BRANCH:-main}"
 
 # --- lander engine wiring (usually leave as-is) ----------------------------------------
 # The serialized merge queue and the risk classifier are vendored in this plugin.
-# $CLAUDE_PLUGIN_ROOT is set by Claude Code to the gated-land plugin root at runtime.
+# $CLAUDE_PLUGIN_ROOT is set by Claude Code when a SKILL runs, but it is UNSET in a plain Bash
+# tool call - which silently yields paths like "/engine/lander.sh" (measured 2026-08-10). Resolve
+# it here so this file is safe to source from anywhere.
+if [ -z "${CLAUDE_PLUGIN_ROOT:-}" ]; then
+  _gl="$(find "$HOME/.claude/plugins/cache" -path '*gated-land*/engine/lander.sh' 2>/dev/null | head -1)"
+  [ -n "$_gl" ] && CLAUDE_PLUGIN_ROOT="${_gl%/engine/lander.sh}"
+  unset _gl
+fi
 export LANDER_SUITE_CMD="$TEST_COMMAND"
 export LANDER_RISK_CLASSIFY="$CLAUDE_PLUGIN_ROOT/engine/risk_classify.py"
+# Call these by variable, NEVER by a literal path. A literal plugin path breaks on every version
+# bump: on 2026-08-10 two sessions armed the wedge watchdog on the pre-plugin
+# ~/.claude/skills/review-gate/... path, got Exit 127, and left a codex land-gate job unwatched.
+export LANDER_SH="$CLAUDE_PLUGIN_ROOT/engine/lander.sh"
+export WATCHDOG_SH="$(find "$HOME/.claude/plugins/cache" -name watch-agent-output.sh 2>/dev/null | head -1)"
 # The generic risk classifier has no imports, so no PYTHONPATH is needed. If you point
 # LANDER_RISK_CLASSIFY at your own in-repo classifier instead (e.g. one that vendors its own
 # engine for a safety-critical gate with no external runtime dependency), and it imports your

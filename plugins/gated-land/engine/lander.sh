@@ -183,8 +183,21 @@ cmd_prepare() {
   fi
   local integ; integ="$(git -C "$wt" rev-parse HEAD)"
 
-  # full suite on the EXACT integration commit (catches two-branches-broken-together)
-  if ! ( cd "$wt" && eval "$SUITE_CMD" ) >"$suite_log" 2>&1; then
+  # full suite on the EXACT integration commit (catches two-branches-broken-together), UNLESS the
+  # integration diff is documentation only - no test can observe a prose change, so the run buys
+  # nothing but exposure to flakes (2026-08-10: a flaky browser test turned a docs-only prepare RED,
+  # costing the discarded prepare plus a full main-suite baseline to prove it was not the diff).
+  #
+  # FAIL-CLOSED BY CONSTRUCTION: skip only when EVERY changed path carries a documentation
+  # extension. Anything else runs the suite - .sh, .yml, Makefile, an extensionless script, a
+  # renamed dir, an empty diff. Do NOT rewrite this as "no path looks like code": an allowlist of
+  # code extensions treats every unlisted one as prose, and this engine is itself a .sh file.
+  local changed suite_status=RAN
+  changed="$(git -C "$wt" diff --name-only "$base" "$integ")"
+  if [ -n "$changed" ] && ! printf '%s\n' "$changed" | grep -qvE '\.(md|txt|rst)$'; then
+    suite_status=SKIPPED_DOCS_ONLY
+    log "land-suite-skipped" "$candidate docs-only integ=${integ:0:8}"
+  elif ! ( cd "$wt" && eval "$SUITE_CMD" ) >"$suite_log" 2>&1; then
     log "land-redsuite" "$candidate integ=$(git -C "$wt" rev-parse --short HEAD)"
     die "SUITE RED on the integration commit — discarded, target untouched (log: $suite_log)" 4
   fi
@@ -203,8 +216,10 @@ cmd_prepare() {
   # OVERLAP_FILES is single-quoted: the caller parses this block with `eval`, so an unquoted
   # multi-file value would execute the second path as a command. Single quotes are stripped from
   # paths for the same reason (they would close the quote).
-  printf "CANDIDATE=%s\nTARGET=%s\nBASE=%s\nINTEGRATION=%s\nWORKTREE=%s\nRISK=%s\nOVERLAP=%s\nOVERLAP_FILES='%s'\n" \
-    "$candidate" "$target" "$base" "$integ" "$wt" "$risk" "$ovn" \
+  # SUITE is a bare token (SKIPPED_DOCS_ONLY, not "SKIPPED (docs-only)") because the caller parses
+  # this block with `eval` - a space or paren in an unquoted value breaks it.
+  printf "CANDIDATE=%s\nTARGET=%s\nBASE=%s\nINTEGRATION=%s\nWORKTREE=%s\nRISK=%s\nSUITE=%s\nOVERLAP=%s\nOVERLAP_FILES='%s'\n" \
+    "$candidate" "$target" "$base" "$integ" "$wt" "$risk" "$suite_status" "$ovn" \
     "$(printf '%s' "$ovf" | tr -d "'" | tr '\n' ' ')"
 }
 
@@ -422,7 +437,8 @@ check "target untouched on conflict" "[ \"$(git rev-parse main)\" = \"$mainc\" ]
 # 5. RED SUITE -> prepare fails, AND the diagnostic log outlives the cleanup trap.
 # The trap on the die path `worktree remove --force`s $wt, so the log must be a SIBLING of $wt,
 # never inside it - an in-worktree log is deleted on exactly the failure it exists to explain.
-git checkout -q -b session/red main; echo z>>docs/x.md; git commit -qam red
+# NOTE: must touch a CODE path - a docs-only diff now skips the suite entirely (case 5b/5c).
+git checkout -q -b session/red main; echo "print('red')">>src/a.py; git commit -qam red
 rc=0; rederr="$(LANDER_SUITE_CMD='sh -c "echo RED_MARKER; exit 1"' "$SELF" prepare session/red main 2>&1 >/dev/null)" || rc=$?
 check "red-suite prepare fails" "[ $rc -eq 4 ]"
 redlog="$(printf '%s' "$rederr" | sed -n 's/.*(log: \(.*\))$/\1/p')"
@@ -430,6 +446,30 @@ check "red-suite error names a log path" "[ -n \"$redlog\" ]"
 check "red-suite log survives cleanup with the failure output" "[ -s \"$redlog\" ] && grep -q RED_MARKER \"$redlog\""
 check "red-suite log is a sibling, not inside the removed worktree" "[ ! -e \"${redlog%.suite.log}\" ]"
 rm -f "$redlog"
+
+# 5b. DOCS-ONLY diff -> suite is SKIPPED. Proven with a suite command that would FAIL if it ran,
+# so a pass here cannot come from the fake `true` suite.
+git checkout -q -b session/docs main; echo z>>docs/x.md; git commit -qam docsonly
+rc=0; outd=$(LANDER_SUITE_CMD='sh -c "echo SHOULD_NOT_RUN; exit 1"' "$SELF" prepare session/docs main) || rc=$?
+check "docs-only prepare ok despite a failing suite cmd" "[ $rc -eq 0 ]"
+check "docs-only reports SUITE=SKIPPED_DOCS_ONLY" "printf '%s\n' \"\$outd\" | grep -qx 'SUITE=SKIPPED_DOCS_ONLY'"
+WT_D=$(printf '%s\n' "$outd" | sed -n 's/^WORKTREE=//p')
+"$SELF" abort "$WT_D" cleanup >/dev/null 2>&1 || true
+
+# 5c. ONE code file alongside the docs -> the suite RUNS (this is the fail-closed half; without it
+# 5b only proves the skip fires, never that it stays off the code path).
+git checkout -q -b session/mixed main; echo z>>docs/x.md; echo "print('m')">>src/a.py; git commit -qam mixed
+rc=0; LANDER_SUITE_CMD='sh -c "exit 1"' "$SELF" prepare session/mixed main >/dev/null 2>&1 || rc=$?
+check "docs+code diff still runs the suite (RED)" "[ $rc -eq 4 ]"
+# and a non-doc extension the allowlist never named must NOT be mistaken for prose
+git checkout -q -b session/sh main; echo 'echo hi' > run.sh; git add run.sh; git commit -qm shfile
+rc=0; LANDER_SUITE_CMD='sh -c "exit 1"' "$SELF" prepare session/sh main >/dev/null 2>&1 || rc=$?
+check "unlisted extension (.sh) is not treated as docs" "[ $rc -eq 4 ]"
+# a green run on the same shape still reports SUITE=RAN
+rc=0; outr=$("$SELF" prepare session/mixed main) || rc=$?
+check "code diff reports SUITE=RAN" "printf '%s\n' \"\$outr\" | grep -qx 'SUITE=RAN'"
+WT_R=$(printf '%s\n' "$outr" | sed -n 's/^WORKTREE=//p')
+"$SELF" abort "$WT_R" cleanup >/dev/null 2>&1 || true
 
 # 6. TARGET CHECKED OUT in primary -> update-ref CAS + reset --hard path (the real-world case)
 git checkout -q main                         # primary now ON the target
