@@ -47,21 +47,45 @@ cap applies to that.)
    (see **Concurrency**). On `ACQUIRED`, dispatch; on `RECONNECT`, poll the printed jobs.
 3. Dispatch **codex** (and **agy** only if you opted in above - then both in parallel, fire-and-forget
    background jobs; with agy skipped, pass an empty agy job id to `record`):
-   - **codex.** THE PREAMBLE MUST MATCH THE DISPATCH PATH. The two paths have opposite tool sets, and
-     using one path's preamble on the other is what manufactures a spurious BLOCK (2026-08-06 audit:
-     this step previously prescribed the Read/Glob/Grep preamble while listing the `task` path first,
-     so every plan-stage round shipped a preamble that was false in both halves).
-     - **`/codex:adversarial-review` (PREFERRED for a diff).** Read-only sandbox, has Read/Glob/Grep,
-       no shell. Accepts `--base <ref>`; **only this path does.** Preamble: *"Your context is
-       read-only: Bash and Skill are DISABLED. Use Read/Glob/Grep only. Treat suite pass/fail as given
-       by the payload, or flag 'suite result not provided' as a finding; do not probe for `.rc`
-       /scratchpad artifacts."* **Do NOT claim the diff is inlined** - the plugin inlines it only when
-       the change touches <=2 files AND <=256 KB (`lib/git.mjs`), thresholds the caller cannot raise,
-       so on any realistic branch the reviewer is told to derive the diff itself. Claiming otherwise
-       while it cannot run git is the second spurious-BLOCK direction.
+   - **codex.** THE PREAMBLE MUST MATCH THE REVIEWER'S ACTUAL TOOL SET. A preamble that misdescribes
+     it is what manufactures a spurious BLOCK (2026-08-06 audit: this step once prescribed the
+     Read/Glob/Grep preamble while listing the `task` path first, so every plan-stage round shipped a
+     preamble that was false in both halves).
+
+     **As of codex plugin `1.0.6` BOTH codex paths have the SAME tool set - a shell, and no
+     Read/Glob/Grep - so both take the shell preamble.** They were documented as opposites until
+     2026-08-12; see the measurement under `adversarial-review`. The rule is kept as "match the
+     reviewer" rather than collapsed to "always send the shell preamble", because a future version
+     can change the tool set again and the failure is silent when it does: the reviewer either
+     ignores the false claim (and you learn nothing) or believes it and refuses. **Verify against a
+     job log before trusting either entry.**
+     - **`/codex:adversarial-review` (PREFERRED for a diff).** **It HAS a shell and does NOT have
+       Read/Glob/Grep** - the same tool set as the `task` path below, so give it the same SHELL
+       preamble. Accepts `--base <ref>`; **only this path does.** Preamble: *"You have a shell.
+       Derive the diff yourself: `git diff <base>...HEAD`. Nothing is inlined in this prompt. Read
+       whatever files you need with shell commands. Treat suite pass/fail as given, or flag 'suite
+       result not provided' as a finding."* **Do NOT claim the diff is inlined** - the plugin inlines
+       it only when the change touches <=2 files AND <=256 KB (`lib/git.mjs`), thresholds the caller
+       cannot raise, so on any realistic branch the reviewer must derive the diff itself.
+
+       > **Corrected 2026-08-12 (codex plugin `1.0.6`), measured.** This entry used to say
+       > "read-only sandbox, has Read/Glob/Grep, no shell" and prescribe *"Bash and Skill are
+       > DISABLED. Use Read/Glob/Grep only."* **Both halves are false**, and the cost is not
+       > cosmetic - the false preamble stops the reviewer investigating at all. Same tool, same
+       > version, three runs in one session: with the "no shell" preamble the reviewer ran **0**
+       > commands and returned `needs-attention` with a `[critical]` finding that it "cannot perform
+       > the requested grounded adversarial review because repository file access is disabled"; with
+       > the shell preamble it ran **17** and **12** shell commands respectively and returned real
+       > verdicts. **That refusal is a spurious non-verdict, not a BLOCK.** On one, re-dispatch with
+       > a corrected preamble - never read it as a finding, and never reach for
+       > `LANDER_VERDICT_OVERRIDE`, which waives the REVIEWER to paper over a DISPATCH error. The
+       > tell is in the job log: `[codex] Running command: /bin/zsh -lc ...` means it has a shell,
+       > whatever this file says. Re-check this entry against the log if the plugin version moves.
      - **`codex:codex-rescue` / `task` (use when you need an anchored `VERDICT:` line, e.g. for the
-       lander interlock).** This agent's tool set is **Bash only - it has NO Read/Glob/Grep**. Never
-       send it the read-only preamble. Preamble: *"You have a shell and no file-reading tools. Derive
+       lander interlock).** This agent's tool set is **Bash only - it has NO Read/Glob/Grep**, i.e.
+       the SAME as `adversarial-review` above, so both take a shell preamble; the paths differ only
+       in `--base` support and output format, not in tools. Preamble: *"You have a shell and no
+       file-reading tools. Derive
        the diff yourself with `git diff <base>...HEAD`; nothing is inlined unless this prompt says so.
        Treat suite pass/fail as given, or flag it as a finding."* Also request read-only explicitly:
        `codex-rescue` defaults to `--write` (`workspace-write`) unless asked otherwise, so a gate that
@@ -96,8 +120,10 @@ Review a branch diff before merge (the path `/ship` delegates to). Same as plan 
 - Resolve `<base>` (usually `main`; ask if ambiguous). Confirm `git diff <base>...HEAD` is non-empty -
   if empty, STOP and report "nothing to ship" (never a clean verdict on empty input).
 - **codex:** `/codex:adversarial-review --base <base>` (scopes to the whole branch diff). Use the
-  `adversarial-review` preamble from the plan stage - read-only, Read/Glob/Grep, and **no claim that
-  the diff is inlined**, since at >2 files the plugin tells the reviewer to derive it itself.
+  `adversarial-review` preamble from the plan stage - **shell, no file-reading tools**, and **no claim
+  that the diff is inlined**, since at >2 files the plugin tells the reviewer to derive it itself.
+  (This bullet said "read-only, Read/Glob/Grep" until 2026-08-12; it is the same stale claim
+  corrected at the plan stage, one section over. Both sites are the same rule, so they move together.)
 - **agy:** the companion `adversarial-review` supports `--base`, so it reviews the SAME range as
   codex - dispatch it by the same direct Bash call as the plan stage (never the `agy:agy-rescue`
   subagent). agy is a SEPARATE CLI: Claude's tool set is irrelevant to it, and it genuinely does
