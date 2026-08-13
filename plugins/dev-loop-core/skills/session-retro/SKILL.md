@@ -50,6 +50,24 @@ for every recommendation).
 To force a date to re-run: delete `session-reports/<date>.md` (or its completion
 marker) and run the runner again.
 
+## Closing step: the report IS the queue
+
+After the report is written - and equally after reading an existing one - **emit one `TodoWrite`
+item per open recommendation, id-tagged `rec:<date>#<n>`, then begin the first one in the same
+turn.** Do not end the turn with an open rec; when one is genuinely blocked, name the user-only
+input it needs and mark that todo blocked.
+
+An unfinished todo list is visible to the harness at turn end in a way a paragraph of CLAUDE.md is
+not, which is the whole point: "ending the turn with the next step already named" was a top-3
+friction pattern on 2026-08-10, 08-11 and 08-12, and on 08-12 it cost 71 minutes in one session
+(`47518583` at `17:08:57` ended with *"Five recs remain open: #2…, #3…"* and nothing running; the
+resuming turn opened with *"Not done… Taking #2 and #7 now"*). The global rule forbidding it is the
+first bullet of `~/.claude/CLAUDE.md` and was in context in every one of those sessions - prose is
+not the lever.
+
+A rec is open unless `session-reports/actions-log.md` carries a `taken`/`rejected`/`deferred` line
+citing its exact id. Check before queueing, and append the outcome line when you finish one.
+
 ## Closing the loop (metrics + actions ledger)
 
 - `session-reports/metrics.jsonl` - one wrapper-written JSON line per day (sessions,
