@@ -81,10 +81,20 @@ risk_of() { # base..integration -> prints HIGH|LOW
     eval "extra=(${LANDER_RISK_EXTRA_FLAGS})"   # validated above -> parses cleanly here
     set +f
   fi
-  git diff --numstat --no-renames "$base..$integ" 2>/dev/null \
-    | PYTHONPATH="${LANDER_RISK_PYTHONPATH:+$LANDER_RISK_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}}" "$PY" "$RISK_CLASSIFY" --gate "${extra[@]+"${extra[@]}"}" >/dev/null 2>&1
+  # stdout carries the classifier's own `reasons`; keep it so a HIGH can say WHY. Emitted as
+  # `VERDICT|reasons` on the SAME channel: risk_of runs inside `$(...)`, i.e. a subshell, so a
+  # global assigned here cannot reach the caller (measured - the first attempt did exactly that
+  # and the denylist-reason selftest caught it). The caller splits on the first `|`.
+  local out
+  out=$(git diff --numstat --no-renames "$base..$integ" 2>/dev/null \
+    | PYTHONPATH="${LANDER_RISK_PYTHONPATH:+$LANDER_RISK_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}}" "$PY" "$RISK_CLASSIFY" --gate "${extra[@]+"${extra[@]}"}" 2>/dev/null)
   rc=$?
-  [ "$rc" -eq 0 ] && echo LOW || echo HIGH
+  # Never let reason-extraction change the verdict: parse failure -> empty string, rc untouched.
+  local reasons
+  reasons=$(printf '%s' "$out" | "$PY" -c 'import json,sys
+try: print("; ".join(json.load(sys.stdin).get("reasons") or []))
+except Exception: print("")' 2>/dev/null | tr -d "'|" | tr '\n' ' ')
+  [ "$rc" -eq 0 ] && echo "LOW|$reasons" || echo "HIGH|$reasons"
 }
 
 overlap_of() { # base candidate -> prints the merge INTERACTION SURFACE, one path per line
@@ -202,7 +212,8 @@ cmd_prepare() {
     die "SUITE RED on the integration commit — discarded, target untouched (log: $suite_log)" 4
   fi
 
-  local risk; risk="$(risk_of "$base" "$integ")"
+  local risk risk_raw RISK_REASONS
+  risk_raw="$(risk_of "$base" "$integ")"; risk="${risk_raw%%|*}"; RISK_REASONS="${risk_raw#*|}"
 
   # Merge interaction surface (see overlap_of). OVERLAP=0 means the branch gate already reviewed
   # every line in this integration commit; OVERLAP=unknown means we could not tell -> treat as gate.
@@ -218,8 +229,13 @@ cmd_prepare() {
   # paths for the same reason (they would close the quote).
   # SUITE is a bare token (SKIPPED_DOCS_ONLY, not "SKIPPED (docs-only)") because the caller parses
   # this block with `eval` - a space or paren in an unquoted value breaks it.
-  printf "CANDIDATE=%s\nTARGET=%s\nBASE=%s\nINTEGRATION=%s\nWORKTREE=%s\nRISK=%s\nSUITE=%s\nOVERLAP=%s\nOVERLAP_FILES='%s'\n" \
-    "$candidate" "$target" "$base" "$integ" "$wt" "$risk" "$suite_status" "$ovn" \
+  # RISK_REASONS: the classifier's own reason list, single-quoted for the same eval reason as
+  # OVERLAP_FILES. A bare RISK=HIGH conflated two different verdicts - "you crossed a denylist"
+  # and "your diff is 8 lines over the size cap" - and the second cost 74 minutes of dead clock
+  # at the land gate on 2026-08-15 for a 408-line src/**+tests/** diff with ZERO denylist hits.
+  # This reports the cause; it does NOT change the policy. risk=HIGH still stops for a human.
+  printf "CANDIDATE=%s\nTARGET=%s\nBASE=%s\nINTEGRATION=%s\nWORKTREE=%s\nRISK=%s\nRISK_REASONS='%s'\nSUITE=%s\nOVERLAP=%s\nOVERLAP_FILES='%s'\n" \
+    "$candidate" "$target" "$base" "$integ" "$wt" "$risk" "${RISK_REASONS:-}" "$suite_status" "$ovn" \
     "$(printf '%s' "$ovf" | tr -d "'" | tr '\n' ' ')"
 }
 
@@ -286,7 +302,8 @@ cmd_commit() {
   if [ "$risk_waived" = "1" ]; then
     log "land-risk-override" "$candidate integ=${integ:0:8} reason=${LANDER_OVERRIDE_REASON:-human}"
   else
-    local risk; risk="$(risk_of "$base" "$integ")"
+    # commit-time re-check: verdict only, reasons are a prepare-time report
+    local risk; risk="$(risk_of "$base" "$integ")"; risk="${risk%%|*}"
     [ "$risk" = LOW ] || { log "land-risk-block" "$candidate risk=$risk"; \
       die "RISK=$risk — auto-land refused; a human reviews and re-runs with LANDER_HUMAN_OVERRIDE=1" 7; }
   fi
@@ -380,8 +397,14 @@ lines = [ln for ln in sys.stdin.read().splitlines() if ln.strip()]
 if any(len(ln.split('\t')) != 3 for ln in lines):   # malformed numstat -> could-not-classify (mirror real)
     print(json.dumps({"risk": "NOT_LOW", "reasons": ["could not classify"]})); sys.exit(2)
 paths = [ln.split('\t', 2)[2] for ln in lines]
-not_low = any('src/secrets/' in p for p in paths) or len(paths) > 15
-print(json.dumps({"risk": "NOT_LOW" if not_low else "LOW"}))
+# `reasons` mirrors the real classifier's shape (a denylist hit and an oversize diff are
+# DIFFERENT reasons) - a fixture that omitted it would let the RISK_REASONS assertions pass
+# vacuously against a field the real classifier populates and this one does not.
+reasons = ["denylisted path: %s" % p for p in paths if 'src/secrets/' in p]
+if len(paths) > 15:
+    reasons.append("too many changed files: %d > 15" % len(paths))
+not_low = bool(reasons)
+print(json.dumps({"risk": "NOT_LOW" if not_low else "LOW", "reasons": reasons}))
 sys.exit((1 if not_low else 0) if '--gate' in sys.argv else 0)
 PYEOF
 export LANDER_RISK_CLASSIFY="$D/risk_classify.py"
@@ -404,6 +427,14 @@ rc=0; out2=$("$SELF" prepare session/sens main) || rc=$?
 check "prepare ok (sensitive)" "[ $rc -eq 0 ]"
 RISK_SENS=$(printf '%s\n' "$out2" | sed -n 's/^RISK=//p'); WT_SENS=$(printf '%s\n' "$out2" | sed -n 's/^WORKTREE=//p')
 check "prepare RISK=HIGH on src/secrets" "[ '$RISK_SENS' = HIGH ]"
+# RISK_REASONS says WHY, so a size-only HIGH is distinguishable from a denylist HIGH without
+# re-running the classifier by hand. Bind it: a denylist hit must name the denylist, not the size.
+REAS_SENS=$(printf '%s\n' "$out2" | sed -n "s/^RISK_REASONS='\(.*\)'$/\1/p")
+check "denylist HIGH names the denylist" "printf '%s' \"$REAS_SENS\" | grep -q denylisted"
+check "denylist HIGH does NOT read as size" "! printf '%s' \"$REAS_SENS\" | grep -q 'changed lines'"
+# ...and a LOW carries no reasons at all (presence control: the field is not always populated)
+REAS_LOW=$(printf '%s\n' "$out" | sed -n "s/^RISK_REASONS='\(.*\)'$/\1/p")
+check "LOW carries empty RISK_REASONS" "[ -z \"$(printf '%s' "$REAS_LOW" | tr -d ' ')\" ]"
 "$SELF" abort "$WT_SENS" cleanup >/dev/null 2>&1 || true
 
 # 2. commit lands it (target checked out is 'session/feat', not main -> CAS update-ref path)
