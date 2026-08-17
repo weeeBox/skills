@@ -135,13 +135,22 @@ citing its exact id. Check before queueing, and append the outcome line when you
   Skipping whole calls is the lever that works.
 - **Long messages in an extract are clipped from the MIDDLE, and the header says how much went**
   (`rec:2026-08-16#3`, fixed 2026-08-17). Every extract carries a
-  `truncated= elided_chars= trajectory_capped=` line. End-truncation silently ate the tail of
+  `truncated= elided_chars= trajectory_capped= trajectory_elided_chars=` line. End-truncation
+  silently ate the tail of
   every message over its cap, and a deliverable's conclusion lives in its tail: on 2026-08-16 six
   of nine analysts reported input cut mid-word and correctly refused to assess what they could
   not see. Regenerated against the fix, all six now end on a complete sentence (`a2854163` 3,816
   chars elided, `78476725` 8,185, `88d5288a` 8,267, `92572f74` 7,418, `a06cd63c` 5,276,
   `5a9c5769` 1,618). `elided_chars` covers only the per-message clipping - `trajectory_capped`
-  is the separate case where whole events past the byte cap are missing.
+  is the separate whole-event case, counted by `trajectory_elided_chars`.
+- **The whole TRAJECTORY is clipped from the middle too, for the same reason** (fixed 2026-08-17,
+  `trajectory_clip`). The extract loop used to `break` at the byte cap, which kept the session's
+  HEAD - but a session's lands, cleanups and destructive commands live in its TAIL. Measured on
+  one 2026-08-13 session (954 in-day events, 282,409 raw bytes against a 100,000 cap): under the
+  old break-at-cap the extract stopped at event 391 and the `git worktree remove --force` that
+  destroyed ~2h of uncommitted work at 20:51:51Z produced **0** matches, so no analyst could ever
+  have reported it; under middle-clipping the same cap yields **2** matches, including the
+  agent's own admission. That extract was guard #5 of the five that failed that day.
 - **The gap timeline is built from `user`/`assistant` rows only** (`TIMELINE_TYPES`). Transcripts
   also carry `system` / `attachment` / `queue-operation` / `file-history-delta` rows that are not
   agent steps; letting them terminate a gap destroys the attribution the label exists for. Measured

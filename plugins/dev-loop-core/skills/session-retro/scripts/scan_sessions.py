@@ -604,6 +604,38 @@ def clip(txt, cap, tally=None):
     return f"{txt[:keep]}\n[... {n} chars elided ...]\n{txt[-keep:]}"
 
 
+TRAJ_MARKER_BUDGET = 200  # the elision marker is itself part of the body
+
+
+def trajectory_clip(lines, cap):
+    """Drop whole events from the MIDDLE of a trajectory until it fits `cap`.
+
+    Same rule as clip(), one level up. Breaking out of the event loop at the cap kept the
+    HEAD of the session, and a session's lands, cleanups and destructive commands live in
+    its TAIL: on 2026-08-13 one session's extract stopped at [08:38:29] against a
+    20:51 event, so the retro never saw the `git worktree remove --force` that destroyed
+    two hours of work. Returns chars dropped (0 if it already fit).
+    """
+    sizes = [len(x) + 1 for x in lines]
+    total = sum(sizes)
+    if total <= cap:
+        return 0
+    budget = max(cap - TRAJ_MARKER_BUDGET, 0)
+    i = front = 0
+    while i < len(lines) and front + sizes[i] <= budget // 2:
+        front += sizes[i]
+        i += 1
+    j = len(lines)
+    back = 0
+    while j > i and back + sizes[j - 1] <= budget - front:
+        j -= 1
+        back += sizes[j]
+    dropped = total - front - back
+    lines[i:j] = [f"[... {j - i} whole events ({dropped} chars) elided from the MIDDLE of "
+                  f"the trajectory - both the start and the TAIL of the session survive ...]"]
+    return dropped
+
+
 def prune_event(d, start, end, out, tally=None):
     ts = parse_ts(d.get("timestamp", ""))
     if ts is None or not (start <= ts < end):
@@ -820,29 +852,31 @@ def cmd_extract(day, top):
             "",
         ]
         trunc_at = out.index(TRUNC_SLOT)
-        tally, capped = [0], False
-        size = sum(len(x) + 1 for x in out)
+        tally = [0]
+        head_size = sum(len(x) + 1 for x in out)
         # sessions with subagents keep 15KB of the cap reserved for their error
         # evidence (their stats are folded into the score, so the report needs it)
         main_cap = MAX_EXTRACT_BYTES - (15_000 if s["subagents"] else 0)
+        body = []
         for d in iter_lines(Path(s["path"])):
-            n0 = len(out)
-            prune_event(d, start, end, out, tally)
-            size += sum(len(x) + 1 for x in out[n0:])
-            if size > main_cap:
-                out.append("[main trajectory truncated at cap]")
-                capped = True
-                break
+            prune_event(d, start, end, body, tally)
+        # clip the WHOLE trajectory from the middle, never by stopping at the cap - the
+        # tail is where the lands and the destructive commands are (see trajectory_clip)
+        capped = trajectory_clip(body, main_cap - head_size)
+        out.extend(body)
+        size = head_size + sum(len(x) + 1 for x in body)
         if s["subagents"]:
             size = sub_errors(s, start, end, out, size, tally)
         # State the bound as a NUMBER. An analyst that can see how much was removed reports
         # a bounded conclusion; one that sees only a broken word has to guess.
         out[trunc_at] = (
             f"truncated={'true' if (tally[0] or capped) else 'false'} "
-            f"elided_chars={tally[0]} trajectory_capped={'true' if capped else 'false'}  "
+            f"elided_chars={tally[0]} trajectory_capped={'true' if capped else 'false'} "
+            f"trajectory_elided_chars={capped}  "
             "(long messages are clipped from the MIDDLE - both ends survive, and the elided "
-            "run is marked inline. trajectory_capped=true means whole events past the "
-            f"{main_cap}-byte cap are missing, which elided_chars does NOT cover)")
+            "run is marked inline. trajectory_capped=true means whole events were dropped from "
+            f"the MIDDLE to fit the {main_cap}-byte cap - the start AND the tail of the session "
+            "are present, the marked gap is not; elided_chars does NOT cover those)")
         # project hash in the name: same session basename in two projects must not collide
         h8 = hashlib.md5(s["project"].encode()).hexdigest()[:8]
         (workdir / f"extract-{s['session']}-{h8}.md").write_text("\n".join(out))
@@ -1424,6 +1458,28 @@ def selftest():
     o, t2 = [], [0]
     prune_event(ev, start, end, o, t2)
     assert o[0].endswith("CONCLUSION") and t2 == [1214], (o, t2)
+    # --- trajectory clipping: the TAIL of a long session must survive the byte cap ---
+    # The 2026-08-13 extract stopped at [08:38:29] and the 20:51 `worktree remove --force`
+    # that destroyed two hours of work was never in the retro's input at all.
+    traj = [f"[12:00:{i:02d}] ASSISTANT: {'y' * 100}" for i in range(50)]
+    traj[0] = "[12:00:00] USER: FIRST"
+    traj[-1] = "[12:00:49] tool_use Bash: git worktree remove --force LAST"
+    fits = list(traj)
+    assert trajectory_clip(fits, 1_000_000) == 0 and fits == traj, fits  # no-op under cap
+    cut = list(traj)
+    dropped = trajectory_clip(cut, 2000)
+    assert dropped > 0, dropped
+    assert cut[0] == traj[0], cut[0]                    # head kept
+    assert cut[-1] == traj[-1], cut[-1]                 # TAIL kept - this is the whole fix
+    assert sum(len(x) + 1 for x in cut) <= 2000, sum(len(x) + 1 for x in cut)
+    marker = [x for x in cut if "elided from the MIDDLE" in x]
+    assert len(marker) == 1 and str(dropped) in marker[0], (marker, dropped)
+    kept = sum(len(x) + 1 for x in traj) - dropped
+    assert kept == sum(len(x) + 1 for x in cut) - len(marker[0]) - 1, (kept, cut)
+    # degenerate: a cap that admits nothing still keeps the marker and drops everything
+    none_fits = list(traj)
+    assert trajectory_clip(none_fits, 0) == sum(len(x) + 1 for x in traj), none_fits
+    assert len(none_fits) == 1 and "50 whole events" in none_fits[0], none_fits
     # extract slot allocation: the 2 reserved slots go to the longest sessions BELOW the
     # friction cut - never to short stubs that merely happen to score 0 (the 2026-08-06
     # defect: two <5min sessions took 2 of 8 slots while 9.1h and 7.4h sessions were cut).
