@@ -71,6 +71,23 @@ re-derive or re-total it.** The 2026-08-05 report printed 6,061 tool calls where
 conclusion on the inflated denominator. Recomputed, that day's error rise was significant
 (z = 3.56). If a figure you want is not in those files, say it is unavailable.
 
+**Tag every scoreboard row and every factual claim about a prior session with an evidence
+class, and put the class in the row.** Use exactly these:
+- `VERIFIED` - read cell-for-cell out of the `scan.json` / `metrics.jsonl` block supplied
+  above in THIS context.
+- `ACCEPTED` - carried from an analyst finding or a previous report without re-derivation.
+- `UNVERIFIED` - neither. Never state an `UNVERIFIED` figure flat; if a figure you want is
+  not in the supplied blocks, write "unavailable" instead of reconstructing it.
+
+Default to `ACCEPTED` and label it. This is deliberately NOT a licence to add tool calls -
+the wrapper supplies the data on purpose and re-reading it would be theatre. The defect it
+closes is that a supplied figure and a recalled one are currently indistinguishable in the
+output: on 2026-08-16 a full scoreboard citing `scan.json` was produced in a session with
+zero `Read` and zero `Bash` calls (`tools: {}`), so no reader could tell which it was. The
+global rule "Claim from READING unreliable; probe-backed claims robust" cannot bind here -
+this pipeline is a one-shot whose evidence arrives in the prompt - so the class label is
+what replaces it.
+
 **Normalize before claiming a trend: divide by `coverage_hours`, not by the calendar day.**
 `coverage_hours` is first-to-last activity, and `tool_calls_per_hour` / `errors_per_hour`
 are precomputed. A day with materially lower coverage than its neighbours is NOT a valid

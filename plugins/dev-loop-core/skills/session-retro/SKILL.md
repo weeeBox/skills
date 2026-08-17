@@ -101,6 +101,17 @@ citing its exact id. Check before queueing, and append the outcome line when you
   split reads 54/35/10 over a wider window. Day-level sums in metrics.jsonl are session-hours
   across overlapping sessions, NOT clock-hours - compare the buckets to each other, not to the day.
   Jobs still in flight when the day window closes are uncounted, so `bg_*` is a lower bound.
+- **Every scoreboard row and every claim about a prior session carries an evidence class**
+  (`rec:2026-08-16#4`, `prompts/reduce.md`, 2026-08-17): `VERIFIED` (read cell-for-cell from
+  the supplied `scan.json` / `metrics.jsonl` block), `ACCEPTED` (carried from an analyst or a
+  prior report), `UNVERIFIED` (neither - never stated flat; write "unavailable" instead). The
+  defect this closes is that a supplied figure and a recalled one were indistinguishable in
+  the output: on 2026-08-16 a full scoreboard citing `scan.json` came out of a session with
+  `tools: {}`. It is deliberately NOT a licence to add tool calls - the wrapper supplies the
+  data on purpose. **Ceiling: this is a prompt rule with no wrapper-side check.** The
+  structural validation in `run_retro.sh` gates on size + `## Next actions` only; a report
+  that drops the classes still stamps `<!-- retro-complete -->`. Add a check there if it is
+  ever observed to drift, rather than assuming the prose holds.
 - **The retro's own headless calls never take an analysis slot** (`is_retro_stub`,
   `rec:2026-08-16#2`, 2026-08-17). A `-`-project session with no tools and <=1 user turn IS a
   map call from that morning's run; analysing it is a retro of a retro and can only report "no
