@@ -155,11 +155,23 @@ Completion is **poll-driven**, the watchdog is only a **wedge** backstop.
   the rescue subagent's completion notification, agy via the companion's printed `Job ID:` (its log path
   comes from the agy job JSON's `logFile` field). Neither return is the verdict. Arm the watchdog on
   codex/agy job logs, not at dispatch time.
+  **Resolve and record BOTH job-log paths in the same turn you dispatch** - the codex one via the
+  job-id glob below, the agy one from its `logFile` field. A job id with no resolved path is what
+  turns every later poll into a directory hunt.
 - **Poll for completion - the mechanic DIFFERS by tool:**
-  - **codex:** poll the job JSON's `result` (`~/.claude/plugins/data/codex-openai-codex/state/<workspace>/jobs/<id>.json`
-    or `/codex:result`). The moment `result.rawOutput` is populated, read it and stop. `result` is an
-    already-parsed dict: `json.load(...)['result'].get('rawOutput','')` - never `json.loads` it, never a
-    cwd-relative path.
+  - **codex:** poll the job JSON's `result`. **Resolve its path by the JOB ID alone - never go
+    looking for the workspace directory.** The `<workspace>` segment is a per-worktree
+    `<slug>-<hash>` that you cannot predict, and hunting it cost an 8-call state-dir search on
+    2026-08-13 and again on 2026-08-14 (`rec:2026-08-13#8`, re-scoped by `rec:2026-08-14#4`).
+    The job id is unique across workspaces, so ONE glob finds it:
+    ```
+    ls ~/.claude/plugins/data/codex-openai-codex/state/*/jobs/<JOB_ID>.json
+    ```
+    Run that in the SAME Bash call that records the job id, and keep the resolved absolute path
+    for every later poll. The moment `result.rawOutput` is populated, read it and stop. `result`
+    is an already-parsed dict: `json.load(...)['result'].get('rawOutput','')` - never
+    `json.loads` it, never a cwd-relative path. (`/codex:result <id>` also works and needs no
+    path at all; the glob is for when you want the file itself, e.g. to arm the watchdog.)
   - **agy:** the agy job JSON (`~/.agy-plugin-cc/<hash>/job-<id>.json`) has NO `result` field - only
     `status`/`pid`/`logFile`. agy's verdict lands in the LOG file (`logFile`), readable via `/agy:result
     <id>` (which just cats the log). Poll that log for the verdict text (agy's `proceed`/`revisit`/`rethink`,
