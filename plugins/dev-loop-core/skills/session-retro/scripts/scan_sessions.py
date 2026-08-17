@@ -450,7 +450,7 @@ def scan_file(path, start, end):
     # QUOTING transcript evidence, so any retraction phrasing in it belongs to the session
     # being analysed, not to this agent. Hard-zero both verbal counters there: 2026-08-09
     # scored self_retractions=1 on such a stub (session 17d87756).
-    if s.get("project") in ("-", None, "") and not s["tools"] and s["user_turns"] <= 1:
+    if is_retro_stub(s):
         s["self_retractions"] = 0
         s["corrections"] = 0
     return s
@@ -689,8 +689,56 @@ def bg_line(s):
             "alongside - serialization is a NAMEABLE cost, not neutral async wait)")
 
 
+REDUCE_ANCHOR = "You are writing the daily Claude Code session-retro report"
+
+
+def _first_user_text(path, limit=400):
+    """First user-turn text of a transcript, for telling the retro's own calls apart."""
+    try:
+        for d in iter_lines(Path(path)):
+            if d.get("type") != "user":
+                continue
+            c = (d.get("message") or {}).get("content")
+            txt = c if isinstance(c, str) else " ".join(
+                text_of(b) for b in blocks(d) if isinstance(b, dict))
+            if txt.strip():
+                return txt.strip()[:limit]
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+def is_retro_stub(s):
+    """This session IS the retro pipeline analysing something else - one user turn, no
+    tools, under the `-` project - and so is not worth an analysis slot of its own.
+
+    Analysing one is a retro OF a retro, which can only ever report "no waste, one turn":
+    on 2026-08-16 nine of eleven sessions were these and the chain ran two levels deep.
+
+    The shape test is on the scan RECORD, not on the session's output text: a heading test
+    (what rec:2026-08-16#2 proposed) would have wrongly skipped `92572f74`, a map call over
+    a real working session whose output opens "# Session retro: eldercare wake_min sentinel
+    bar". The one text test here is against the retro's OWN reduce prompt - a first-party
+    string, not transcript-derived content - to keep the daily report-writer call, whose
+    analysis is the report's QA path and which produced rec:2026-08-16#4.
+
+    NB: inside scan_file() neither `project` nor `path` is set yet, so both of those tests
+    are inert there and the predicate reduces to the turn/tool test. Preserved on purpose -
+    changing it would silently alter which sessions get their verbal counters zeroed, a
+    different question from this one.
+    """
+    if not (s.get("project") in ("-", None, "")
+            and not s["tools"] and s["user_turns"] <= 1):
+        return False
+    return not _first_user_text(s["path"]).startswith(REDUCE_ANCHOR) if s.get("path") else True
+
+
 def pick_sessions(sessions, cap):
     """Choose which `cap` sessions get an evidence extract -> (picked, slow_reserved).
+
+    Retro stubs are dropped before any ranking: see is_retro_stub(). A day of nothing but
+    stubs correctly yields zero extracts, which run_retro.sh already handles as a
+    scan-only no-op report.
 
     Reserves up to 2 slots for the LONGEST sessions the friction ranking would not
     surface on its own, so "slow but quiet" sessions stop being invisible.
@@ -703,6 +751,7 @@ def pick_sessions(sessions, cap):
     were dropped entirely. Key on the actual cut instead, with a duration floor so a quiet
     day cannot reserve trivia.
     """
+    sessions = [s for s in sessions if not is_retro_stub(s)]
     fric = [s for s in sessions if s["friction_score"] > 0]
     above_cut = {(s["project"], s["session"]) for s in fric[:cap]}
     slow = sorted((s for s in sessions if s.get("duration_secs", 0) > 0),
@@ -1378,8 +1427,15 @@ def selftest():
     # extract slot allocation: the 2 reserved slots go to the longest sessions BELOW the
     # friction cut - never to short stubs that merely happen to score 0 (the 2026-08-06
     # defect: two <5min sessions took 2 of 8 slots while 9.1h and 7.4h sessions were cut).
-    def _s(sid, fs, dur):
-        return {"project": "p", "session": sid, "friction_score": fs, "duration_secs": dur}
+    def _s(sid, fs, dur, project="p", tools=..., user_turns=3):
+        # tools/user_turns are real record fields; is_retro_stub indexes them directly on
+        # purpose, so a record missing them raises instead of quietly reading as a stub.
+        # `...` not None as the default: {} is falsy and an `or` default would silently
+        # turn every "no tools" fixture back into a tool-using one.
+        return {"project": project, "session": sid, "friction_score": fs,
+                "duration_secs": dur,
+                "tools": {"Bash": 1} if tools is ... else tools,
+                "user_turns": user_turns}
     day_sessions = ([_s(f"f{i}", 9 - i, 1000) for i in range(8)]     # the friction top-8
                     + [_s("long", 0.5, 30000), _s("stub1", 0, 60), _s("stub2", 0, 57)])
     picked, reserved = pick_sessions(day_sessions, 8)
@@ -1390,6 +1446,33 @@ def selftest():
     # floor: on a quiet day nothing below SLOW_RESERVE_MIN_SECS may be reserved
     _, quiet = pick_sessions([_s("f0", 5, 100), _s("stub1", 0, 60)], 8)
     assert quiet == [], quiet
+    # retro stubs never take an analysis slot (rec:2026-08-16#2). The discriminator is the
+    # record, not the text: a REAL session with no tools and one turn is still analysed, and
+    # a `-` session that DID use tools is still analysed.
+    retro = _s("retro1", 3, 100, project="-", tools={}, user_turns=1)
+    real_quiet = _s("realq", 3, 100, project="scratch", tools={}, user_turns=1)
+    dash_worked = _s("dashw", 3, 100, project="-", tools={"Bash": 2}, user_turns=1)
+    assert is_retro_stub(retro) and not is_retro_stub(real_quiet), (retro, real_quiet)
+    assert not is_retro_stub(dash_worked), dash_worked
+    ids = [s["session"] for s in pick_sessions([retro, real_quiet, dash_worked], 8)[0]]
+    assert ids == ["realq", "dashw"], ids
+    # a day of nothing but stubs yields zero extracts, not a fallback pick
+    assert pick_sessions([retro, _s("retro2", 0, 90, project="-", tools={}, user_turns=1)],
+                         8) == ([], []), "stub-only day must produce no extracts"
+    # ...but the daily REPORT-WRITER call is kept: same record shape, distinguished only by
+    # the retro's own reduce prompt (a first-party string, not transcript-derived content).
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f5:
+        f5.write(json.dumps({"timestamp": "2026-07-08T12:00:00.000Z", "type": "user",
+                             "message": {"content": REDUCE_ANCHOR + ". Appended below..."}})
+                 + "\n")
+        p5 = Path(f5.name)
+    reducer = _s("reducer", 3, 100, project="-", tools={}, user_turns=1)
+    reducer["path"] = str(p5)
+    mapper = dict(retro, path=str(p5.parent / "does-not-exist.jsonl"))
+    assert not is_retro_stub(reducer), "the report-writer call must survive the filter"
+    assert is_retro_stub(mapper), "a map call must not"
+    assert [s["session"] for s in pick_sessions([reducer, mapper], 8)[0]] == ["reducer"]
+    p5.unlink()
 
     # metrics upsert is idempotent per date (atomic replace-by-date)
     global REPORTS

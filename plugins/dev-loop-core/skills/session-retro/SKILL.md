@@ -101,6 +101,27 @@ citing its exact id. Check before queueing, and append the outcome line when you
   split reads 54/35/10 over a wider window. Day-level sums in metrics.jsonl are session-hours
   across overlapping sessions, NOT clock-hours - compare the buckets to each other, not to the day.
   Jobs still in flight when the day window closes are uncounted, so `bg_*` is a lower bound.
+- **The retro's own headless calls never take an analysis slot** (`is_retro_stub`,
+  `rec:2026-08-16#2`, 2026-08-17). A `-`-project session with no tools and <=1 user turn IS a
+  map call from that morning's run; analysing it is a retro of a retro and can only report "no
+  waste, one turn" (2026-08-16: nine of eleven sessions, chain two levels deep). The one
+  exception is the daily REPORT-WRITER call, kept because QA-ing the report is what produced
+  `rec:2026-08-16#4`; it is told apart by matching the retro's own reduce prompt - a
+  first-party string, never transcript-derived text. **Do not re-implement this as a heading
+  test**: `92572f74` is a map call over a *real* working session whose output opens
+  "# Session retro: eldercare wake_min sentinel bar", and a heading test skips it wrongly.
+  Measured on real days - 08-16: 8 extracts -> 3 (the reduce call survives); 08-15: 8 -> 7,
+  three stubs dropped and a real session promoted into a freed slot; 08-13, a full working
+  day: **unchanged at the same 8**, so the filter is inert when there is real work.
+- **A `retro-analyst` subagent type is NOT the lever, and `--system-prompt` is not either.**
+  Measured 2026-08-17: the per-session analysis is a `claude -p --tools ""` headless call, not
+  an `Agent` dispatch, so a `subagent_type` has nothing to attach to. `--system-prompt` does
+  not suppress `~/.claude/CLAUDE.md` (probed directly - both the default and the overridden
+  call answer YES to "do your instructions contain 'Never use the em dash'") and saves only
+  3,113 of 19,296 prompt tokens. Sequential map calls already cache-READ the prefix rather
+  than rewriting it (measured with a no-flag control), so the "each isolated session rewrites
+  its ~60K prefix" line below is bytes, not tokens, and does not reproduce as a per-call cost.
+  Skipping whole calls is the lever that works.
 - **Long messages in an extract are clipped from the MIDDLE, and the header says how much went**
   (`rec:2026-08-16#3`, fixed 2026-08-17). Every extract carries a
   `truncated= elided_chars= trajectory_capped=` line. End-truncation silently ate the tail of
