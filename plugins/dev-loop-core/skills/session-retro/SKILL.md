@@ -75,11 +75,22 @@ citing its exact id. Check before queueing, and append the outcome line when you
   codex/agy review-gate volume and slowest single wait, and the wall-clock partition below);
   the reduce prompt reads the last 14 for trends. Upserted atomically by
   `scan_sessions.py metrics --date D` after a report completes; safe to backfill manually.
-- **Wall-clock partition (`work_secs` / `human_wait_secs` / `blocked_secs`).** Every
-  inter-event gap lands in exactly one bucket, so the three sum to the session's span:
-  `blocked` = the gap follows a tool/gate dispatch, or the agent ended its turn while a
-  background job was still in flight; `human_wait` = the agent ended its turn with NOTHING
-  running, so only a human could restart it; `work` = everything else. The two waits are
+- **Wall-clock partition (`work_secs` / `human_wait_secs` / `blocked_secs` /
+  `model_latency_secs` / `idle_secs`).** Every inter-event gap lands in exactly one bucket, so
+  the five sum to the session's span. **A gap is classified by the PAIR of events that bound
+  it, never by the one that precedes it** (`rec:2026-08-15#7`, fixed 2026-08-17): `blocked` =
+  the gap follows a tool/gate dispatch, or the agent ended its turn while a background job was
+  still in flight; `human_wait` = the gap CLOSES on a user message, so only a human could
+  restart it; `model_latency` = a pending turn answered within `MAX_GENERATION_SECS` (default
+  1800, env `RETRO_MAX_GENERATION_SECS`); `idle` = a pending turn NOT answered within it, i.e.
+  the machine sat on it; `work` = everything else (model thinking between a tool result and the
+  next call). **Classifying by the preceding event alone was wrong in both directions and both
+  halves are measured**: 2026-08-16's `78476725` booked one 38,833.3s pending turn as 100%
+  `work` - 98.4% of that entire day's `work_secs`, on a session with zero tool calls - and now
+  reads `idle=38833.3`; `67080bab` reported `human_wait=14.1s` for assistant→assistant
+  generation and now reads `human_wait=0.0, model_latency=26.6`. Never read `idle` as work.
+  Rows in `metrics.jsonl` written before 2026-08-17 use the old three-bucket rule and are not
+  comparable across that boundary. The two waits are
   indistinguishable without the in-flight set - which is why they used to be one undifferentiated
   "NEUTRAL wall-clock" bucket that no finding could name. Background jobs are correlated exactly:
   a completion `<task-notification>` carries its dispatching tool_use's id (`BG_NOTIFY_RE`), which
@@ -97,6 +108,16 @@ citing its exact id. Check before queueing, and append the outcome line when you
   "after system", and a gate gap with a system row after the dispatch was dropped from
   `gate_wait_secs` entirely. Gates dispatched as background jobs are now charged from dispatch to
   completion notification (the same session read 8 min of gate wait against a ~1.6h hand count).
+- **`subagents` counts the subagents that ran ON THE DAY, not the transcript files in the
+  session's `subagents/` dir** (`rec:2026-08-16#1`, fixed 2026-08-17). It is sliced by the
+  in-day event window exactly like `tools` / `errors` / `total_tokens`. File-counting carried a
+  session's whole history into a day it never touched: 2026-08-16's `129c1cb6` reported
+  `subagents=10` on a record with 2 events, zero turns and no tools. An emit-time assert now
+  rejects any record with `subagents > 0` and no turns and no tools. Hand-check on the same
+  change: `5b861411` read 11 on 2026-08-15 and now reads **3** - the report that proposed this
+  fix predicted "unchanged" and was wrong; reading all 11 transcripts' timestamps shows only 3
+  carry an 08-15 event, the other 8 are dated 08-13/08-14. Swept 2026-08-08..08-17: the assert
+  fires on no real day.
 - **Calibrate a counter against ONE hand-measured session before any report leans on it.**
   This tool's whole job is measurement, so an uncalibrated counter is not a rough number - it
   is an unfalsified claim that a report will state as fact. The precedent that works is
