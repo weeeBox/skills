@@ -24,6 +24,11 @@ REPORTS = Path.home() / ".claude" / "session-reports"
 COMPLETE_MARKER = "<!-- retro-complete -->"
 ACTIVE_GRACE_SECS = 15 * 60  # sessions written to in the last 15 min are deferred
 MAX_EXTRACT_BYTES = 100_000
+# Longest a single model generation is allowed to be before the gap is called `idle` instead.
+# A user->assistant gap of 30s is generation latency; the same gap at 10h47m is the machine
+# sitting on a pending turn (2026-08-16 session 78476725, which alone was 98.4% of that day's
+# reported work_secs).
+MAX_GENERATION_SECS = float(os.environ.get("RETRO_MAX_GENERATION_SECS", 1800))
 DENIAL_RE = re.compile(r"doesn't want to proceed|denied by|permission denied", re.I)
 # Verbal friction the per-turn density score would otherwise miss (no tool error thrown):
 # a user CORRECTING the agent, or repeatedly NUDGING it to continue. Both are precise by
@@ -247,6 +252,7 @@ def scan_file(path, start, end):
         "corrections": 0, "nudges": 0,
         "gate_calls": 0, "gate_wait_secs": 0.0, "max_gate_wait_secs": 0.0,
         "work_secs": 0.0, "human_wait_secs": 0.0, "blocked_secs": 0.0,
+        "model_latency_secs": 0.0, "idle_secs": 0.0,
         "bg_jobs": 0, "bg_job_secs": 0.0, "bg_blocked_secs": 0.0,
     }
     prev_call = None
@@ -258,7 +264,10 @@ def scan_file(path, start, end):
     bg_iv = []              # (dispatch_ts, completion_ts) per correlated background job
     gate_ids = set()        # tool_use ids that dispatched a codex/agy gate
     gate_bg = []            # durations of gate jobs that ran in the BACKGROUND
-    all_gaps = []           # (secs, at_hms, after_label, gap_start_ts)
+    all_gaps = []           # [secs, at_hms, after_label, gap_start_ts, closing_role]
+                            # closing_role is patched in at the END of the iteration that
+                            # appended the gap - a gap is classified by the pair of events
+                            # that BOUND it, never by the one that precedes it alone.
     cur_err = None          # first line of the current consecutive-error run
     cur_err_count = 0
     runs = []               # completed runs of >=2 identical consecutive errors
@@ -291,11 +300,14 @@ def scan_file(path, start, end):
         # inter-event gap in TRANSCRIPT order (not sorted), attributed to what the
         # previous event was. NEUTRAL wall-clock: may be human think-time, model
         # latency, async wait, or tool latency - not waste on its own.
+        gap_idx = None
         if prev_ts is not None:
             # max(0): rows are not strictly monotonic (a file-history-delta can back-date)
-            all_gaps.append((max(0.0, (ts - prev_ts).total_seconds()),
-                             hhmmss(prev_ts), prev_label, prev_ts))
+            all_gaps.append([max(0.0, (ts - prev_ts).total_seconds()),
+                             hhmmss(prev_ts), prev_label, prev_ts, None])
+            gap_idx = len(all_gaps) - 1
         label = t
+        has_tool_result = False
         if t == "assistant":
             s["assistant_turns"] += 1
             u = (d.get("message") or {}).get("usage") or {}
@@ -341,7 +353,6 @@ def scan_file(path, start, end):
                     bg_iv.append((t0, ts))
                     if nm_.group(1) in gate_ids:
                         gate_bg.append((ts - t0).total_seconds())
-            has_tool_result = False
             for b in blocks(d):
                 if isinstance(b, dict) and b.get("type") == "tool_result":
                     has_tool_result = True
@@ -380,17 +391,21 @@ def scan_file(path, start, end):
                         s["corrections"] += 1
                     if NUDGE_RE.match(utext.strip()):
                         s["nudges"] += 1
+        if gap_idx is not None:
+            all_gaps[gap_idx][4] = ("assistant" if t == "assistant"
+                                    else "tool_result" if has_tool_result else "user")
         prev_ts, prev_label = ts, label
     flush_run()
     s["gaps"] = [{"secs": round(g, 1), "at": at, "after": lab}
-                 for g, at, lab, _t0 in sorted(all_gaps, key=lambda x: -x[0])[:5]]
+                 for g, at, lab, _t0, _cl in sorted(all_gaps, key=lambda x: -x[0])[:5]]
     # wall-clock spent waiting on a codex/agy gate = the gaps that FOLLOW a gate call. Reuses the
     # gap machinery (a gate that blocks 25 min shows as a big gap labeled "gate:*") instead of a
     # stateful dispatch->verdict correlator.
     # ...plus the gates dispatched as BACKGROUND jobs, whose following gap is ~0s (the tool_result
     # returns at once) and whose real wait only ends at the completion notification. Measured on
     # 3f02f940, the gap-only rule saw 8 min of gate wait against a hand-count of ~1.6h.
-    gate_gaps = [g for g, _at, lab, _t0 in all_gaps if lab and lab.startswith("gate:")] + gate_bg
+    gate_gaps = [g for g, _at, lab, _t0, _cl in all_gaps
+                 if lab and lab.startswith("gate:")] + gate_bg
     s["gate_wait_secs"] = round(sum(gate_gaps), 1)
     s["max_gate_wait_secs"] = round(max(gate_gaps), 1) if gate_gaps else 0.0
     # ponytail: a job still in flight when the window closed is simply uncounted - a dispatch id
@@ -400,21 +415,33 @@ def scan_file(path, start, end):
     s["bg_job_secs"] = round(sum((e - b).total_seconds() for b, e in bg_iv), 1)
     s["bg_blocked_secs"] = round(merge_intervals(bg_iv), 1)
     # WALL-CLOCK PARTITION of the session's span, one bucket per inter-event gap:
-    #   blocked     - the gap follows a tool_use/gate dispatch (synchronous tool latency), OR
-    #                 the agent ended its turn while a background job was still in flight
-    #   human_wait  - the agent ended its turn with NOTHING running: only a human unblocks it
-    #   work        - everything else (model thinking between a result and the next call)
-    # The two are indistinguishable without the in-flight set, which is why they were previously
-    # lumped into one NEUTRAL bucket and neither could be named.
-    for g, _at, lab, t0 in all_gaps:
+    #   blocked        - the gap follows a tool_use/gate dispatch (synchronous tool latency), OR
+    #                    the agent ended its turn while a background job was still in flight
+    #   human_wait     - the gap CLOSES on a user message: only a human could restart it
+    #   model_latency  - a pending turn answered inside MAX_GENERATION_SECS
+    #   idle           - a pending turn NOT answered inside MAX_GENERATION_SECS: the machine
+    #                    sat on it. Never `work`.
+    #   work           - everything else: model thinking between a tool result and the next call
+    # Every gap is classified by the PAIR of events bounding it. Classifying by the preceding
+    # event alone was wrong in both directions: a user-opened gap was `work` however long it ran
+    # (2026-08-16 `78476725`: one 38,833.3s span = 98.4% of the day's work_secs, on a session
+    # with zero tool calls), and an assistant->assistant generation gap was `human_wait`
+    # (`67080bab`, where the real human_wait is 0s).
+    for g, _at, lab, t0, close in all_gaps:
         if lab and (lab.startswith("tool_use:") or lab.startswith("gate:")):
             s["blocked_secs"] += g
+        elif lab == "assistant" and any(b <= t0 < e for b, e in bg_iv):
+            s["blocked_secs"] += g
+        elif close == "user":
+            s["human_wait_secs"] += g
+        elif lab == "user":
+            s["model_latency_secs" if g < MAX_GENERATION_SECS else "idle_secs"] += g
         elif lab == "assistant":
-            in_flight = any(b <= t0 < e for b, e in bg_iv)
-            s["blocked_secs" if in_flight else "human_wait_secs"] += g
+            s["model_latency_secs"] += g
         else:
             s["work_secs"] += g
-    for k in ("work_secs", "human_wait_secs", "blocked_secs"):
+    for k in ("work_secs", "human_wait_secs", "blocked_secs",
+              "model_latency_secs", "idle_secs"):
         s[k] = round(s[k], 1)
     s["repeated_error_runs"] = runs
     # A retro STUB - the pipeline analysing its own output - is one user turn, one or two
@@ -498,8 +525,17 @@ def scan_day(day):
                 active.append(f"{proj.name}/{f.stem}")
             subdir = f.parent / f.stem / "subagents"
             subs = list(subdir.glob("*.jsonl")) if subdir.is_dir() else []
+            # `subagents` counts the subagents that ran ON THIS DAY, sliced identically to
+            # tools/errors/total_tokens. Counting FILES instead carried the whole transcript's
+            # history into a day it did not touch: 2026-08-16's `129c1cb6` reported
+            # subagents=10 on a record with 2 events, zero turns and no tools - those 10 ran
+            # on 08-15.
+            in_day_subs = 0
             for sub in subs:
-                merge_sub(s, scan_file(sub, start, end))
+                sub_s = scan_file(sub, start, end)
+                if sub_s["events"]:
+                    in_day_subs += 1
+                merge_sub(s, sub_s)
             dur = 0.0
             if s["first_ts"] and s["last_ts"]:
                 dur = (parse_ts(s["last_ts"]) - parse_ts(s["first_ts"])).total_seconds()
@@ -510,7 +546,12 @@ def scan_day(day):
             s["repeated_error_runs"] = sorted(
                 s["repeated_error_runs"], key=lambda r: -r["count"])[:3]
             s.update(project=proj.name, session=f.stem, path=str(f),
-                     subagents=len(subs), friction_score=friction(s))
+                     subagents=in_day_subs, friction_score=friction(s))
+            # A record with delegated work but no turns and no tools is a slicing bug, not a
+            # session. Fail loudly rather than emitting it - it inflates the day's session
+            # count and corrupts any subagent-derived metric.
+            assert not (s["subagents"] and not s["user_turns"]
+                        and not s["assistant_turns"] and not s["tools"]), s
             sessions.append(s)
     sessions.sort(key=lambda x: x["friction_score"], reverse=True)
     return {"date": day.isoformat(), "generated": now.isoformat(),
@@ -603,14 +644,18 @@ def _pct(part, whole):
 
 
 def wallclock_line(s):
-    """Where the session's span actually went. The three buckets partition duration_secs."""
+    """Where the session's span actually went. The five buckets partition duration_secs."""
     dur = s.get("duration_secs", 0) or 0
     w, h, b = (s.get("work_secs", 0), s.get("human_wait_secs", 0), s.get("blocked_secs", 0))
+    m, i = s.get("model_latency_secs", 0), s.get("idle_secs", 0)
     return (f"wall_clock: work={w}s ({_pct(w, dur)}) human_wait={h}s ({_pct(h, dur)}) "
-            f"blocked={b}s ({_pct(b, dur)}) of duration_secs={dur}  "
-            "(human_wait = the agent ended its turn with NOTHING running, so only a human "
-            "could unblock it - a NAMEABLE cost when the next step was already known; "
-            "blocked = waiting on a tool or a background job)")
+            f"blocked={b}s ({_pct(b, dur)}) model_latency={m}s ({_pct(m, dur)}) "
+            f"idle={i}s ({_pct(i, dur)}) of duration_secs={dur}  "
+            "(human_wait = the gap closed on a user message, so only a human could restart it "
+            "- a NAMEABLE cost when the next step was already known; blocked = waiting on a "
+            f"tool or a background job; model_latency = a pending turn answered within "
+            f"{MAX_GENERATION_SECS:.0f}s; idle = a pending turn NOT answered within it, i.e. the "
+            "machine sat on it - never count idle as work)")
 
 
 def bg_line(s):
@@ -752,6 +797,8 @@ def cmd_metrics(day):
         "work_secs": round(sum(s.get("work_secs", 0) for s in ss), 1),
         "human_wait_secs": round(sum(s.get("human_wait_secs", 0) for s in ss), 1),
         "blocked_secs": round(sum(s.get("blocked_secs", 0) for s in ss), 1),
+        "model_latency_secs": round(sum(s.get("model_latency_secs", 0) for s in ss), 1),
+        "idle_secs": round(sum(s.get("idle_secs", 0) for s in ss), 1),
         "bg_jobs": sum(s.get("bg_jobs", 0) for s in ss),
         "bg_job_secs": round(sum(s.get("bg_job_secs", 0) for s in ss), 1),
         "bg_blocked_secs": round(sum(s.get("bg_blocked_secs", 0) for s in ss), 1),
@@ -1240,16 +1287,46 @@ def selftest():
     w = scan_file(p3, start, end)
     assert (w["bg_jobs"], w["bg_job_secs"], w["bg_blocked_secs"]) == (1, 202.0, 202.0), w
     # blocked = 1s tool latency + 200s turn-ended-while-job-in-flight; human_wait = the 100s
-    # after the job finished; work = the three model-thinking gaps
-    assert (w["blocked_secs"], w["human_wait_secs"], w["work_secs"]) == (201.0, 100.0, 3.0), w
+    # after the job finished; work = the one tool_result->assistant thinking gap; the two
+    # user->assistant gaps (t=0->1, t=203->204) are generation, not work.
+    assert (w["blocked_secs"], w["human_wait_secs"], w["work_secs"]) == (201.0, 100.0, 1.0), w
+    assert (w["model_latency_secs"], w["idle_secs"]) == (2.0, 0.0), w
     span = (parse_ts(w["last_ts"]) - parse_ts(w["first_ts"])).total_seconds()
-    assert w["blocked_secs"] + w["human_wait_secs"] + w["work_secs"] == span == 304.0, (w, span)
+    assert sum(w[k] for k in ("blocked_secs", "human_wait_secs", "work_secs",
+                              "model_latency_secs", "idle_secs")) == span == 304.0, (w, span)
     # the `system` row at t=100 must not steal the gap's attribution from the assistant turn
     assert (w["gaps"][0]["secs"], w["gaps"][0]["after"]) == (200.0, "assistant"), w["gaps"]
     # a gate dispatched into the background: its wait ends at the notification, not at the
     # tool_result that returns immediately (1s tool gap + 202s job)
     assert (w["gate_calls"], w["gate_wait_secs"]) == (1, 203.0), w
     p3.unlink()
+    # --- pair-invariant: a gap is classified by the events that BOUND it (rec:2026-08-15#7) ---
+    # Both halves of the 2026-08-16 defect, on one fixture with NO background job in flight:
+    #   t=0 user -> t=2h assistant : a pending turn nobody answered for 2h. Was `work` (100% of
+    #                               that day's work_secs came from one such span). Must be `idle`.
+    #   t=2h assistant -> +10s assistant : generation between two assistant rows. Was
+    #                               `human_wait` (nothing was running), and no human was waited on.
+    def evtd(sec, **kw):
+        h, r = divmod(sec, 3600)
+        mi, se = divmod(r, 60)
+        return dict(timestamp=f"2026-07-08T{12 + h:02d}:{mi:02d}:{se:02d}.000Z", **kw)
+    plines = [
+        evtd(0, type="user", message={"content": [{"type": "text", "text": "go"}]}),
+        evtd(7200, type="assistant", message={"content": [{"type": "text", "text": "late"}]}),
+        evtd(7210, type="assistant", message={"content": [{"type": "text", "text": "more"}]}),
+        evtd(7215, type="user", message={"content": [{"type": "text", "text": "next"}]}),
+    ]
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f4:
+        for l in plines:
+            f4.write(json.dumps(l) + "\n")
+        p4 = Path(f4.name)
+    pr = scan_file(p4, start, end)
+    assert (pr["idle_secs"], pr["work_secs"]) == (7200.0, 0.0), pr
+    assert (pr["model_latency_secs"], pr["human_wait_secs"]) == (10.0, 5.0), pr
+    assert pr["blocked_secs"] == 0.0, pr
+    assert sum(pr[k] for k in ("blocked_secs", "human_wait_secs", "work_secs",
+                               "model_latency_secs", "idle_secs")) == 7215.0, pr
+    p4.unlink()
     # extract slot allocation: the 2 reserved slots go to the longest sessions BELOW the
     # friction cut - never to short stubs that merely happen to score 0 (the 2026-08-06
     # defect: two <5min sessions took 2 of 8 slots while 9.1h and 7.4h sessions were cut).
