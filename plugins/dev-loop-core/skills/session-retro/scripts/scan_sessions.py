@@ -29,6 +29,7 @@ MAX_EXTRACT_BYTES = 100_000
 # sitting on a pending turn (2026-08-16 session 78476725, which alone was 98.4% of that day's
 # reported work_secs).
 MAX_GENERATION_SECS = float(os.environ.get("RETRO_MAX_GENERATION_SECS", 1800))
+TRUNC_SLOT = "\x00truncation-header-slot"  # placeholder, filled once the body is built
 DENIAL_RE = re.compile(r"doesn't want to proceed|denied by|permission denied", re.I)
 # Verbal friction the per-turn density score would otherwise miss (no tool error thrown):
 # a user CORRECTING the agent, or repeatedly NUDGING it to continue. Both are precise by
@@ -584,7 +585,26 @@ def cmd_scan(day):
     return result
 
 
-def prune_event(d, start, end, out):
+def clip(txt, cap, tally=None):
+    """Cap a message from the MIDDLE, keeping both ends, with an explicit marker.
+
+    End-truncation loses the tail of every long message, and a deliverable's conclusion
+    lives in its tail: on 2026-08-16 six of nine analysts reported their input cut
+    mid-word ("But the same tu", "so no verifi") and correctly refused to assess what
+    they could not see. `tally` is a one-element list accumulating elided chars so the
+    extract header can state the bound as a number instead of an analyst inferring it
+    from a broken word.
+    """
+    if len(txt) <= cap:
+        return txt
+    keep = cap // 2
+    n = len(txt) - 2 * keep
+    if tally is not None:
+        tally[0] += n
+    return f"{txt[:keep]}\n[... {n} chars elided ...]\n{txt[-keep:]}"
+
+
+def prune_event(d, start, end, out, tally=None):
     ts = parse_ts(d.get("timestamp", ""))
     if ts is None or not (start <= ts < end):
         return
@@ -596,21 +616,21 @@ def prune_event(d, start, end, out):
                 txt = text_of(b).strip()
                 cap = 500 if b.get("is_error") else 300
                 tag = "TOOL_ERROR" if b.get("is_error") else "tool_result"
-                out.append(f"[{stamp}] {tag}: {txt[:cap]}")
+                out.append(f"[{stamp}] {tag}: {clip(txt, cap, tally)}")
             else:
                 txt = (text_of(b) if isinstance(b, dict) else str(b)).strip()
                 if txt:
-                    out.append(f"[{stamp}] USER: {txt[:1500]}")
+                    out.append(f"[{stamp}] USER: {clip(txt, 1500, tally)}")
     elif t == "assistant":
         for b in blocks(d):
             if b.get("type") == "tool_use":
-                args = json.dumps(b.get("input", {}))[:300]
+                args = clip(json.dumps(b.get("input", {})), 300, tally)
                 out.append(f"[{stamp}] tool_use {b.get('name', '?')}: {args}")
             elif b.get("type") == "text" and b.get("text", "").strip():
-                out.append(f"[{stamp}] ASSISTANT: {b['text'].strip()[:800]}")
+                out.append(f"[{stamp}] ASSISTANT: {clip(b['text'].strip(), 800, tally)}")
 
 
-def sub_errors(s, start, end, out, size):
+def sub_errors(s, start, end, out, size, tally=None):
     """Append subagent TOOL_ERROR evidence (their stats are folded into the
     parent's score, so the report needs their evidence too)."""
     subdir = Path(s["path"]).parent / s["session"] / "subagents"
@@ -630,7 +650,7 @@ def sub_errors(s, start, end, out, size):
             for b in blocks(d):
                 if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error"):
                     line = (f"[{sub.stem} {hhmmss(ts)}] "
-                            f"TOOL_ERROR: {text_of(b).strip()[:300]}")
+                            f"TOOL_ERROR: {clip(text_of(b).strip(), 300, tally)}")
                     out.append(line)
                     size += len(line) + 1
     return size
@@ -747,21 +767,33 @@ def cmd_extract(day, top):
             f"gate_calls={s.get('gate_calls', 0)} gate_wait_secs={s.get('gate_wait_secs', 0)} "
             f"max_gate_wait_secs={s.get('max_gate_wait_secs', 0)}  (codex/agy review-gate "
             "latency: many calls + high wait = slow/repeated gate rounds - a NAMEABLE cost)",
+            TRUNC_SLOT,   # replaced once the body is built and the elided total is known
             "",
         ]
+        trunc_at = out.index(TRUNC_SLOT)
+        tally, capped = [0], False
         size = sum(len(x) + 1 for x in out)
         # sessions with subagents keep 15KB of the cap reserved for their error
         # evidence (their stats are folded into the score, so the report needs it)
         main_cap = MAX_EXTRACT_BYTES - (15_000 if s["subagents"] else 0)
         for d in iter_lines(Path(s["path"])):
             n0 = len(out)
-            prune_event(d, start, end, out)
+            prune_event(d, start, end, out, tally)
             size += sum(len(x) + 1 for x in out[n0:])
             if size > main_cap:
                 out.append("[main trajectory truncated at cap]")
+                capped = True
                 break
         if s["subagents"]:
-            size = sub_errors(s, start, end, out, size)
+            size = sub_errors(s, start, end, out, size, tally)
+        # State the bound as a NUMBER. An analyst that can see how much was removed reports
+        # a bounded conclusion; one that sees only a broken word has to guess.
+        out[trunc_at] = (
+            f"truncated={'true' if (tally[0] or capped) else 'false'} "
+            f"elided_chars={tally[0]} trajectory_capped={'true' if capped else 'false'}  "
+            "(long messages are clipped from the MIDDLE - both ends survive, and the elided "
+            "run is marked inline. trajectory_capped=true means whole events past the "
+            f"{main_cap}-byte cap are missing, which elided_chars does NOT cover)")
         # project hash in the name: same session basename in two projects must not collide
         h8 = hashlib.md5(s["project"].encode()).hexdigest()[:8]
         (workdir / f"extract-{s['session']}-{h8}.md").write_text("\n".join(out))
@@ -1327,6 +1359,22 @@ def selftest():
     assert sum(pr[k] for k in ("blocked_secs", "human_wait_secs", "work_secs",
                                "model_latency_secs", "idle_secs")) == 7215.0, pr
     p4.unlink()
+    # --- middle-clipping: the END of a long message must survive (rec:2026-08-16#3) ---
+    # End-truncation cut six of nine 2026-08-16 extracts mid-word and every analyst
+    # correctly refused to assess the tail it could not see.
+    long_msg = "HEAD" + ("x" * 2000) + "CONCLUSION"
+    tally = [0]
+    c = clip(long_msg, 800, tally)
+    assert c.startswith("HEAD") and c.endswith("CONCLUSION"), c
+    assert "[... 1214 chars elided ...]" in c, c
+    assert tally == [1214], tally
+    assert len(long_msg) - tally[0] == 800, (len(long_msg), tally)   # kept exactly the cap
+    assert clip("short", 800, tally) == "short" and tally == [1214], tally  # no-op, no tally
+    ev = {"timestamp": "2026-07-08T12:00:00.000Z", "type": "assistant",
+          "message": {"content": [{"type": "text", "text": long_msg}]}}
+    o, t2 = [], [0]
+    prune_event(ev, start, end, o, t2)
+    assert o[0].endswith("CONCLUSION") and t2 == [1214], (o, t2)
     # extract slot allocation: the 2 reserved slots go to the longest sessions BELOW the
     # friction cut - never to short stubs that merely happen to score 0 (the 2026-08-06
     # defect: two <5min sessions took 2 of 8 slots while 9.1h and 7.4h sessions were cut).

@@ -101,6 +101,15 @@ citing its exact id. Check before queueing, and append the outcome line when you
   split reads 54/35/10 over a wider window. Day-level sums in metrics.jsonl are session-hours
   across overlapping sessions, NOT clock-hours - compare the buckets to each other, not to the day.
   Jobs still in flight when the day window closes are uncounted, so `bg_*` is a lower bound.
+- **Long messages in an extract are clipped from the MIDDLE, and the header says how much went**
+  (`rec:2026-08-16#3`, fixed 2026-08-17). Every extract carries a
+  `truncated= elided_chars= trajectory_capped=` line. End-truncation silently ate the tail of
+  every message over its cap, and a deliverable's conclusion lives in its tail: on 2026-08-16 six
+  of nine analysts reported input cut mid-word and correctly refused to assess what they could
+  not see. Regenerated against the fix, all six now end on a complete sentence (`a2854163` 3,816
+  chars elided, `78476725` 8,185, `88d5288a` 8,267, `92572f74` 7,418, `a06cd63c` 5,276,
+  `5a9c5769` 1,618). `elided_chars` covers only the per-message clipping - `trajectory_capped`
+  is the separate case where whole events past the byte cap are missing.
 - **The gap timeline is built from `user`/`assistant` rows only** (`TIMELINE_TYPES`). Transcripts
   also carry `system` / `attachment` / `queue-operation` / `file-history-delta` rows that are not
   agent steps; letting them terminate a gap destroys the attribution the label exists for. Measured
