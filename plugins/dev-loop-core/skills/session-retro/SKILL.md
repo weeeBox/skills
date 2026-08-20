@@ -50,6 +50,46 @@ for every recommendation).
 To force a date to re-run: delete `session-reports/<date>.md` (or its completion
 marker) and run the runner again.
 
+## Same-day staleness watchdog
+
+The daily report only surfaces the FOLLOWING morning - a session that dispatches a
+background job whose completion notification never arrives (defef5a9-3b39-4cb4-ba79-
+bda6611372cc, 2026-08-19/20: lost 19,478s, 65% of an 8.5h unattended overnight run, to
+exactly this) just sits there until a human happens to check in. `scripts/watchdog.sh`
+(-> `staleness_watchdog.py`) is a separate, independent, frequent (~20 min via launchd
+`StartInterval`, not the daily `StartCalendarInterval`) sweep that catches this same-day:
+
+- **Cheap first filter:** `stat`s `~/.claude/projects/*/*.jsonl` mtimes only - no content
+  read - for files touched between `RETRO_WATCHDOG_STALE_SECS` (default 2700s/45min) and
+  `RETRO_WATCHDOG_RECENT_SECS` (default 18h) ago. Most files never pass this filter.
+- **Tail-parse only the stale candidates** (reuses `scan_sessions.py`'s
+  `iter_lines`/`blocks`/`BG_NOTIFY_RE` - one parser, not two) to check whether the file's
+  LAST row leaves the session "owed" a turn: either the last row is an assistant turn that
+  dispatched a background job (an `Agent`, or a `run_in_background: true` Bash) whose id
+  never got a `<task-notification>` anywhere in the file, or the last row IS a
+  notification with no assistant reply after it. A plain trailing human message, or a
+  dispatch that already got its notification and reply, is ordinary idle time - not
+  flagged.
+- **Dedup via `work/watchdog-state.json`:** one notification per stuck INSTANCE (keyed on
+  the file's exact mtime), not per poll - a session still stuck 20 minutes later with no
+  new writes is silently skipped.
+
+**Known ceiling (ponytail, documented in `is_owed_turn`'s docstring):** from a static
+transcript file alone, a genuinely-wedged LIVE session and an old session the user simply
+stopped returning to look IDENTICAL - both end on an unresolved dispatch forever. Verified
+live on 2026-08-20: 2 of 3 first-run flags were sessions from the evening before, already
+covered by that day's retro report - false positives by this definition, not live wedges.
+Dedup means each such session notifies ONCE ever, not repeatedly, which is the accepted
+mitigation for v1. Upgrade path if the false-positive rate ever becomes a real problem:
+correlate against live `claude`/`codex-companion` process state instead of file content
+alone - not built here, no evidence yet that it's needed over the dedup mitigation.
+
+Manual invocation: `python3 ${CLAUDE_PLUGIN_ROOT}/skills/session-retro/scripts/staleness_watchdog.py scan`
+(prints newly-flagged sessions, updates the dedup state) or `bash
+${CLAUDE_PLUGIN_ROOT}/skills/session-retro/scripts/watchdog.sh` (same, plus the macOS
+notification). Wired to run automatically via
+`~/Library/LaunchAgents/com.alementuev.claude-session-retro-watchdog.plist`.
+
 ## Closing step: the report IS the queue
 
 After the report is written - and equally after reading an existing one - **emit one `TodoWrite`
