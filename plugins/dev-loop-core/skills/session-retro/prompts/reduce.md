@@ -191,10 +191,20 @@ No evidence or no artifact -> drop it. Generic advice ("write better prompts",
 One line per suppressed id: the id + the matched ledger line. Omit the section if none.
 
 ## Next actions
-The top 3 recommendations rewritten as ready-to-paste prompts for a follow-up session.
-Each prompt MUST end with: "When done, append the outcome line to
-~/.claude/session-reports/actions-log.md using the exact schema
-`- [YYYY-MM-DD] taken|rejected|deferred rec:<id> - <summary> (<reason>)` citing rec:<id>."
+EVERY recommendation in ## Recommendations gets a Next-action prompt, in the same rank
+order - no cap, no silent drop. (The old "top 3" cap dropped rec:2026-08-14#7 - actions-
+log backfill - from dispatch on 4 of 5 consecutive days despite it being re-recommended
+every single one; a report that names a fix but never queues it as a prompt is why it
+stayed unactioned. session-retro dimension-4 audit, 2026-08-20.) If ## Recommendations
+is empty, write exactly one line: "No open recommendations today."
+
+Each prompt is a ready-to-paste prompt for a follow-up session and MUST:
+- Be genuinely self-contained: a fresh agent with ZERO other context (it has not read this
+  report) must be able to execute it. Name the exact file(s) to edit by path - never a
+  vague "the classifier" / "the scanner" / "the existing bullet" with no path attached.
+- End with: "When done, append the outcome line to
+  ~/.claude/session-reports/actions-log.md using the exact schema
+  `- [YYYY-MM-DD] taken|rejected|deferred rec:<id> - <summary> (<reason>)` citing rec:<id>."
 
 Do not add any completion marker; the runner stamps that itself.
 
