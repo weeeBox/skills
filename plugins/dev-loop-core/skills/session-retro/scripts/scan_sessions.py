@@ -7,6 +7,8 @@ Commands:
   extract --date D --top N    pruned evidence extracts for top-N friction sessions
                               (writes work/<date>/<session-id>.md + previous-report.md)
   missing-dates               dates since last complete report, up to yesterday
+  trends [--days N]           rate-normalized quality trend over the last N days of
+                              metrics.jsonl (default 14) + an effectiveness-digest snapshot
   selftest                    run built-in assertions on a synthetic transcript
 
 Stdlib only. Transcript content is untrusted data; this script only counts and
@@ -1190,6 +1192,104 @@ def cmd_effectiveness(day):
                   f"dates:{in_window[0]}..{in_window[-1]}{label(rid)}")
 
 
+MIN_TREND_COVERAGE_HOURS = 1.0  # below this, a day's rate is too little signal to trust
+MIN_TREND_SPLIT_DAYS = 4        # fewer usable days than this: report the table, skip the split
+
+
+def _load_metrics():
+    path = REPORTS / "metrics.jsonl"
+    out = []
+    if path.exists():
+        for l in path.read_text().splitlines():
+            try:
+                r = json.loads(l)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(r.get("date"), str):
+                out.append(r)
+    return sorted(out, key=lambda r: r["date"])
+
+
+def cmd_trends(days=14):
+    """Rate-normalized, coverage-aware quality trend over the last `days` metrics.jsonl
+    rows, plus an effectiveness-digest snapshot as of the most recent stamped report.
+    Read-only - never writes recs.jsonl/actions-log.md/metrics.jsonl.
+
+    `errors_per_hour` / `tool_calls_per_hour` are the primary axes (already rate-
+    normalized, so a busy day and a quiet day are comparable - a raw count conflates
+    volume with quality). A day with < MIN_TREND_COVERAGE_HOURS of coverage (no sessions,
+    or an all-retro-stub day) is marked `low-coverage` in the table and EXCLUDED from the
+    trend split, never silently averaged in as if it were a great quiet day.
+    `top_friction`/friction_score is printed too but is the noisier axis - it tracks how
+    messy what was ATTEMPTED was, not whether the underlying process is improving; the
+    effectiveness digest (does a landed fix's friction actually stop recurring) is the
+    stronger signal for that and is why it's snapshotted here alongside the raw trend."""
+    rows = _load_metrics()[-days:]
+    if not rows:
+        print("no metrics.jsonl history yet")
+        return
+    print(f"{'date':<12} {'sess':>4} {'cov_h':>6} {'tools/hr':>9} {'err/hr':>7} "
+          f"{'friction':>9} {'gates':>6} {'max_gate_wait':>13} {'human_wait%':>12}")
+    usable = []
+    for r in rows:
+        ch = r.get("coverage_hours")
+        low = ch is None or ch < MIN_TREND_COVERAGE_HOURS
+        hw, w, b = r.get("human_wait_secs") or 0, r.get("work_secs") or 0, r.get("blocked_secs") or 0
+        ml, idl = r.get("model_latency_secs") or 0, r.get("idle_secs") or 0
+        total = hw + w + b + ml + idl
+        hw_pct = round(100 * hw / total, 1) if total else None
+
+        def cell(v, width):
+            return f"{v if v is not None else '-':>{width}}"
+
+        print(f"{r['date']:<12} {r.get('sessions', 0):>4} {cell(ch, 6)} "
+              f"{cell(r.get('tool_calls_per_hour'), 9)} {cell(r.get('errors_per_hour'), 7)} "
+              f"{r.get('top_friction', 0):>9} {r.get('gate_calls', 0):>6} "
+              f"{r.get('max_gate_wait_secs', 0):>13} {cell(hw_pct, 12)}"
+              f"{' low-coverage' if low else ''}")
+        if not low:
+            usable.append(r)
+
+    def avg(rs, key):
+        vals = [x[key] for x in rs if x.get(key) is not None]
+        return round(sum(vals) / len(vals), 2) if vals else None
+
+    if len(usable) >= MIN_TREND_SPLIT_DAYS:
+        half = len(usable) // 2
+        first, second = usable[:half], usable[half:]
+        for key, label_ in (("errors_per_hour", "errors/hr (primary)"),
+                            ("tool_calls_per_hour", "tool_calls/hr"),
+                            ("top_friction", "friction_score (noisier axis)")):
+            a, b_ = avg(first, key), avg(second, key)
+            if a is not None and b_ is not None:
+                direction = "down" if b_ < a else ("up" if b_ > a else "flat")
+                print(f"trend {label_}: first-half avg {a} -> second-half avg {b_} ({direction})")
+    else:
+        print(f"only {len(usable)} usable (non-low-coverage) day(s) in range "
+              f"({MIN_TREND_SPLIT_DAYS} needed) - too few for a trend split")
+
+    reports = sorted(p.stem for p in REPORTS.glob("????-??-??.md")
+                     if COMPLETE_MARKER in p.read_text(encoding="utf-8", errors="replace"))
+    if reports:
+        latest = date.fromisoformat(reports[-1])
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cmd_effectiveness(latest)
+        eff_lines = buf.getvalue().splitlines()
+        holding = sum(1 for l in eff_lines if "status:holding" in l)
+        recurred = sum(1 for l in eff_lines if "status:recurred-after-fix" in l)
+        too_soon = sum(1 for l in eff_lines if "status:too-soon" in l)
+        chronic = sum(1 for l in eff_lines if l.startswith("CHRONIC"))
+        print(f"effectiveness as of {latest.isoformat()}: holding={holding} "
+              f"recurred-after-fix={recurred} too-soon={too_soon} CHRONIC={chronic}")
+        if chronic:
+            print("  a CHRONIC rec recurring across weeks despite landing is the strongest "
+                  "single signal something isn't actually improving - see that day's report's "
+                  "Fix effectiveness section for which one(s)")
+
+
 def selftest():
     import tempfile
     ts = "2026-07-08T12:00:00.000Z"
@@ -1737,6 +1837,48 @@ def selftest():
         assert _taken_recs() == {"2026-07-05#1": "2026-07-07"}, _taken_recs()
         with _rso(_io.StringIO()):
             cmd_effectiveness(date(2026, 7, 10))
+
+        # --- cmd_trends: rate-normalized split + low-coverage exclusion ---
+        # explicit, self-contained fixture - does not depend on residue from the tests
+        # above, so reordering them can't silently break this one.
+        for f in REPORTS.glob("????-??-??.md"):
+            f.unlink()
+        for iso, epr, tph, fric in [
+            ("2026-07-20", 10.0, 100.0, 30.0), ("2026-07-21", 12.0, 110.0, 32.0),
+            ("2026-07-22", 8.0, 90.0, 28.0), ("2026-07-23", 10.0, 100.0, 30.0),
+            ("2026-07-24", 2.0, 50.0, 10.0), ("2026-07-25", 3.0, 55.0, 12.0),
+            ("2026-07-26", 1.0, 45.0, 8.0), ("2026-07-27", 2.0, 50.0, 10.0),
+        ]:
+            _upsert_jsonl(REPORTS / "metrics.jsonl", {
+                "date": iso, "sessions": 5, "coverage_hours": 5.0,
+                "errors_per_hour": epr, "tool_calls_per_hour": tph, "top_friction": fric,
+                "gate_calls": 1, "max_gate_wait_secs": 1.0, "work_secs": 10.0,
+                "human_wait_secs": 10.0, "blocked_secs": 0.0, "model_latency_secs": 0.0,
+                "idle_secs": 0.0,
+            }, key="date")
+        # a low-coverage day in the SAME window must not pollute the trend average
+        _upsert_jsonl(REPORTS / "metrics.jsonl", {
+            "date": "2026-07-19", "sessions": 0, "coverage_hours": None,
+            "errors_per_hour": None, "tool_calls_per_hour": None, "top_friction": 0,
+            "gate_calls": 0, "max_gate_wait_secs": 0,
+        }, key="date")
+        (REPORTS / "2026-07-27.md").write_text("x\n" + COMPLETE_MARKER + "\n")
+        (REPORTS / "recs.jsonl").write_text("".join(json.dumps(r) + "\n" for r in [
+            {"report_date": "2026-07-20", "recs": [{"id": "2026-07-20#1", "repeat": False, "summary": "x"}]},
+        ]))
+        (REPORTS / "actions-log.md").write_text(
+            "- [2026-07-20] taken rec:2026-07-20#1 - fixed x (landed)\n")
+        buf_t = _io.StringIO()
+        with _rso(buf_t):
+            cmd_trends(days=9)
+        out_t = buf_t.getvalue()
+        assert "trend errors/hr (primary): first-half avg 10.0 -> second-half avg 2.0 (down)" in out_t, out_t
+        assert "trend tool_calls/hr: first-half avg 100.0 -> second-half avg 50.0 (down)" in out_t, out_t
+        assert ("trend friction_score (noisier axis): first-half avg 30.0 -> "
+                "second-half avg 10.0 (down)") in out_t, out_t
+        row_2026_07_19 = next(l for l in out_t.splitlines() if l.startswith("2026-07-19"))
+        assert "low-coverage" in row_2026_07_19, row_2026_07_19
+        assert "effectiveness as of 2026-07-27: holding=1" in out_t, out_t
     REPORTS = real_reports
 
     # --- still_active must name only sessions that HAVE a record (2026-08-10) ---
@@ -1793,6 +1935,8 @@ def main():
         cmd_ledger(day)
     elif cmd == "missing-dates":
         cmd_missing_dates()
+    elif cmd == "trends":
+        cmd_trends(int(args[args.index("--days") + 1]) if "--days" in args else 14)
     elif cmd == "selftest":
         selftest()
     else:

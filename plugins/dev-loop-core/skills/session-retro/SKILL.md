@@ -50,6 +50,24 @@ for every recommendation).
 To force a date to re-run: delete `session-reports/<date>.md` (or its completion
 marker) and run the runner again.
 
+**"How am I trending over time?"** - don't eyeball `metrics.jsonl` by hand or re-derive
+this from daily report prose (each report only compares to the prior 1-2 days). Use:
+
+    python3 ${CLAUDE_PLUGIN_ROOT}/skills/session-retro/scripts/scan_sessions.py trends --days 14
+
+Prints a rate-normalized (`errors_per_hour`/`tool_calls_per_hour`, not raw counts - a
+busy day and a quiet day are otherwise incomparable), coverage-aware table, a first-half-
+vs-second-half trend split (skipped with a note if fewer than `MIN_TREND_SPLIT_DAYS`
+usable days are in range), and an effectiveness-digest snapshot (holding /
+recurred-after-fix / too-soon / CHRONIC counts) as of the most recent stamped report. A
+day with `coverage_hours` below `MIN_TREND_COVERAGE_HOURS` (no sessions, or an all-retro-
+stub day) is marked `low-coverage` and excluded from the split - never silently averaged
+in as if it were a great quiet day. `errors_per_hour` is the primary axis;
+`friction_score` is printed too but is noisier (tracks how messy what was ATTEMPTED was,
+not whether the process is improving) - a shrinking CHRONIC count over weeks is the
+stronger "is this actually getting better" signal. Read-only: never writes
+recs.jsonl/actions-log.md/metrics.jsonl.
+
 ## Same-day staleness watchdog
 
 The daily report only surfaces the FOLLOWING morning - a session that dispatches a
