@@ -114,6 +114,14 @@ last `gateloop-start`), so it survives context compaction and clock drift.
    - Exit 3 → **STOP. Do not self-approve, even if the suite is green and codex would SHIP.** Log
      `gateloop-tamper` to verify.log and hand the branch diff to a human, or dispatch a **dedicated
      codex pass whose sole job is to judge that test/config/deps diff** - the loop cannot clear it.
+     **This dispatch gets the SAME wedge watchdog as Step 4's gate, no exceptions and no "I'll wait
+     for the natural completion notification":** arm `watch-agent-output.sh <exact-job-log-file>` in
+     a `run_in_background: true` Bash job in the same turn you dispatch, and read its result once on
+     the completion notification. On STUCK-OR-DONE with empty output, cancel and re-dispatch once in
+     the same turn (`rec:2026-08-12#8`) - never let a second window sit unwatched. Measured cost of
+     skipping this: session `defef5a9` (2026-08-19/20, unattended overnight) dispatched this exact
+     tamper-judge pass unwatched and lost 19,478s - 65% of an 8.5h session - to a dead job whose
+     result never arrived; the eventual watched re-dispatch that unstuck it took under 2 minutes.
    - Exit 0 → continue. **Only exit 0 continues; ANY non-zero (2 usage, 3 tamper, or anything else) is a
      fail-closed STOP** - never "exit != 3 means proceed".
    This runs BEFORE the concurrent dispatch below and must clear first: a tamper hit means no codex
