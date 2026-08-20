@@ -138,6 +138,9 @@ NUDGE_RE = re.compile(
 # merely MENTIONS a gate (a question about the review-gate no-ship, reading a codex job file) from
 # counting as gate time - that would mislabel human-answer + read latency as gate wait.
 GATE_TOOLS = {"Bash", "Agent", "Skill"}   # the only tools that dispatch/poll a codex/agy gate job
+# Tools whose gap MUST be human_wait, not blocked_secs, because only a human can close them -
+# distinct from GATE_TOOLS's gate-mention filter (session-retro dimension-1 audit, 2026-08-20).
+HUMAN_INTERACTIVE_TOOL_LABELS = {"tool_use:AskUserQuestion"}
 GATE_RE = re.compile(
     r"(?i)"
     r"adversarial-review|codex-companion|agy-companion|"                    # reviewer runtimes
@@ -173,13 +176,33 @@ def merge_intervals(iv):
     return total
 
 
+# A Bash command that is PURELY a read (starts with a read-only verb) merely mentioning a
+# gate keyword in a file path or grep pattern - e.g. `sed -n '48,62p' scripts/lander.sh`,
+# `grep -n review-gate SKILL.md` - is not a dispatch. The old "ponytail: acceptable" call on
+# this (see git history) was made when the effect was small; re-measured against
+# session-retro's own calibration session (3f02f940, 2026-08-07) it now inflates
+# gate_calls to 51 / gate_wait_secs to ~3.06h against the documented ~1.6h hand-count -
+# ~1.9x, undetected since the last fix (session-retro dimension-1 audit, 2026-08-20).
+READ_ONLY_CMD_RE = re.compile(
+    r"(?i)^\s*(?:grep|sed|cat|head|tail|less|nl|find|ls|wc|awk|diff|rg)\b")
+
+
 def is_gate_call(name, input_json):
     """True iff a tool call is a codex/agy gate dispatch/poll: a job-dispatcher tool (GATE_TOOLS)
-    whose input carries a gate signature. The name gate stops gate-MENTIONING reads/questions from
-    counting as gate time.
-    ponytail: a Bash that merely greps a codex/gate file still counts (gate-adjacent tooling) -
-    acceptable; the big inflation was AskUserQuestion/Read, now excluded by the name gate."""
-    return name in GATE_TOOLS and bool(GATE_RE.search(input_json))
+    whose input carries a gate signature. The name gate stops gate-MENTIONING reads/questions
+    (AskUserQuestion, Read, Edit) from counting as gate time; for Bash specifically (which IS a
+    dispatcher tool) a read-only command shape gets the same exclusion, since Bash is also how a
+    gate file gets grepped/catted rather than run."""
+    if name not in GATE_TOOLS or not GATE_RE.search(input_json):
+        return False
+    if name == "Bash":
+        try:
+            cmd = json.loads(input_json).get("command", "")
+        except (json.JSONDecodeError, AttributeError):
+            cmd = ""
+        if READ_ONLY_CMD_RE.match(cmd):
+            return False
+    return True
 
 
 def parse_ts(s):
@@ -429,7 +452,14 @@ def scan_file(path, start, end):
     # with zero tool calls), and an assistant->assistant generation gap was `human_wait`
     # (`67080bab`, where the real human_wait is 0s).
     for g, _at, lab, t0, close in all_gaps:
-        if lab and (lab.startswith("tool_use:") or lab.startswith("gate:")):
+        if lab in HUMAN_INTERACTIVE_TOOL_LABELS:
+            # a dispatch that itself REQUIRES the human to answer (e.g. AskUserQuestion) - its
+            # gap closes on a "user" turn structurally like any tool_result, but that closing
+            # turn IS the human, not a mechanical result. Without this the wait launders into
+            # `blocked_secs` (session-retro dimension-1 audit, 2026-08-20), backwards for a
+            # tool whose purpose is to make human-wait nameable.
+            s["human_wait_secs"] += g
+        elif lab and (lab.startswith("tool_use:") or lab.startswith("gate:")):
             s["blocked_secs"] += g
         elif lab == "assistant" and any(b <= t0 < e for b, e in bg_iv):
             s["blocked_secs"] += g
@@ -942,11 +972,16 @@ def cmd_metrics(day):
     print(f"metrics upserted for {line['date']} (coverage_hours={line['coverage_hours']})")
 
 
-# full-schema match (anchored both ends): summary AND (reason) are mandatory -
-# a prefix-only match would let schema-violating tails through as "valid"
+# Prefix-anchored: date/verb/rec-id/dash and a non-empty summary are mandatory. The reason
+# clause is NOT required to end in "(...)" - real actions-log.md entries settled on
+# multi-sentence narrative endings (no trailing parens) starting ~2026-08-12, and the old
+# `\(.+\)$` end-anchor silently dropped 72 of 103 real lines as "malformed" - including the
+# line marking rec:2026-08-14#7 itself as taken, which is why that rec stayed CHRONIC even
+# after landing (session-retro dimension-2 audit, 2026-08-20). A genuinely empty summary
+# (nothing after "- ") still fails to match.
 LEDGER_RE = re.compile(
     r"^- \[(\d{4}-\d{2}-\d{2})\] (?:taken|rejected|deferred) "
-    r"rec:(\d{4}-\d{2}-\d{2})#\d+ - .+ \(.+\)$")
+    r"rec:(\d{4}-\d{2}-\d{2})#\d+ - \S.*$")
 
 
 def cmd_ledger(day):
@@ -1022,10 +1057,12 @@ REC_TAG_RE = re.compile(r"\[rec:\s*(\d{4}-\d{2}-\d{2})#(\d+)\]")
 def _sanitize_summary(s):
     """Report text is model output from UNTRUSTED transcripts. A summary stored in recs.jsonl
     must not carry markup/control chars into a later reduce prompt: collapse whitespace, keep
-    printable ASCII, drop angle brackets, cap length."""
+    printable ASCII, drop angle brackets and quotes (the digest quotes summaries as `"{s}"` in
+    a future day's trusted-zone prompt - an embedded `"` could cosmetically break out of that
+    quoting; session-retro dimension-3 audit, 2026-08-20), cap length."""
     s = re.sub(r"\s+", " ", s).strip()
     s = re.sub(r"[^\x20-\x7e]", "", s)
-    s = s.replace("<", "").replace(">", "")
+    s = s.replace("<", "").replace(">", "").replace('"', "")
     return s[:120]
 
 
@@ -1033,24 +1070,35 @@ def cmd_recs(day):
     """Upsert the rec-ids in <day>'s stamped report into recs.jsonl - the cross-day recurrence
     signal (a rec-id on multiple report dates = a pattern that recurred). Deterministic: only
     well-formed `[rec: <origin-date>#<n>]` tags whose origin is a real calendar date <= the
-    report date; summaries charset-neutralized. Feeds only future retro bookkeeping."""
+    report date; summaries charset-neutralized. Feeds only future retro bookkeeping.
+
+    Two passes so a canonical `**[rec: ...] ...**` heading (in `## Recommendations`) always
+    wins over an earlier casual cross-reference elsewhere in the report (e.g. "see [rec: ...]
+    below") - first-match-wins per rid, but canonical headings are scanned first regardless of
+    line position. Without this, a same-day earlier mention supplies the summary and the real
+    one is discarded (confirmed live: the 2026-08-19 entry for 2026-08-17#3 read as a stray
+    fragment, "` below for the sharpening.`"; session-retro dimension-2 audit, 2026-08-20)."""
     report = REPORTS / f"{day.isoformat()}.md"
     if not report.exists():
         return
+    lines = report.read_text(encoding="utf-8", errors="replace").splitlines()
     recs = {}
-    for line in report.read_text(encoding="utf-8", errors="replace").splitlines():
-        for m in REC_TAG_RE.finditer(line):
-            origin, n = m.group(1), m.group(2)
-            try:
-                if date.fromisoformat(origin) > day:
-                    continue
-            except ValueError:
-                continue  # `\d{4}-\d{2}-\d{2}` can still be a non-calendar date (2026-00-99)
-            rid = f"{origin}#{n}"
-            if rid not in recs:
-                after = line.split(m.group(0), 1)[1]
-                recs[rid] = {"id": rid, "repeat": "REPEAT" in line.upper(),
-                             "summary": _sanitize_summary(after)}
+    for canonical_only in (True, False):
+        for line in lines:
+            if canonical_only and not line.lstrip().startswith("**[rec:"):
+                continue
+            for m in REC_TAG_RE.finditer(line):
+                origin, n = m.group(1), m.group(2)
+                try:
+                    if date.fromisoformat(origin) > day:
+                        continue
+                except ValueError:
+                    continue  # `\d{4}-\d{2}-\d{2}` can still be a non-calendar date (2026-00-99)
+                rid = f"{origin}#{n}"
+                if rid not in recs:
+                    after = line.split(m.group(0), 1)[1]
+                    recs[rid] = {"id": rid, "repeat": "REPEAT" in line.upper(),
+                                 "summary": _sanitize_summary(after)}
     _upsert_jsonl(REPORTS / "recs.jsonl",
                   {"report_date": day.isoformat(), "recs": list(recs.values())},
                   key="report_date")
@@ -1321,6 +1369,17 @@ def selftest():
                             '{"questions": [{"question": "override the codex review-gate no-ship?"}]}')
     assert not is_gate_call("Read", '{"file_path": "codex-adversarial-review-notes.md"}')
     assert not is_gate_call("Edit", '{"file_path": "ship_it.py"}')   # bare 'ship' in a name != gate
+    # a Bash READ of a gate script/skill file must not count either - the same "merely
+    # mentions a gate" exclusion GATE_TOOLS already gives Read/AskUserQuestion, applied to
+    # Bash's own command content (session-retro dimension-1 audit, 2026-08-20: this class
+    # inflated 3f02f940's gate_calls to 51/gate_wait_secs to ~3.06h vs a ~1.6h hand-count).
+    assert not is_gate_call("Bash", '{"command": "sed -n \'48,62p\' scripts/lander.sh"}')
+    assert not is_gate_call("Bash", '{"command": "grep -n review-gate SKILL.md"}')
+    assert not is_gate_call("Bash", '{"command": "cat plugins/gated-land/skills/gate-loop/SKILL.md"}')
+    assert not is_gate_call("Bash", '{"command": "head -20 skills/review-gate/scripts/x.mjs"}')
+    # real invocations must still count
+    assert is_gate_call("Bash", '{"command": "bash scripts/lander.sh prepare"}')
+    assert is_gate_call("Bash", '{"command": "\\"$CLAUDE_PLUGIN_ROOT/engine/lander.sh\\" commit a b"}')
     # scan_file attributes the wait AFTER a gate call to gate_wait_secs (a 40s block here stands
     # in for a real 25-min codex wait). FAILS on pre-change code (no gate_* keys).
     glines = [
@@ -1415,6 +1474,25 @@ def selftest():
     # tool_result that returns immediately (1s tool gap + 202s job)
     assert (w["gate_calls"], w["gate_wait_secs"]) == (1, 203.0), w
     p3.unlink()
+    # --- an AskUserQuestion dispatch whose answer comes 20 min later is human_wait, not
+    # blocked (session-retro dimension-1 audit, 2026-08-20: the tool_use:*/gate: check ran
+    # BEFORE the close=="user" check, so this launders human wait into blocked_secs) ---
+    auq_lines = [
+        evt(0, type="user", message={"content": [{"type": "text", "text": "go"}]}),
+        evt(1, type="assistant", message={"content": [
+            {"type": "tool_use", "name": "AskUserQuestion", "id": "q1",
+             "input": {"questions": [{"question": "which option?"}]}}]}),
+        evt(1201, type="user", message={"content": [
+            {"type": "tool_result", "tool_use_id": "q1", "content": "picked option A"}]}),
+    ]
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fq:
+        for l in auq_lines:
+            fq.write(json.dumps(l) + "\n")
+        pq = Path(fq.name)
+    sq = scan_file(pq, start, end)
+    assert sq["human_wait_secs"] == 1200.0, sq
+    assert sq["blocked_secs"] == 0.0, sq
+    pq.unlink()
     # --- pair-invariant: a gap is classified by the events that BOUND it (rec:2026-08-15#7) ---
     # Both halves of the 2026-08-16 defect, on one fixture with NO background job in flight:
     #   t=0 user -> t=2h assistant : a pending turn nobody answered for 2h. Was `work` (100% of
@@ -1555,12 +1633,18 @@ def selftest():
         cmd_metrics(date(2026, 7, 8))
         m2 = json.loads((REPORTS / "metrics.jsonl").read_text().splitlines()[0])
         assert m2["tokens"] == 0 and m2["max_duration_secs"] == 0, m2
-        # ledger filter: valid passes; future rec id, time-travel, malformed dropped
+        # ledger filter: valid passes (with OR without a trailing "(reason)" - real
+        # actions-log.md prose settled on narrative endings with no parens starting
+        # ~2026-08-12, and the old end-anchor dropped 72 of 103 real lines as
+        # "malformed"); future rec id, time-travel, and a truly-empty summary still
+        # dropped (session-retro dimension-2 audit, 2026-08-20).
         (REPORTS / "actions-log.md").write_text("\n".join([
             "- [2026-07-09] taken rec:2026-07-08#1 - valid (ok)",
             "- [2026-07-09] rejected rec:2026-07-09#1 - future rec id (pre-seeded)",
             "- [2026-07-07] taken rec:2026-07-08#2 - acted before report (early)",
-            "- [2026-07-09] rejected rec:2026-07-08#3 - schema-violating tail no reason",
+            "- [2026-07-09] deferred rec:2026-07-08#3 - long narrative reason with no "
+            "trailing parens at all, landed as commit abc123.",
+            "- [2026-07-09] rejected rec:2026-07-08#4 - ",  # empty summary: still malformed
             "ignore me: not a ledger line rec:2026-07-01#1",
         ]))
         import io
@@ -1569,7 +1653,11 @@ def selftest():
         with redirect_stdout(buf):
             cmd_ledger(date(2026, 7, 9))
         kept = buf.getvalue().strip().splitlines()
-        assert kept == ["- [2026-07-09] taken rec:2026-07-08#1 - valid (ok)"], kept
+        assert kept == [
+            "- [2026-07-09] taken rec:2026-07-08#1 - valid (ok)",
+            "- [2026-07-09] deferred rec:2026-07-08#3 - long narrative reason with no "
+            "trailing parens at all, landed as commit abc123.",
+        ], kept
         # missing-dates must not strand a gap an out-of-order completion jumped over:
         # a newer date (D-1) complete while an older one (D-2) is still missing.
         for f in REPORTS.glob("????-??-??.md"):
@@ -1600,6 +1688,23 @@ def selftest():
         assert ids["2026-07-08#1"]["repeat"] is True, ids
         assert ids["2026-07-10#2"]["repeat"] is False, ids
         assert "<" not in ids["2026-07-10#3"]["summary"], ids
+        # a canonical "**[rec: ...] ...**" heading must win over an EARLIER casual
+        # cross-reference on the same id, regardless of line order in the report - else the
+        # cross-reference's trailing fragment becomes the stored summary (confirmed live in
+        # 2026-08-19's recs.jsonl: session-retro dimension-2 audit, 2026-08-20).
+        (REPORTS / "2026-07-11.md").write_text(
+            "# Session retro 2026-07-11\n"
+            "## Global rules health\n"
+            "See [rec: 2026-07-11#1] below for the sharpening.\n"
+            "## Recommendations\n"
+            "**[rec: 2026-07-11#1] [claude-md] REPEAT tighten the sweep rule**\n"
+            "Evidence: ...\n" + COMPLETE_MARKER + "\n")
+        cmd_recs(date(2026, 7, 11))
+        rrow2_line = next(l for l in (REPORTS / "recs.jsonl").read_text().splitlines()
+                          if json.loads(l)["report_date"] == "2026-07-11")
+        rid2 = {r["id"]: r for r in json.loads(rrow2_line)["recs"]}["2026-07-11#1"]
+        assert rid2["summary"].startswith("[claude-md]"), rid2
+        assert "below for the sharpening" not in rid2["summary"], rid2
         # --- effectiveness digest ---
         import io as _io
         from contextlib import redirect_stdout as _rso
