@@ -115,6 +115,18 @@ item per open recommendation, id-tagged `rec:<date>#<n>`, then begin the first o
 turn.** Do not end the turn with an open rec; when one is genuinely blocked, name the user-only
 input it needs and mark that todo blocked.
 
+**A PRINTED prompt does not count as begun, and the "Next actions" section is not the deliverable.**
+The `## Next actions` prompts exist so the work is already specified - they are for YOU to execute,
+never a block for the user to paste. The generating turn must actually run the first one (edit the
+file, land the commit), not restate it. This is the exact mechanism by which `rec:2026-08-14#7` has
+stayed CHRONIC at `seen_count:6`: on 2026-08-20 the 08-19 report's three prompts had produced zero
+ledger lines, and the generating session (`34d4cc42`) shows why - `subagents=0`, `bg_jobs=0`, nothing
+dispatched. It repeated the next day: the 08-20 report printed **eleven** prompts and none had run 24
+hours later. If a rec turns out to be wrong, that is a finding worth more than the rec - verify each
+one's premise against the code before executing it rather than after (2026-08-21: `rec:2026-08-19#1`
+asked to inline a table into two agent files that already contained it verbatim, and the real cause
+was three command shapes the table never listed).
+
 An unfinished todo list is visible to the harness at turn end in a way a paragraph of CLAUDE.md is
 not, which is the whole point: "ending the turn with the next step already named" was a top-3
 friction pattern on 2026-08-10, 08-11 and 08-12, and on 08-12 it cost 71 minutes in one session

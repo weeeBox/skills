@@ -94,7 +94,16 @@ cap applies to that.)
      (1) **wiring/dead-code** (a module with correct logic that is never imported/registered/wired ->
      a shipped no-op), (2) **concurrency-path routing** (a new lock/queue/idempotency layer that one
      caller still bypasses); ask for a verdict line **SHIP / SHIP-WITH-CHANGES / BLOCK** with findings
-     tied to `file:line`.
+     tied to `file:line`. **Require the verdict FORMAT literally, in these words: "End your report
+     with a final line reading exactly `VERDICT: SHIP`, `VERDICT: SHIP-WITH-CHANGES` or
+     `VERDICT: BLOCK` - bare text at the start of its own line, no bold, no heading, no backticks,
+     no trailing punctuation, nothing after the token."** The lander's `_verdict_ok` is a
+     fail-closed interlock matching `^VERDICT:` and then the token exactly, and it is deliberately
+     NOT going to be loosened - the comment above it records that every past widening of that
+     grammar produced a fail-OPEN. An unparseable verdict is therefore not a formatting nit: it
+     costs a destroyed integration worktree, a full re-prepare (an entire suite), and another codex
+     round purely to restate a verdict already given (2026-08-20: `**SHIP**` under a heading did
+     exactly this). Make the round parseable by construction instead of paying for it afterwards.
    - **agy** by a DIRECT Bash call to the companion - NOT the `agy:agy-rescue` subagent, which is a
      contractual `task`-only forwarder that refuses `adversarial-review` (it may run once then refuse
      mid-gate; do not depend on it). Resolve the wrapper version-robustly and invoke `adversarial-review`
