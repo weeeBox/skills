@@ -92,13 +92,18 @@ named in the prior verdict, with no sweep, is the failure mode this step exists 
 
 ## The loop (max 3 gate rounds)
 
-At loop entry, append one `gateloop-start` row to the audit log so the cap is counted from data, not
-memory: `printf '%s\tgateloop-start\t%s\t-\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse --short HEAD)" >> "$VLOG"`.
-
 Repeat the round below. A **round** = one gate attempt (codex). **Cap from data, not memory:**
 at the top of each round, if `${CLAUDE_PLUGIN_ROOT}/skills/gate-loop/scripts/round-count.sh "$VLOG"`
-returns `>=3`, take the Cap-out path (do NOT start a 4th round). The count is positional (rows after the
-last `gateloop-start`), so it survives context compaction and clock drift.
+returns `>=3`, take the Cap-out path (do NOT start a 4th round).
+
+**The cap is per BRANCH, for the branch's whole life.** The count is every `gateloop-block` row
+carrying this branch in field 5, so it survives context compaction, clock drift, and a fresh
+invocation of this skill. There is no loop-entry marker to re-emit: "I addressed the findings,
+so this is a fresh loop with a fresh round count" is exactly the move the cap exists to stop
+(2026-08-23 session `45d27e2c`: a cap-out at round 3, a relabelled "loop 2" thirteen minutes
+later, a second cap-out, then two more rounds - 7+ rounds and ~62 minutes on one branch, while
+the counter honestly returned 2). Once this branch is at the cap, a "confirmation round" or a
+"final round" is round N+1 and is forbidden; take the Cap-out path or apply the terminal option.
 
 1. **agy advisory - OPT-IN, skipped by default** (see review-gate's role note: 78% of 91 measured
    dispatches returned `revisit`/`rethink` on work codex then SHIP'd, and agy can never block). Run it
@@ -181,8 +186,12 @@ Append one tab-separated row per terminal event to `$VLOG` (resolved at Step 0 -
 checkout's log, never the worktree's):
 
 ```
-printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" <event> "$(git rev-parse --short HEAD)" "<detail>" >> "$VLOG"
+printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" <event> "$(git rev-parse --short HEAD)" "<detail>" "$(git rev-parse --abbrev-ref HEAD)" >> "$VLOG"
 ```
+
+Five tab-separated fields: `ts`, `event`, `head`, `detail`, `branch`. **Field 5 is what the round
+cap is counted by** - a row written without it is invisible to `round-count.sh` and silently buys
+the branch an extra round, so never drop it.
 
 Events: `gateloop-pass` (detail = base + rounds used), `gateloop-block` (per BLOCK round, detail =
 one-line findings), `gateloop-capout`, `gateloop-tamper` (detail = offending paths).
