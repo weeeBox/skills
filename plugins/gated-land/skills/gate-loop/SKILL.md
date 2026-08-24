@@ -142,6 +142,13 @@ the counter honestly returned 2). Once this branch is at the cap, a "confirmatio
      mechanics (`/codex:adversarial-review --base <base>`), arming the wedge watchdog in the same breath.
      **Round 2+: resume the SAME codex agent** (`codex:rescue --resume`) so it re-judges with warm
      context, feeding it the prior verdict; do not cold-dispatch codex each round.
+     **Never open the prompt with a repo skill's trigger vocabulary** (`ship`, `land`, `prepare`,
+     `release`, `BLOCKING ship/no-ship gate`). Codex picks the repo skill up and runs its release
+     preflight instead of reading the diff, and you get no verdict at all: 2026-08-23 `72e380fe`
+     `21:09:17` - *"my prompt opened with 'BLOCKING ship/no-ship gate', which made codex pick up the
+     repo's `ship` skill and run its release preflight instead of reading the diff... it never ran
+     the review"* - one dispatch, one watchdog and one result fetch for nothing. Open with
+     `ADVERSARIAL CODE REVIEW` and include `Do not run any release protocol.`
    - **A RED suite still rejects the round, exactly as before - this is a concurrency change, not a
      policy change.** Discard this round's codex verdict (a SHIP on a red tree is never a pass), find
      the **root cause** and fix it, re-run affected + full suite until green, then start the next
@@ -171,6 +178,16 @@ the counter honestly returned 2). Once this branch is at the cap, a "confirmatio
        re-gate** - batching is never an escape hatch.
      - **Guardrails:** a BLOCK is never merged over (codex must still SHIP the final
        commit); a risk-sensitive diff never batches; batch+confirm counts toward the 3-round cap.
+     - **A finding whose PREMISE your own in-session evidence refutes is not a finding.** Record the
+       refutation in the commit message with the command that produced it and move on - do not
+       "comply anyway" to buy a SHIP token. Complying costs a commit, a hook suite, a fresh
+       `prepare` and a whole codex round, and it writes a change you have already measured as wrong.
+       2026-08-23 `7880bd43`: codex returned `SHIP-WITH-CHANGES` over an absolute interpreter path at
+       `19:51:52`; the agent's own count at `19:52:18` showed the repo majority IS the absolute form,
+       14 vs 4; it said *"Codex's premise is off"* at `19:52:26` and complied regardless, spending a
+       fourth `prepare` and a fourth round. If the refutation is wrong you will find out on the next
+       round; if it is right, you have saved one. This applies only to a premise you can refute with
+       a command you ran - not to a finding you merely disagree with.
 
 ## Cap-out (round 3 still BLOCK)
 
