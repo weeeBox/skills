@@ -16,9 +16,19 @@ set -uo pipefail
 
 # Matched against `git diff --name-only` output (repo-relative paths). A hit means the
 # session touched something that could fake a green run, so it may not self-approve.
-is_guarded() {
+# Test SOURCE, split out from the substrate list below so `is_test_source_only` can be DERIVED
+# from that list instead of restating it. Restating it is not a style preference: a duplicated
+# copy re-introduced the basename-vs-path bug the scoping comments below already warn about
+# (`*gate.py` matches `test_renewal_claim_gate.py`), and it would silently rot every time a new
+# substrate rule is added to only one of the two lists.
+is_test_path() {
+  case "$1" in tests/*|*/tests/*) return 0 ;; esac
+  return 1
+}
+
+# Everything that is substrate for a reason OTHER than being test source.
+is_substrate() {
   case "$1" in
-    tests/*|*/tests/*)                                 return 0 ;;  # any test source
     conftest.py|*/conftest.py)                         return 0 ;;  # pytest fixtures/config
     pytest.ini|*/pytest.ini|pyproject.toml|*/pyproject.toml) return 0 ;;
     requirements*.txt|*/requirements*.txt)             return 0 ;;  # deps (mock the world)
@@ -56,21 +66,77 @@ is_guarded() {
   return 1
 }
 
+is_guarded() { is_test_path "$1" || is_substrate "$1"; }
+
+# Test source that is NOT also substrate for another reason (tests/conftest.py and
+# tests/run_all.sh are, and keep the path-level rule). This is the one guarded class where
+# "was it touched?" is the wrong question.
+#
+# Measured 2026-08-24 by replaying all 65 historical gateloop-tamper events against reconstructed
+# fork points: the path-level rule fired on 60 of 60 usable episodes, and the logged details argue
+# the case for the defence ("NEW file, no existing test modified", "3 tests ADDED, none
+# modified/removed"). In a repo whose CLAUDE.md mandates red-repro-first TDD, "the diff touches
+# tests/" describes every branch, not a threat: the guard was 100% precise against its own rule and
+# near-0% against tampering, and a guard that fires on routine work stops being read - the exact
+# erosion the gate.py scoping comment above was written about. Rescoped to DELETED-or-WEAKENED it
+# fires on 5 of the same 60: 4 are the machinery rules (lander.sh, risk_classify.py, tamper-check.sh)
+# firing exactly as designed, and 2 episodes carry 5 genuine test-evidence regressions - including
+# tests/memory/test_preference_write_receipt.py dropping 27 assertions to 25, which the old rule
+# reported with the same weight as every additive branch and therefore buried.
+is_test_source_only() { is_test_path "$1" && ! is_substrate "$1"; }
+
+# Exit 0 (= this test file REMOVED or WEAKENED evidence, treat as tamper) / 1 (= clean).
+# FAIL CLOSED on any git error, same contract as tamper_check itself.
+test_weakened() {
+  local st="$1" old="$2" new="$3" mb="$4" cand="$5" a b ca cb
+  case "$st" in
+    A*) return 1 ;;   # net-new test file: adds evidence, cannot fake a green run
+    D*) return 0 ;;   # deleted test file: always tamper
+  esac
+  a="$(git show "$mb:$old" 2>/dev/null)"   || return 0
+  b="$(git show "$cand:$new" 2>/dev/null)" || return 0
+  # grep -c counts LINES, symmetric on both sides; `|| true` because grep exits 1 on zero matches.
+  # Anchored on statement SHAPE, not the bare word: a plain /assert/ also counted PROSE, so deleting
+  # one comment reading "...is what is asserted" registered as a weakened test (measured false
+  # positive on tests/eldercare_verify/test_replay_ui_browser.py: 446->445 loose, 305->305 anchored).
+  ca="$(printf '%s\n' "$a" | grep -cE '^[[:space:]]*assert[[:space:](]|self\.assert|pytest\.raises|^[[:space:]]*(async )?def test_' || true)"
+  cb="$(printf '%s\n' "$b" | grep -cE '^[[:space:]]*assert[[:space:](]|self\.assert|pytest\.raises|^[[:space:]]*(async )?def test_' || true)"
+  [ "${cb:-0}" -lt "${ca:-0}" ]
+}
+
 tamper_check() {
-  local base="$1" cand="${2:-HEAD}" hits=() f diff_out
+  local base="$1" cand="${2:-HEAD}" hits=() f old st line rest mb diff_out
   # three-dot: what THIS branch introduced since it forked from base (matches
   # ship/review-gate's `git diff <base>...HEAD` scoping - ignores base-side drift so a
   # test that landed on main after the fork is never mistaken for tampering here).
   # FAIL CLOSED: a safety guard must never report "clean" when it could not actually check. A
   # bad base/candidate (or any git error) returns TAMPER, not a false all-clear (codex finding).
-  if ! diff_out="$(git diff --name-only "$base...$cand" 2>&1)"; then
-    printf 'TAMPER-CHECK ERROR: `git diff --name-only %s...%s` failed - failing CLOSED:\n%s\n' \
+  if ! diff_out="$(git diff --name-status "$base...$cand" 2>&1)"; then
+    printf 'TAMPER-CHECK ERROR: `git diff --name-status %s...%s` failed - failing CLOSED:\n%s\n' \
       "$base" "$cand" "$diff_out" >&2
     return 3
   fi
-  while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    is_guarded "$f" && hits+=("$f")
+  # Content comparison needs the fork point, not the base tip, to match the three-dot diff above.
+  if ! mb="$(git merge-base "$base" "$cand" 2>&1)"; then
+    printf 'TAMPER-CHECK ERROR: `git merge-base %s %s` failed - failing CLOSED:\n%s\n' \
+      "$base" "$cand" "$mb" >&2
+    return 3
+  fi
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    st="${line%%	*}"; rest="${line#*	}"
+    case "$st" in
+      R*|C*) old="${rest%%	*}"; f="${rest#*	}" ;;   # rename/copy: <status>\t<old>\t<new>
+      *)     f="$rest"; old="$f" ;;
+    esac
+    is_guarded "$f" || continue
+    if is_test_source_only "$f"; then
+      # Test SOURCE is judged on whether it lost evidence, not on whether it was touched.
+      test_weakened "$st" "$old" "$f" "$mb" "$cand" || continue
+      hits+=("$f (test evidence removed or weakened)")
+    else
+      hits+=("$f")
+    fi
   done <<< "$diff_out"
   if ((${#hits[@]})); then
     printf 'TAMPER: branch diff touches the verification substrate - human/codex-only approval:\n' >&2
@@ -109,6 +175,22 @@ selftest() {
   done
   # fail-closed: an unresolvable base must return TAMPER - and EXACTLY 3, not merely non-zero. A
   # test that accepts any non-zero would pass on exit 1 or 2, which callers do not treat as tamper.
+  # is_test_source_only: test source is content-judged; test-shaped substrate is not. The
+  # `test_*_gate.py` / `test_risk_classify.py` cases are regressions - a duplicated substrate list
+  # with basename globs (`*gate.py`) swallowed them, which is why the predicate derives from
+  # is_substrate instead.
+  for p in tests/test_foo.py tests/app/test_bar.py src/tests/x.py \
+           tests/test_renewal_claim_gate.py tests/test_risk_classify.py tests/test_gate.py; do
+    is_test_source_only "$p" || { echo "FAIL: expected TEST-SOURCE-ONLY: $p"; fails=$((fails+1)); }
+  done
+  for p in tests/conftest.py tests/run_all.sh tests/requirements.txt \
+           src/app/main.py scripts/lander.sh; do
+    is_test_source_only "$p" && { echo "FAIL: expected NOT test-source-only: $p"; fails=$((fails+1)); }
+  done
+  # TAMPER_EXTRA_SUBSTR keeps its path-level force even under tests/
+  ( local TAMPER_EXTRA_SUBSTR="tests/golden/"
+    is_test_source_only "tests/golden/fixture.py" ) && \
+    { echo "FAIL: TAMPER_EXTRA_SUBSTR should force path-level under tests/"; fails=$((fails+1)); }
   local rc=0
   tamper_check __definitely_no_such_ref__ HEAD 2>/dev/null || rc=$?
   [ "$rc" -eq 3 ] || { echo "FAIL: bad-base should return exactly 3, got $rc"; fails=$((fails+1)); }
