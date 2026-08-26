@@ -178,6 +178,18 @@ Ranked list, each tagged `[rec: <date>#<n>]`. Every recommendation MUST have BOT
   timestamp, never a range - a range hides which event you mean.
 - A concrete artifact inline: exact CLAUDE.md rule text, skill name + outline, exact
   command, specific file/dir to reorganize, or a settings/permission change.
+- ENFORCEMENT TIER, stated explicitly as `tier: hook|script|test|prose`. A rule a hook, a
+  script, or a test can enforce MUST ship as that, not as prose; `tier: prose` is the fallback
+  for judgment rules only and must say in one clause why no mechanical form exists. Measured
+  2026-08-26: of 101 distinct pinned rules in the global CLAUDE.md, ZERO are enforced by any
+  hook - the four rec-ids cited across every hook are four widenings of one rule - while the
+  two most-repeated prose rules both recurred on 2026-08-25, one of them stated three separate
+  times in the file and fired three times in a day. More prose is measurably not working.
+  Before proposing `tier: hook`, score the matcher against the real corpus per rec:2026-08-23#4
+  and print `real=N flagged=M CAUGHT=K`; a shape firing on more than ~1% of all calls of its
+  kind is a deny-list, and must be narrowed or dropped rather than shipped. A rule whose
+  trigger is a CLAIM the agent writes later cannot be a PreToolUse hook at all - the hook
+  cannot see a sentence that does not exist yet - so it is `tier: prose` by construction.
 - DEDUP against the global config: before proposing a [claude-md] or [permissions] rec,
   check whether the rule/setting ALREADY EXISTS in the appended config. If it does, do NOT
   re-recommend adding it - either drop it, or (if a friction pattern recurred despite it)
