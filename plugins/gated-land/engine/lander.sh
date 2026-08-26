@@ -224,6 +224,21 @@ cmd_prepare() {
 
   trap - EXIT                       # hand the worktree off to the gate; commit/abort will clean it
   log "land-prepared" "$candidate risk=$risk overlap=$ovn integ=${integ:0:8}"
+  # LAND_ROUND: how many times THIS candidate has been prepared, counting this one. `gate-loop`
+  # caps at 3 rounds; `land` had no cap at all, so a branch that capped out at the branch gate
+  # could open an uncapped SECOND loop here - the "a fresh loop defeats the cap" rathole the
+  # standing rules already name. Measured 2026-08-04..26 over 882 codex job records: 24 of 144
+  # branches took >=4 land rounds and burned 133 of 335 land-gate jobs; `prd-home-manager` took
+  # 11, `tracks-ui-round2` took 10 across 20h. Every round is a full re-prepare AND a whole suite.
+  # This REPORTS and refuses nothing on purpose: branches do legitimately reach a clean SHIP late
+  # (`ingress-calendar-drops` did, at round 6), so a hard cap here would strand real work. The cap
+  # is a stop-and-surface rule in the land SKILL; this is the number that rule needs, emitted where
+  # it cannot be missed rather than recounted by hand from verify.log.
+  # index($4, c" ")==1 anchors on the candidate plus its trailing space, so `session/foo` does not
+  # also count `session/foo-2`. awk (not `grep -c`) because grep exits 1 on zero matches.
+  local lround
+  lround="$(awk -F'\t' -v c="$candidate" '$2=="land-prepared" && index($4, c" ")==1 {n++} END{print n+0}' "$LOG" 2>/dev/null)"
+  [ -n "$lround" ] || lround=1
   # OVERLAP_FILES is single-quoted: the caller parses this block with `eval`, so an unquoted
   # multi-file value would execute the second path as a command. Single quotes are stripped from
   # paths for the same reason (they would close the quote).
@@ -234,9 +249,9 @@ cmd_prepare() {
   # and "your diff is 8 lines over the size cap" - and the second cost 74 minutes of dead clock
   # at the land gate on 2026-08-15 for a 408-line src/**+tests/** diff with ZERO denylist hits.
   # This reports the cause; it does NOT change the policy. risk=HIGH still stops for a human.
-  printf "CANDIDATE=%s\nTARGET=%s\nBASE=%s\nINTEGRATION=%s\nWORKTREE=%s\nRISK=%s\nRISK_REASONS='%s'\nSUITE=%s\nOVERLAP=%s\nOVERLAP_FILES='%s'\n" \
+  printf "CANDIDATE=%s\nTARGET=%s\nBASE=%s\nINTEGRATION=%s\nWORKTREE=%s\nRISK=%s\nRISK_REASONS='%s'\nSUITE=%s\nOVERLAP=%s\nOVERLAP_FILES='%s'\nLAND_ROUND=%s\n" \
     "$candidate" "$target" "$base" "$integ" "$wt" "$risk" "${RISK_REASONS:-}" "$suite_status" "$ovn" \
-    "$(printf '%s' "$ovf" | tr -d "'" | tr '\n' ' ')"
+    "$(printf '%s' "$ovf" | tr -d "'" | tr '\n' ' ')" "$lround"
 }
 
 # Re-read codex's OWN artifact; pass ONLY on a clean codex SHIP. Verdict = the LAST line beginning
@@ -445,6 +460,28 @@ eval "$out"                              # imports BASE/INTEGRATION/WORKTREE/RIS
 check "prepare RISK=LOW on benign src" "[ '$RISK' = LOW ]"
 check "worktree left in place" "[ -d '$WORKTREE' ]"
 check "target untouched by prepare" "[ \"$(git rev-parse main)\" = '$main' ]"
+
+# 1a. LAND_ROUND counts per CANDIDATE across preparations, and does not bleed between branches.
+# Pins the number the land SKILL's round cap reads; without it the cap is hand-counted from
+# verify.log, which is how `land` ran 11 uncapped rounds on one branch.
+# Self-contained: its own branches, its own worktrees, and it re-evals case 1's output at the end
+# so the vars later cases consume (WORKTREE/INTEGRATION) are exactly as case 1 left them.
+check "LAND_ROUND=1 on a first prepare" "[ '$LAND_ROUND' = 1 ]"
+git checkout -q -b session/lround "$main"
+echo "print('lr')" >> src/a.py; git commit -qam lr
+outA=$("$SELF" prepare session/lround main); LAND_ROUND=; eval "$outA"
+check "LAND_ROUND=1 for a fresh candidate" "[ '$LAND_ROUND' = 1 ]"
+"$SELF" abort "$WORKTREE" "selftest 1a" >/dev/null 2>&1
+outB=$("$SELF" prepare session/lround main); LAND_ROUND=; eval "$outB"
+check "LAND_ROUND=2 on a re-prepare of the same candidate" "[ '$LAND_ROUND' = 2 ]"
+"$SELF" abort "$WORKTREE" "selftest 1a" >/dev/null 2>&1
+git checkout -q -b session/lround-2 "$main"
+echo "print('lr2')" >> src/a.py; git commit -qam lr2
+outC=$("$SELF" prepare session/lround-2 main); LAND_ROUND=; eval "$outC"
+check "LAND_ROUND=1 for a sibling the other name PREFIXES" "[ '$LAND_ROUND' = 1 ]"
+"$SELF" abort "$WORKTREE" "selftest 1a" >/dev/null 2>&1
+git checkout -q main
+eval "$out"                              # restore case 1's WORKTREE/INTEGRATION for later cases
 
 # 1b. sensitive-path candidate -> RISK=HIGH
 git checkout -q -b session/sens "$main"

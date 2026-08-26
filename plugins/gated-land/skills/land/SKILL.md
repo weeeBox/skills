@@ -57,8 +57,18 @@ the vendored `${CLAUDE_PLUGIN_ROOT}/engine/risk_classify.py` (allowlist + denyli
   auto-resolve - hand to a human), `4`=suite red on the integration commit (the semantic-conflict
   catch), `5`=dirty/stale, `2`=usage. Do not proceed.
 - **Exit 0 →** capture the printed `BASE`, `INTEGRATION`, `WORKTREE`, `RISK`, `SUITE`, `OVERLAP`,
-  `OVERLAP_FILES`. The throwaway worktree is left in place holding the merged commit, for the gate and
-  the commit.
+  `OVERLAP_FILES`, `LAND_ROUND`. The throwaway worktree is left in place holding the merged commit,
+  for the gate and the commit.
+- **`LAND_ROUND` is this candidate's land-round count, and the cap is 3 - the same as `gate-loop`'s.**
+  At `LAND_ROUND` 4 do not dispatch another gate round: stop, surface the standing findings and the
+  count, and let a human decide. Rounds are counted per BRANCH, so a candidate that already capped
+  out at the branch gate arrives here with its budget spent - `land` is otherwise exactly the "open a
+  fresh loop to defeat the cap" rathole. Measured over 2026-08-04..26 (882 codex job records): 24 of
+  144 branches took 4+ land rounds and burned 133 of 335 land-gate jobs, `prd-home-manager` taking 11
+  and `tracks-ui-round2` 10 across 20h, each round a full re-prepare AND a whole suite. The counter
+  only reports - it refuses nothing, because a branch can legitimately reach a clean SHIP late
+  (`ingress-calendar-drops` did, at round 6); the judgement is yours, but make it deliberately
+  instead of by drift.
 - `SUITE` is `RAN` or `SKIPPED_DOCS_ONLY`. The skip fires only when **every** path in the
   integration diff ends `.md`/`.txt`/`.rst` - one code file, one unlisted extension, or an empty
   diff and the suite runs. State the value in the Step 4 report and in the reviewer prompt, so a
