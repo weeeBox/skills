@@ -166,6 +166,40 @@ def is_owed_turn(path):
     return False, "unrecognized last event type"
 
 
+SESSIONS_DIR = Path(os.path.expanduser("~/.claude/sessions"))
+
+
+def live_sessions():
+    """sessionId -> session record, for every Claude session whose pid is still alive.
+
+    The transcript alone cannot tell a LIVE wedged session from one the user simply stopped
+    returning to - the script's original docstring accepted that and named this correlation as
+    the upgrade path. Measured 2026-08-26: 124 of 124 sessions flagged by is_owed_turn() across
+    this machine's whole transcript corpus were dead, i.e. every banner the watchdog had ever
+    raised at rest was about a session nobody could unstick. A backstop with that hit rate is one
+    people learn to ignore, which is the opposite of what a catastrophic-failure poll is for.
+    """
+    out = {}
+    for f in SESSIONS_DIR.glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        pid, sid = d.get("pid"), d.get("sessionId")
+        if not (pid and sid):
+            continue
+        try:
+            os.kill(pid, 0)          # signal 0: existence check, sends nothing
+        except ProcessLookupError:
+            continue                 # gone
+        except PermissionError:
+            pass                     # alive, just not ours
+        except OSError:
+            continue
+        out[sid] = d
+    return out
+
+
 def _load_state():
     try:
         return json.loads(STATE_PATH.read_text())
@@ -180,15 +214,22 @@ def _save_state(state):
     os.replace(tmp, STATE_PATH)
 
 
-def scan():
-    """Print one line per newly-stuck session (not already notified for this exact
-    last-write instant) and persist the dedup state. A session still stuck on a later run
-    with no new writes (same mtime) is silently skipped - one notification per stuck
-    instance, not one per poll."""
+def scan(live=None):
+    """STDOUT = the notification channel: only sessions that are still ALIVE and owed a turn,
+    i.e. wedges a human can actually walk over and unstick. STDERR = the log line for a
+    dead/abandoned session that is owed - real, but nobody can act on it, so it must not spend
+    the notification channel.
+
+    Dedup differs by liveness, deliberately. A dead session is announced ONCE ever (its mtime
+    never changes again). A LIVE wedge re-announces on EVERY scan for as long as it stays wedged:
+    a frozen mtime is the signal, not a reason to fall silent, and going quiet after one banner
+    is how an 8-hour stall survives a backstop that already fired. It self-clears the moment the
+    session writes anything, because the mtime moves and it stops being a candidate."""
     now = time.time()
+    live = live_sessions() if live is None else live
     state = _load_state()
     new_state = {}
-    flagged = []
+    flagged, dead = [], []
     for path, age in candidates(now):
         key = str(path)
         mtime = path.stat().st_mtime
@@ -196,10 +237,17 @@ def scan():
         if not owed:
             continue
         new_state[key] = mtime  # keep only currently-candidate, currently-owed entries
+        if path.stem in live:
+            sess = live[path.stem]
+            flagged.append(f"LIVE {sess.get('name') or path.stem} (pid {sess.get('pid')}) "
+                           f"stale {int(age / 60)}m: {reason}")
+            continue
         if state.get(key) == mtime:
-            continue  # already notified for this exact stuck instance
-        flagged.append(f"{path.parent.name}/{path.stem} stale {int(age/60)}m: {reason}")
+            continue  # dead + already announced for this exact stuck instance
+        dead.append(f"{path.parent.name}/{path.stem} stale {int(age/60)}m (not live): {reason}")
     _save_state(new_state)
+    for line in dead:
+        print(line, file=sys.stderr)
     for line in flagged:
         print(line)
     return flagged
@@ -354,16 +402,52 @@ def selftest():
         global STATE_PATH
         orig_state_path = STATE_PATH
         STATE_PATH = ss.REPORTS / "work" / "watchdog-state.json"
+        import contextlib, io
+
+        def scan_dead():
+            """scan() with no live sessions -> nothing on the notify channel; the line, if any,
+            lands on stderr."""
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                flagged = scan(live={})
+            assert flagged == [], flagged   # a dead session never spends the notify channel
+            return buf.getvalue().strip().splitlines()
+
         try:
-            first = scan()
-            assert len(first) == 1 and "stuck" in first[0], first
-            second = scan()   # same mtime, still stuck -> suppressed, not re-flagged
+            # --- dead + owed: logged once, never notified ---
+            first = scan_dead()
+            assert len(first) == 1 and "stuck" in first[0] and "not live" in first[0], first
+            second = scan_dead()   # same mtime, still stuck -> suppressed, not re-logged
             assert second == [], second
             # a DIFFERENT (still-stale) mtime simulates a new event that itself later went
-            # stale again - a distinct stuck instance, so it must re-flag
+            # stale again - a distinct stuck instance, so it must re-log
             os.utime(stuck, (now2 - 4000, now2 - 4000))
-            third = scan()
+            third = scan_dead()
             assert len(third) == 1, third
+
+            # --- LIVE + owed: notified on EVERY scan, dedup deliberately does not apply.
+            # This is the ce8656e6 case: mtime frozen for 8h, so "announce once" == silence.
+            alive = {"stuck": {"pid": 4242, "name": "Memory fixes", "status": "idle"}}
+            runs = [scan(live=alive) for _ in range(3)]
+            assert all(len(r) == 1 for r in runs), runs
+            assert all("LIVE" in r[0] and "Memory fixes" in r[0] and "pid 4242" in r[0]
+                       for r in runs), runs
+
+            # --- live_sessions() only counts a pid that actually exists ---
+            with tempfile.TemporaryDirectory() as sd:
+                global SESSIONS_DIR
+                orig_sessions = SESSIONS_DIR
+                SESSIONS_DIR = Path(sd)
+                try:
+                    (Path(sd) / "me.json").write_text(json.dumps(
+                        {"pid": os.getpid(), "sessionId": "mine"}))
+                    (Path(sd) / "gone.json").write_text(json.dumps(
+                        {"pid": 2 ** 22, "sessionId": "gone"}))   # far above pid_max
+                    (Path(sd) / "junk.json").write_text("{not json")
+                    found = live_sessions()
+                finally:
+                    SESSIONS_DIR = orig_sessions
+                assert set(found) == {"mine"}, found
         finally:
             ss.PROJECTS, ss.REPORTS = orig_projects, orig_reports
             STATE_PATH = orig_state_path
