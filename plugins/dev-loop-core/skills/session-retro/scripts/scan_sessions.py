@@ -188,6 +188,18 @@ def merge_intervals(iv):
 READ_ONLY_CMD_RE = re.compile(
     r"(?i)^\s*(?:grep|sed|cat|head|tail|less|nl|find|ls|wc|awk|diff|rg)\b")
 
+# The same "merely mentions a gate" exclusion, applied to the Agent arm. An SDD implementer or
+# an Explore/audit subagent routinely carries gate vocabulary in its BRIEF ("when green, run
+# gate-loop", "analyze the gating regime") without dispatching a gate, and the whole lane -
+# dispatch to completion notification - was then charged to gate_wait_secs. Measured over every
+# transcript in ~/.claude/projects on 2026-08-26: 150 Agent calls counted as gate calls, of
+# which 97 are real (codex:codex-rescue 96, agy:agy-rescue 1) and 53 are not (sdd-implementer
+# 30, explore-readonly 18, general-purpose 5) - a 35% false-positive rate on this arm. It
+# produced the single largest artifact of the error: 3ece6495 on 2026-08-25 reported
+# max_gate_wait_secs=3803.7 ("a 63-minute gate round"), which was in fact one sdd-implementer
+# lane (W0-J) running for 63 minutes - productive parallel work, not gate cost.
+AGENT_GATE_TYPE_RE = re.compile(r"(?i)codex|agy")
+
 
 def is_gate_call(name, input_json):
     """True iff a tool call is a codex/agy gate dispatch/poll: a job-dispatcher tool (GATE_TOOLS)
@@ -203,6 +215,13 @@ def is_gate_call(name, input_json):
         except (json.JSONDecodeError, AttributeError):
             cmd = ""
         if READ_ONLY_CMD_RE.match(cmd):
+            return False
+    if name == "Agent":
+        try:
+            sub = json.loads(input_json).get("subagent_type", "") or ""
+        except (json.JSONDecodeError, AttributeError):
+            sub = ""
+        if not AGENT_GATE_TYPE_RE.search(sub):
             return False
     return True
 
@@ -1463,6 +1482,17 @@ def selftest():
     assert is_gate_call("Skill", '{"skill": "gated-land:gate-loop"}')
     assert is_gate_call("Bash", '{"command": "codex exec resume abc"}')
     assert is_gate_call("Agent", '{"subagent_type": "codex:codex-rescue", "prompt": "re-gate"}')
+    assert is_gate_call("Agent", '{"subagent_type": "agy:agy-rescue", "prompt": "review this"}')
+    # ...and an SDD/Explore/general subagent whose BRIEF merely mentions gate vocabulary is not a
+    # gate dispatch. Charging its whole lane to gate_wait_secs is what produced 3ece6495's
+    # "63-minute gate round" on 2026-08-25 (it was one sdd-implementer lane).
+    assert not is_gate_call("Agent",
+                            '{"subagent_type": "sdd-implementer", "prompt": "when green run gate-loop"}')
+    assert not is_gate_call("Agent",
+                            '{"subagent_type": "explore-readonly", "prompt": "analyze gate-loop cost"}')
+    assert not is_gate_call("Agent",
+                            '{"subagent_type": "general-purpose", "prompt": "audit codex exec config"}')
+    assert not is_gate_call("Agent", '{"prompt": "run lander.sh prepare"}')   # no subagent_type
     assert not is_gate_call("Bash", '{"command": "git status --short"}')
     # the tightening: a QUESTION / READ that only MENTIONS a gate must NOT count as gate time
     assert not is_gate_call("AskUserQuestion",
