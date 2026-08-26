@@ -262,12 +262,39 @@ cmd_prepare() {
 # Each round narrowed the grammar and the next found another encoding. A fail-closed release interlock
 # should not parse free-form prose - the false NEGATIVE it produces costs an override; every fix for
 # it so far has produced a fail-OPEN, which is worse.
+# Say WHICH refusal this is. Does NOT widen what is accepted - the grammar below stays exactly as
+# narrow as it was, and only `VERDICT: SHIP` still returns 0. A bare exit code cannot distinguish
+# "codex reviewed this and said BLOCK" from "you dispatched through the wrong codex path and the
+# artifact is unreadable", and those need OPPOSITE responses: fix the code, versus re-dispatch and
+# touch nothing. Measured over 2026-08-04..26: 26 of 332 completed land gates (8%) produced an
+# unreadable artifact, 14 of those cost another full gate round (re-prepare + whole suite) on the
+# same branch, and at least 4 were APPROVALS this function had to refuse. `gate-blocklist-minimal`
+# re-dispatched the identical wrong path 4 times in 32 minutes on 2026-08-24 - the signature of a
+# caller that cannot see which failure it hit.
+_verdict_why() { printf 'lander: verdict refused - %s\n' "$1" >&2; }
+
 _verdict_ok() { # <codex_result_json>
   local cres="$1" craw cverd
-  [ -f "$cres" ] || return 1
-  craw="$("$PY" -c 'import json,sys,os;print(json.load(open(os.path.expanduser(sys.argv[1]),encoding="utf-8",errors="replace"))["result"].get("rawOutput",""))' "$cres" 2>/dev/null)" || return 1
+  [ -f "$cres" ] || { _verdict_why "no artifact at '$cres' - the gate never recorded a result"; return 1; }
+  craw="$("$PY" -c 'import json,sys,os;print(json.load(open(os.path.expanduser(sys.argv[1]),encoding="utf-8",errors="replace"))["result"].get("rawOutput",""))' "$cres" 2>/dev/null)" || { _verdict_why "artifact is not JSON with a .result.rawOutput - not a codex job record"; return 1; }
   cverd="$(printf '%s\n' "$craw" | tr -d '\r' | grep -E '^VERDICT:' | tail -1 | sed 's/^VERDICT:[[:space:]]*//' | grep -oE '^(SHIP-WITH-CHANGES|BLOCK|SHIP)$')"
-  [ "$cverd" = SHIP ] || return 1
+  if [ -z "$cverd" ]; then
+    # A 'VERDICT:' line IS present but its token is not one this grammar recognises (e.g. the
+    # tamper guard's own TAMPER). Say that, rather than "no VERDICT line" - a diagnostic that
+    # misdescribes the failure sends the caller to fix the wrong thing, which is the defect
+    # this whole block exists to close.
+    if printf '%s\n' "$craw" | tr -d '\r' | grep -qE '^VERDICT:'; then
+      _verdict_why "output carries a 'VERDICT:' line whose token is not SHIP / SHIP-WITH-CHANGES / BLOCK: $(printf '%s\n' "$craw" | tr -d '\r' | grep -E '^VERDICT:' | tail -1)"
+      return 1
+    fi
+    case "$craw" in
+      '{'*'"verdict"'*) _verdict_why "this is an ADVERSARIAL-REVIEW artifact, not a 'codex task' one - its verdict sits inside a JSON summary string, so nothing is anchored and even an 'approve' is refused here. RE-DISPATCH through 'codex task' (land SKILL Step 2). Do not edit code; do not set LANDER_VERDICT_OVERRIDE, which waives the REVIEWER and not the format" ;;
+      '') _verdict_why "the reviewer produced NO output - a dispatch or wedge failure, not a review. Re-dispatch" ;;
+      *) _verdict_why "no anchored 'VERDICT:' line in the output - the prompt must require it on its own line (land SKILL Step 2)" ;;
+    esac
+    return 1
+  fi
+  [ "$cverd" = SHIP ] || { _verdict_why "codex returned $cverd - a genuine non-SHIP. Fix the findings and re-gate"; return 1; }
   return 0
 }
 
