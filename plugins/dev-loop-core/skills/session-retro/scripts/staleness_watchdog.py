@@ -28,6 +28,7 @@ real tail-seek only if `scan` is ever observed to run long enough to matter.
 """
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -60,6 +61,30 @@ def candidates(now=None):
     return sorted(out, key=lambda x: -x[1])
 
 
+# A dispatch into an EXTERNAL queue (codex/agy `--background`) returns a job id immediately, so the
+# Bash call itself completes and the harness never owes a notification - the run_in_background test
+# below cannot see it. Session ce8656e6 (2026-08-26) lost 731 of 795 minutes to exactly this: four
+# land gates queued this way, every gate done in under 3 min, and is_owed_turn() classified all three
+# stalls as "ordinary end-of-turn, nothing left in flight" (replayed against the real transcript).
+# The companion is usually invoked through a shell var (`node "$CODEX" task --background`), so
+# matching only the literal filename misses most real dispatches - and most real read-backs.
+_CODEX = r"(?:codex-companion\.mjs|\$\{?CODEX\}?|\bagy\b)"
+EXTERNAL_DISPATCH_RE = re.compile(_CODEX + r"[^\n]*--background")
+# ...and it is resolved the moment the session goes and LOOKS: a status/result call, or a read of the
+# job record or the verdict it lands in. Any of those means the wait is being managed, not forgotten.
+EXTERNAL_READ_RE = re.compile(
+    _CODEX + r"[^\n]*\b(?:status|result|cancel)\b"
+    r"|/jobs/[\w.-]+\.json"
+    r"|land-verdicts"
+    r"|watch-bg-job\.sh"
+)
+
+
+def _command_text(block):
+    inp = block.get("input") or {}
+    return inp.get("command") or "" if isinstance(inp, dict) else ""
+
+
 def last_meaningful_event(path):
     """Scan the WHOLE file once: the last user/assistant row, every background-job
     dispatch (an Agent tool_use, or a Bash tool_use with run_in_background=True) and every
@@ -67,6 +92,7 @@ def last_meaningful_event(path):
     and its notification can be far apart, so this can't be tail-windowed."""
     dispatched_bg = set()
     notified = set()
+    external_pending = 0
     last = None
     for d in ss.iter_lines(path):
         t = d.get("type")
@@ -79,6 +105,12 @@ def last_meaningful_event(path):
                 is_bg = name == "Agent" or (name == "Bash" and inp.get("run_in_background") is True)
                 if is_bg and b.get("id"):
                     dispatched_bg.add(b["id"])
+                if name == "Bash":
+                    cmd = _command_text(b)
+                    if EXTERNAL_READ_RE.search(cmd):
+                        external_pending = 0  # the session went and looked - nothing forgotten
+                    elif EXTERNAL_DISPATCH_RE.search(cmd):
+                        external_pending += 1
         elif t == "user":
             raw = (d.get("message") or {}).get("content")
             raw_text = raw if isinstance(raw, str) else " ".join(
@@ -87,7 +119,7 @@ def last_meaningful_event(path):
                 notified.add(m.group(1))
         if t in ("user", "assistant"):
             last = d
-    return last, dispatched_bg, notified
+    return last, dispatched_bg, notified, external_pending
 
 
 def is_owed_turn(path):
@@ -96,6 +128,8 @@ def is_owed_turn(path):
       (a) last row is an assistant turn that dispatched a background job whose id never
           got a completion notification anywhere in the file (defef5a9's actual bug).
       (b) last row is a completion notification itself, with no assistant turn after it
+      (c) an external async job (codex/agy `--background`) was queued and never read back - the
+          harness owes no notification for these, so shape (a) is blind to them
 
     ponytail: from a static transcript file alone, a genuinely-wedged LIVE session and an
     old session the user simply stopped returning to (closed the terminal, started a new
@@ -112,13 +146,16 @@ def is_owed_turn(path):
           (the job finished but nothing ever picked it up).
     A plain trailing human message, or a dispatch that already got its notification and
     an assistant reply, is ordinary idle time - NOT flagged; that's most of a quiet day."""
-    last, dispatched_bg, notified = last_meaningful_event(path)
+    last, dispatched_bg, notified, external_pending = last_meaningful_event(path)
     if last is None:
         return False, "no user/assistant events"
     if last.get("type") == "assistant":
         unresolved = dispatched_bg - notified
         if unresolved:
             return True, f"{len(unresolved)} background dispatch(es) with no completion notification"
+        if external_pending:
+            return True, (f"{external_pending} external async dispatch(es) (codex/agy --background) "
+                          "queued and never read back")
         return False, "ordinary end-of-turn, nothing left in flight"
     if last.get("type") == "user":
         raw = (last.get("message") or {}).get("content")
@@ -238,6 +275,46 @@ def selftest():
     owed5, why5 = is_owed_turn(p5)
     assert not owed5, (owed5, why5)
     p5.unlink()
+
+    # (e) an external async dispatch (codex --background) queued and never read back -> owed.
+    # This is the ce8656e6 shape: a FOREGROUND Bash call, so (a) is blind to it.
+    gate = ('CODEX=$(ls ~/.claude/plugins/cache/openai-codex/codex/*/scripts/codex-companion.mjs '
+            '| sort -V | tail -1) && node "$CODEX" task --background --cwd /wt --prompt-file /p.md')
+    p6 = write([
+        ev("assistant", 0, message={"content": [
+            {"type": "tool_use", "name": "Bash", "id": "b1", "input": {"command": gate}}]}),
+        ev("assistant", 1, message={"content": [{"type": "text", "text": "Dispatched. Waiting."}]}),
+    ])
+    owed6, why6 = is_owed_turn(p6)
+    assert owed6 and "external async dispatch" in why6, (owed6, why6)
+    p6.unlink()
+
+    # (f) same dispatch, but the session went and read the job back -> not owed
+    p7 = write([
+        ev("assistant", 0, message={"content": [
+            {"type": "tool_use", "name": "Bash", "id": "b1", "input": {"command": gate}}]}),
+        ev("assistant", 1, message={"content": [
+            {"type": "tool_use", "name": "Bash", "id": "b2",
+             "input": {"command": 'node "$CODEX" status --all --json'}}]}),
+    ])
+    owed7, why7 = is_owed_turn(p7)
+    assert not owed7, (owed7, why7)
+    p7.unlink()
+
+    # (g) a foreground dispatch WITHOUT --background (the fixed land-gate shape) -> not owed;
+    # the harness owes a real notification for it, so shape (a) covers it and (e) must not fire.
+    p8 = write([
+        ev("assistant", 0, message={"content": [
+            {"type": "tool_use", "name": "Bash", "id": "b1",
+             "input": {"command": 'timeout 1800 node "$CODEX" task --cwd /wt --prompt-file /p.md',
+                       "run_in_background": True}}]}),
+        ev("user", 100, message={"content": ("<task-notification>\n<task-id>j9</task-id>\n"
+                                             "<tool-use-id>b1</tool-use-id>\n</task-notification>")}),
+        ev("assistant", 101, message={"content": [{"type": "text", "text": "verdict in"}]}),
+    ])
+    owed8, why8 = is_owed_turn(p8)
+    assert not owed8, (owed8, why8)
+    p8.unlink()
 
     # --- candidates(): mtime stat filter ---
     with tempfile.TemporaryDirectory() as td:

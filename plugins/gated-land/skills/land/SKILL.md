@@ -132,9 +132,31 @@ CODEX="$(ls ~/.claude/plugins/cache/openai-codex/codex/*/scripts/codex-companion
 # shell when passed inline, which silently deletes words from the review request.
 # $PROMPT_FILE MUST BE ABSOLUTE: the companion resolves it with path.resolve(cwd, ...), i.e. against
 # --cwd, so a path relative to your own directory silently resolves inside $WORKTREE and fails.
-node "$CODEX" task --background --cwd "$WORKTREE" --prompt-file "$PROMPT_FILE"
+timeout 1800 node "$CODEX" task --cwd "$WORKTREE" --prompt-file "$PROMPT_FILE"
 ```
 
+- **Send this with the Bash tool's `run_in_background: true`, and do NOT pass codex's own
+  `--background`.** They are not the same thing and picking the wrong one costs hours.
+  `--background` enqueues the job and returns a task id *immediately*, so the Bash call has already
+  completed and the harness has no pending job to notify you about: you end the turn saying
+  "waiting", and nothing ever wakes you. Measured 2026-08-26 in session
+  `ce8656e6`/`session_01KLjuE2gLeavxWK5nGHZKCX`: four land gates dispatched this way, every gate
+  finished in 0.3-2.9 min, and the session sat idle 126m / 486m / 72m / 48m - 731 of 795 session
+  minutes, 92% - until a human typed "are you stuck?". Without `--background` the companion runs the
+  task in the foreground and exits when the verdict is in, so `run_in_background: true` makes the
+  job's completion the Bash call's completion and the harness's own notification fires.
+- `timeout 1800` is the wedge ceiling (`~/.local/bin/timeout`; the perl `alarm` form if it is not on
+  PATH). A foreground run has no watchdog of its own, and a codex job CAN wedge forever - see the
+  `codex-jobs-can-wedge` memory. 30 min is ~10x the slowest gate measured above.
+- The foreground run writes the SAME job record the background one does (`status: completed`,
+  `result.rawOutput`), so Step 3's interlock is unchanged. Get its path from the companion rather
+  than globbing the state dir - `--cwd "$WORKTREE"` resolves the latest job for that workspace:
+  `lander.sh verdict` opens it as a FILE (`json.load(open(...))["result"]["rawOutput"]`), so
+  `$CODEX_RESULT_JSON` must be the record's PATH, not its id:
+  ```bash
+  JOB_ID="$(node "$CODEX" result --cwd "$WORKTREE" --json | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["job"]["id"])')"
+  CODEX_RESULT_JSON="$(find ~/.claude/plugins/data/codex-openai-codex/state -path '*/jobs/*' -name "$JOB_ID.json" | head -1)"
+  ```
 - `--cwd "$WORKTREE"` is what scopes the review to the merged commit. There is no `--base` on this
   path, so the PROMPT must tell codex to derive the diff itself: `git diff <BASE>...HEAD`.
 - **Preamble must match the task path:** this agent has **Bash only - no Read/Glob/Grep**. Never send
@@ -144,8 +166,6 @@ node "$CODEX" task --background --cwd "$WORKTREE" --prompt-file "$PROMPT_FILE"
 - **Require the anchored line explicitly**, as its own line: ask for
   `VERDICT: SHIP` / `VERDICT: SHIP-WITH-CHANGES` / `VERDICT: BLOCK` and nothing else on that line.
   Trailing prose on the verdict line is refused by the interlock, by design.
-- Poll the job JSON's `result` for completion and arm the wedge watchdog, exactly as `review-gate`
-  does - do not hand-roll those mechanics.
 
 - agy: **N/A** (committed diff, no base option) - say so honestly, do not imply agy reviewed.
 - Collect codex's verdict (SHIP / SHIP-WITH-CHANGES / BLOCK). Do not fix findings here.
