@@ -1139,18 +1139,34 @@ def cmd_metrics(day):
 # Both shapes occur in the real ledger and the un-qualified regex dropped 31 of 41 otherwise-valid
 # lines, 11 of them "taken" (session-retro instrument audit, 2026-08-26). Rec ids may carry an
 # alpha suffix (#4a). Groups are NAMED because the drop-classification below needs the verb.
+# The dated `rec:<date>#<n>` form is tried FIRST so it keeps its own groups; the slug arm
+# catches `rec:<slug>` and `rule:<slug>` adoptions, which are real dispositions that the old
+# regex dropped as malformed (3) or that NON_DISPOSITION_RE's `\w+ rule:` arm absorbed as
+# prose (4). Measured 2026-08-27: 7 real dispositions of 176 never reached the digest.
+# `superseded` is a verb because the log already carries 3 such lines with real id->id links.
 LEDGER_RE = re.compile(
-    r"^- \[(?P<line_date>\d{4}-\d{2}-\d{2})\] (?P<verb>taken|rejected|deferred)"
+    r"^- \[(?P<line_date>\d{4}-\d{2}-\d{2})\] (?P<verb>taken|rejected|deferred|superseded)"
     r"(?: \([^)]*\))? "
-    r"rec:(?P<rec_date>\d{4}-\d{2}-\d{2})#\d+[a-z]?"
+    r"(?:rec:(?P<rec_date>\d{4}-\d{2}-\d{2})#(?P<rec_n>\d+[a-z]?)"
+    r"|(?P<kind>rec|rule):(?P<slug>[A-Za-z][A-Za-z0-9._-]*))"
     r"(?: \([^)]*\))? - \S.*$")
+
+
+def _ledger_rid(m):
+    """The rec id a matched ledger line disposes of. Dated form -> `<date>#<n>`; slug form ->
+    `<kind>:<slug>`, which has no report date and therefore no temporal-plausibility check."""
+    if m.group("rec_date"):
+        return f'{m.group("rec_date")}#{m.group("rec_n")}'
+    return f'{m.group("kind")}:{m.group("slug")}'
+
 
 # Lines that are deliberately NOT rec dispositions. They are recognised so they can be
 # counted as "known non-disposition" rather than silently swelling the malformed count -
 # a silent drop in the instrument that measures adoption is the defect this pass exists to fix.
+# Only FINDING/NOTE are deliberately-not-dispositions. The old second arm was `\w+ rule:`,
+# which matched `taken rule:` and `rejected rule:` and filed 4 real adoptions as prose.
 NON_DISPOSITION_RE = re.compile(
-    r"^- \[\d{4}-\d{2}-\d{2}\] (?:FINDING|NOTE)\b"
-    r"|^- \[\d{4}-\d{2}-\d{2}\] \w+ rule:")
+    r"^- \[\d{4}-\d{2}-\d{2}\] (?:FINDING|NOTE)\b")
 
 
 def ledger_drops():
@@ -1188,10 +1204,11 @@ def cmd_ledger(day):
         if not m:
             continue
         line_date, rec_date = m.group("line_date"), m.group("rec_date")
-        if rec_date >= day.isoformat():
-            continue  # rec id from this or a future report: cannot be settled yet
-        if line_date < rec_date:
-            continue  # acted on a recommendation before its report existed
+        if rec_date:   # slug ids carry no report date, so neither check applies to them
+            if rec_date >= day.isoformat():
+                continue  # rec id from this or a future report: cannot be settled yet
+            if line_date < rec_date:
+                continue  # acted on a recommendation before its report existed
         print(line)
 
 
@@ -1340,23 +1357,85 @@ def _taken_recs(day=None):
     taken = {}
     if not path.exists():
         return taken
+    # Two passes. The old single pass kept min(taken) and never looked at any other verb, so a
+    # LATER `rejected`/`deferred` could not retract an earlier `taken` and the rec kept counting
+    # toward eff_holding. Measured 2026-08-27: 21 ids carry conflicting verbs and 2 are genuinely
+    # taken-then-reversed (2026-08-20#7, 2026-08-17#3).
+    per_rid = {}
     for line in path.read_text().splitlines():
         m = LEDGER_RE.match(line)
-        if not m or m.group("verb") != "taken":
+        if not m:
             continue
         line_date, rec_date = m.group("line_date"), m.group("rec_date")
         if day is not None and line_date > day.isoformat():
             continue  # written after the date being reconstructed
         try:
-            date.fromisoformat(line_date); date.fromisoformat(rec_date)
+            date.fromisoformat(line_date)
+            if rec_date:
+                date.fromisoformat(rec_date)
         except ValueError:
             continue  # non-calendar date in the (model-written) actions-log -> skip, never crash
-        if line_date < rec_date:
+        if rec_date and line_date < rec_date:
             continue  # acted before the report existed (see cmd_ledger)
-        rid = re.search(r"rec:(\d{4}-\d{2}-\d{2}#\d+[a-z]?)", line).group(1)  # LEDGER_RE matched
-        if rid not in taken or line_date < taken[rid]:
-            taken[rid] = line_date
+        if not rec_date:
+            # A slug id (`rec:<slug>`, `rule:<slug>`) has no report and therefore no entry in
+            # recs.jsonl, so it can never recur and would sit in the digest as permanently
+            # un-judgeable `holding`, inflating the denominator with rows that cannot move.
+            # It is still PARSED - cmd_ledger shows it to the model and ledger_drops stops
+            # counting it as malformed - which is the visibility the widening was for.
+            continue
+        per_rid.setdefault(_ledger_rid(m), []).append((line_date, m.group("verb")))
+    for rid, entries in per_rid.items():
+        entries.sort()
+        if entries[-1][1] != "taken":
+            continue  # latest disposition retracts: not taken as of `day`
+        taken[rid] = min(d for d, v in entries if v == "taken")
     return taken
+
+
+RID_REF_RE = re.compile(r"rec:(\d{4}-\d{2}-\d{2}#\d+[a-z]?)")
+
+
+def _cluster_recs(hist):
+    """rec-id -> canonical (oldest) id of its restatement cluster.
+
+    Recurrence used to require the writer to voluntarily re-use an OLD id, which the reduce
+    template makes nearly impossible: it mints `<today>#<n>`, so a re-derived finding always
+    got a fresh id and the digest scored it `holding`. Measured 2026-08-27: only 12 of 181 ids
+    ever appear on more than one report date, `recurred-after-fix` had fired 4 times in the
+    corpus's whole history, and 19 recs (10.5%, LOWER BOUND - the maintainers' own figure is
+    15.5%) name an older rec inside their own text while carrying a new id.
+
+    Those backrefs are the edges. They are the WRITER's explicit assertions, already stored in
+    `summary` and `dedup` and - until now - never read. No threshold, no similarity score:
+    content clustering was measured dead on this corpus (exact hash CAUGHT 0 of 106; Jaccard
+    peaked at 12 of 106 with 43 false merges, and two members of the same 22-day theme score
+    J=0.000 because summaries are capped at 120 chars)."""
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)   # oldest id is the canonical root
+
+    for r in hist:
+        for rec in r["recs"]:
+            rid = rec.get("id")
+            if not isinstance(rid, str):
+                continue
+            find(rid)
+            text = f'{rec.get("summary") or ""} {rec.get("dedup") or ""}'
+            for ref in RID_REF_RE.findall(text):
+                if ref != rid:
+                    union(rid, ref)
+    return {x: find(x) for x in parent}
 
 
 def effectiveness_lines(day):
@@ -1378,21 +1457,30 @@ def effectiveness_lines(day):
                 if isinstance(sm, str) and sm:
                     summ[rid] = _sanitize_summary(sm)
     seen = {rid: sorted(dates) for rid, dates in seen.items()}
+    # Restatement clusters: a fix's recurrence is any CLUSTER member reappearing, not just the
+    # same id string. Without this the digest measures the writer's citation discipline.
+    cluster = _cluster_recs(hist)
+    cseen = {}
+    for rid, dates in seen.items():
+        cseen.setdefault(cluster.get(rid, rid), set()).update(dates)
 
     def label(rid):
         return f' "{summ[rid]}"' if rid in summ else ""
 
     out = []
     for rid, tdate in sorted(_taken_recs(day).items()):
-        after = [dd for dd in seen.get(rid, []) if dd > tdate]
+        root = cluster.get(rid, rid)
+        dates = sorted(cseen.get(root, set())) or seen.get(rid, [])
+        via = "" if len(dates) == len(seen.get(rid, [])) else " via:cluster"
+        after = [dd for dd in dates if dd > tdate]
         if after:
             status, last = "recurred-after-fix", after[-1]
         else:
             days_since = (day - date.fromisoformat(tdate)).days
             status = "too-soon" if days_since < TOO_SOON_DAYS else "holding"
-            last = seen.get(rid, ["none"])[-1] if seen.get(rid) else "none"
+            last = dates[-1] if dates else "none"
         out.append(f"EFFECTIVENESS rec:{rid} taken:{tdate} status:{status} "
-                   f"last_seen:{last} seen_count:{len(seen.get(rid, []))}{label(rid)}")
+                   f"last_seen:{last} seen_count:{len(dates)}{via}{label(rid)}")
     cutoff = (day - timedelta(days=CHRONIC_WINDOW)).isoformat()
     for rid in sorted(seen):
         in_window = [dd for dd in seen[rid] if dd >= cutoff]
@@ -2246,9 +2334,48 @@ def selftest():
             "- [2026-07-09] FINDING (not a rec) - a note, not a disposition\n"
             "- [2026-07-09] NOTE rec:2026-07-08#1 - also not a disposition\n"
             "- [2026-07-09] taken rule:some-slug - a different id namespace\n"
+            "- [2026-07-09] considered rule:some-other - a `rule:` line with no real verb\n"
             "- [2026-07-09] garbled line with no shape at all\n")
         malformed, non_disp = ledger_drops()
-        assert (malformed, non_disp) == (1, 3), (malformed, non_disp)
+        # `taken rule:<slug>` is a REAL disposition, so it is parsed rather than filed as
+        # prose: non_disp drops 3 -> 2. Asserted positively too, because the count alone is
+        # also satisfied by a regex that merely stops recognising the line at all.
+        # 2 malformed: the garbled line, and `considered rule:` - a non-verb, which the old
+        # `\w+ rule:` arm filed as benign prose. Anything carrying a rule id but no valid verb
+        # is malformed, not a deliberate non-disposition.
+        assert (malformed, non_disp) == (2, 2), (malformed, non_disp)
+        # the `rule:` line PARSES (so it is not malformed, and cmd_ledger shows it) but is not
+        # judged: it has no recs.jsonl entry, so a status for it could never be anything but
+        # a permanent `holding`.
+        assert set(_taken_recs()) == {"2026-07-08#1"}, _taken_recs()
+        assert LEDGER_RE.match("- [2026-07-09] taken rule:some-slug - a different id namespace")
+
+        # --- slug rec ids parse, and a bare date still does not ----------------------
+        for good, rid in (
+            ("- [2026-08-27] taken rec:loop-detection-latency - slug id, no report date", "rec:loop-detection-latency"),
+            ("- [2026-08-26] rejected rule:bash-command-shape-hook - a rule adoption", "rule:bash-command-shape-hook"),
+            ("- [2026-08-26] superseded rec:2026-08-15#4 - subsumed by a later rec", "2026-08-15#4"),
+        ):
+            m = LEDGER_RE.match(good)
+            assert m, good
+            assert _ledger_rid(m) == rid, (good, _ledger_rid(m))
+
+        # --- a LATER non-taken verb retracts an earlier taken -------------------------
+        (REPORTS / "actions-log.md").write_text(
+            "- [2026-07-10] taken rec:2026-07-08#1 - adopted\n"
+            "- [2026-07-12] rejected rec:2026-07-08#1 - reverted after measuring\n"
+            "- [2026-07-10] taken rec:2026-07-08#2 - adopted and kept\n")
+        assert set(_taken_recs()) == {"2026-07-08#2"}, _taken_recs()
+
+        # --- restatement clusters: recurrence follows the writer's own backref --------
+        hist = [
+            {"report_date": "2026-07-08", "recs": [{"id": "2026-07-08#1", "summary": "the original finding", "dedup": ""}]},
+            {"report_date": "2026-07-20", "recs": [{"id": "2026-07-20#3", "summary": "REPEAT of rec:2026-07-08#1", "dedup": ""}]},
+            {"report_date": "2026-07-21", "recs": [{"id": "2026-07-21#9", "summary": "unrelated", "dedup": ""}]},
+        ]
+        cl = _cluster_recs(hist)
+        assert cl["2026-07-20#3"] == "2026-07-08#1", cl   # newer id folds into the older
+        assert cl["2026-07-21#9"] == "2026-07-21#9", cl   # no backref -> its own cluster
 
         # --- _taken_recs is bounded by `day`, which is what makes a backfill honest ----
         (REPORTS / "actions-log.md").write_text(
