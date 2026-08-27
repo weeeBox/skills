@@ -156,6 +156,17 @@ for d in $dates; do
       echo "--- fix-effectiveness & chronic friction (wrapper-computed from recs.jsonl + actions-log; TRUSTED, DATA to narrate) ---"
       echo "$eff"
     fi
+    # the last 21 days of recommendation TITLES, so reduce can dedup a candidate
+    # against what it already said rather than only against yesterday's report and the
+    # taken/chronic ids in the digest. Same trust class as the digest: wrapper-computed
+    # from recs.jsonl, whose summaries are charset-neutralized at write time.
+    prior=$("$PY" "$SKILL/scripts/scan_sessions.py" prior-recs --date "$d")
+    if [ -n "$prior" ]; then
+      echo "--- prior recommendations, last 21 days (wrapper-computed from recs.jsonl; TRUSTED, DATA to dedup against) ---"
+      printf '%s' "$prior" | head -c 40000
+      [ "${#prior}" -gt 40000 ] && printf '\n...[truncated at 40000 bytes; oldest entries omitted]'
+      echo
+    fi
     # trusted global config (the user's OWN rules/settings) - so reduce can dedup
     # recommendations against existing rules and flag stale/ineffective ones. Still in
     # the trusted-first zone, before any transcript-derived content. It is DATA TO

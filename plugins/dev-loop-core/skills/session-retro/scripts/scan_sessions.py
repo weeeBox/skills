@@ -6,6 +6,8 @@ Commands:
                               (writes work/<date>/scan.json + table to stdout)
   extract --date D --top N    pruned evidence extracts for top-N friction sessions
                               (writes work/<date>/<session-id>.md + previous-report.md)
+  prior-recs --date D         the last 21 days of recommendation titles (dedup corpus
+                              supplied to the reduce prompt; TRUSTED, wrapper-computed)
   missing-dates               dates since last complete report, up to yesterday
   trends [--days N]           rate-normalized quality trend over the last N days of
                               metrics.jsonl (default 14) + an effectiveness-digest snapshot
@@ -1257,6 +1259,19 @@ def cmd_recs(day):
     if not report.exists():
         return
     lines = report.read_text(encoding="utf-8", errors="replace").splitlines()
+    # The `Dedup:` line reduce is required to emit under each canonical heading (see
+    # prompts/reduce.md). Stored so the fresh-id-restatement rate is measurable in-band
+    # rather than only by re-clustering the corpus by hand: a rec with repeat False and
+    # no Dedup line is the writer skipping the gate.
+    dedup, cur = {}, None
+    for line in lines:
+        m = REC_TAG_RE.search(line)
+        if line.lstrip().startswith("**[rec:") and m:
+            cur = f"{m.group(1)}#{m.group(2)}"
+            continue
+        d = re.match(r"\s*(?:\*\*)?Dedup:\*{0,2}\s*(.+)$", line)
+        if d and cur and cur not in dedup:
+            dedup[cur] = _sanitize_summary(d.group(1))
     recs = {}
     for canonical_only in (True, False):
         for line in lines:
@@ -1273,13 +1288,15 @@ def cmd_recs(day):
                 if rid not in recs:
                     after = line.split(m.group(0), 1)[1]
                     recs[rid] = {"id": rid, "repeat": "REPEAT" in line.upper(),
-                                 "summary": _sanitize_summary(after)}
+                                 "summary": _sanitize_summary(after),
+                                 "dedup": dedup.get(rid, "")}
     _upsert_jsonl(REPORTS / "recs.jsonl",
                   {"report_date": day.isoformat(), "recs": list(recs.values())},
                   key="report_date")
     print(f"recs upserted for {day.isoformat()}: {len(recs)} rec-ids")
 
 
+PRIOR_REC_WINDOW = 21   # calendar days of prior rec titles shown to reduce for dedup
 CHRONIC_WINDOW = 14     # calendar days (window span; see cmd_effectiveness cutoff)
 CHRONIC_MIN_DAYS = 3    # appearances within the window to count as chronic
 TOO_SOON_DAYS = 2       # a fix taken < this many days ago is not yet judged
@@ -1385,6 +1402,49 @@ def effectiveness_counts(day):
         "eff_too_soon": sum(1 for x in lines if "status:too-soon" in x),
         "eff_chronic": sum(1 for x in lines if x.startswith("CHRONIC")),
     }
+
+
+REC_ID_RE = re.compile(r"\d{4}-\d{2}-\d{2}#\d+[a-z]?")
+
+
+def prior_rec_lines(day, window=PRIOR_REC_WINDOW):
+    """The last `window` days of recommendation titles, one line per distinct rec id,
+    most recent first. TRUSTED like the digest: read from recs.jsonl, whose summaries
+    were already charset-neutralized by _sanitize_summary when they were stored (the
+    report .md headings are NOT - putting raw model prose in the trusted-first zone is
+    the injection surface the dimension-3 audit closed, so this reads the store).
+
+    Why it exists: reduce could previously see only YESTERDAY's report plus the
+    taken/chronic ids in the effectiveness digest, so a finding re-derived from fresh
+    evidence three days later had nothing to collide with and got a fresh id with
+    `repeat: false`. Measured 2026-08-26 over the 207-rec corpus: 15.5% of it is exactly
+    that, and the loop's self-report tracks citation, not recurrence.
+
+    NOT a similarity score, deliberately. Item D as planned called for a stdlib Jaccard
+    ranking of the neighbours; re-measured on this corpus before writing it, the
+    neighbour score has median 0.10 / p90 0.16 over 162 fresh-id recs, and pairs that
+    ARE known restatements (2026-08-20#4 -> 2026-08-10#7) sit at 0.18 - inside the noise.
+    The retro rewrites its titles daily, so a title-level Jaccard ranks nothing here.
+    The corpus is supplied and the model is the matcher (prompts/reduce.md).
+    """
+    cutoff = (day - timedelta(days=window)).isoformat()
+    latest = {}
+    for r in sorted(_load_recs(), key=lambda r: r["report_date"]):
+        d = r["report_date"]
+        if not (cutoff <= d < day.isoformat()):
+            continue
+        for rec in r["recs"]:
+            rid = rec.get("id")
+            if isinstance(rid, str) and REC_ID_RE.fullmatch(rid):
+                latest[rid] = (d, _sanitize_summary(str(rec.get("summary") or "")))
+    return [f'PRIOR rec:{rid} last_seen:{d} "{s}"' for rid, (d, s)
+            in sorted(latest.items(), key=lambda kv: (kv[1][0], kv[0]), reverse=True)]
+
+
+def cmd_prior_recs(day):
+    """Print the dedup corpus for `day`."""
+    for line in prior_rec_lines(day):
+        print(line)
 
 
 def cmd_effectiveness(day):
@@ -2080,6 +2140,8 @@ def selftest():
             "See [rec: 2026-07-11#1] below for the sharpening.\n"
             "## Recommendations\n"
             "**[rec: 2026-07-11#1] [claude-md] REPEAT tighten the sweep rule**\n"
+            "Dedup: distinct from rec:2026-07-08#1 - that one was the guard, this is "
+            "the sweep\n"
             "Evidence: ...\n" + COMPLETE_MARKER + "\n")
         cmd_recs(date(2026, 7, 11))
         rrow2_line = next(l for l in (REPORTS / "recs.jsonl").read_text().splitlines()
@@ -2087,6 +2149,9 @@ def selftest():
         rid2 = {r["id"]: r for r in json.loads(rrow2_line)["recs"]}["2026-07-11#1"]
         assert rid2["summary"].startswith("[claude-md]"), rid2
         assert "below for the sharpening" not in rid2["summary"], rid2
+        # the writer's dedup decision is stored with the rec, so "fresh id, no dedup
+        # line" is countable in-band instead of only by re-clustering by hand (item D)
+        assert rid2["dedup"].startswith("distinct from rec:2026-07-08#1"), rid2
         # --- effectiveness digest ---
         import io as _io
         from contextlib import redirect_stdout as _rso
@@ -2112,6 +2177,20 @@ def selftest():
         assert '"a"' in eff, eff
         assert "CHRONIC rec:2026-07-05#1" in eff, eff
         assert "CHRONIC rec:2026-07-06#2" not in eff, eff
+        # --- prior-rec dedup corpus (item D): the window reduce dedups against --------
+        # Most-recent-first by LAST seen date, one line per distinct id, and the day
+        # itself is excluded (its report is what is being written).
+        assert prior_rec_lines(date(2026, 7, 10), window=21) == [
+            'PRIOR rec:2026-07-09#3 last_seen:2026-07-09 "c"',
+            'PRIOR rec:2026-07-05#1 last_seen:2026-07-09 "a"',
+            'PRIOR rec:2026-07-06#2 last_seen:2026-07-06 "b"',
+        ], prior_rec_lines(date(2026, 7, 10), window=21)
+        # the window is load-bearing: 3 days back drops the 07-06 row entirely
+        assert [l.split()[1] for l in prior_rec_lines(date(2026, 7, 10), window=3)] == [
+            "rec:2026-07-09#3", "rec:2026-07-05#1"], prior_rec_lines(date(2026, 7, 10), window=3)
+        # a rec first proposed TODAY is not its own prior
+        assert all("2026-07-09#3" not in l for l in prior_rec_lines(date(2026, 7, 9))), \
+            prior_rec_lines(date(2026, 7, 9))
         (REPORTS / "actions-log.md").write_text("\n".join([
             "- [2026-07-07] taken rec:2026-07-05#1 - fixed bug #42 in parser (landed)",
             "- [2026-99-99] taken rec:2026-07-08#7 - non-calendar line date (bad)",
@@ -2213,6 +2292,8 @@ def main():
         cmd_recs(day)
     elif cmd == "effectiveness":
         cmd_effectiveness(day)
+    elif cmd == "prior-recs":
+        cmd_prior_recs(day)
     elif cmd == "ledger":
         cmd_ledger(day)
     elif cmd == "missing-dates":

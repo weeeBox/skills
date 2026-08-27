@@ -20,6 +20,18 @@ It also tracks recommendation recurrence across days (`recs.jsonl`) and reports,
 recommendation, whether the friction it targeted actually stopped ("Fix effectiveness &
 chronic friction"), so a fix that is not working surfaces instead of silently repeating.
 
+The reduce step is additionally given the **last 21 days of recommendation titles**
+(`scan_sessions.py prior-recs`, wrapper-computed from `recs.jsonl`, trusted-first zone) and
+must emit a `Dedup:` line under every recommendation citing the closest prior id. Without
+it reduce can only see yesterday's report plus the taken/chronic ids in the digest, so a
+finding re-derived from fresh evidence days later collides with nothing and gets a fresh id
+with `repeat: false`; measured 2026-08-26, **15.5% of the 207-rec corpus is exactly that**,
+which is why the self-report (24.6%) sits well under an independent clustering pass (37.2%).
+The corpus is supplied rather than a similarity SCORE deliberately: re-measured on that same
+corpus, the nearest-title Jaccard has median 0.10 / p90 0.16 over 162 fresh-id recs while
+known restatements sit at 0.18, so no threshold separates them - the report rewrites its own
+titles daily, and the model is the only matcher that works at same-theme granularity.
+
 Run it on demand (see **Manual invocation** below), or wire it to run every morning via a
 scheduler (macOS `launchd` / Linux `cron`) that calls `scripts/run_retro.sh` - see the repo
 README for an example LaunchAgent/cron entry. Everything is
