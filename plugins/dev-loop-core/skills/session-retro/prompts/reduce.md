@@ -56,9 +56,15 @@ Ledger matching rules - conservative, id-based ONLY:
   list such items as one-liners under "Previously rejected", citing the matched ledger
   line verbatim. Wording similarity alone NEVER suppresses - a novel recommendation
   always gets a new id and full ranking.
-- An id matching a `taken` line is not re-recommended; instead check the metrics
-  history and today's scan for its observed effect and report that under the relevant
-  friction pattern, citing the matched line.
+- An id matching a `taken` line is not re-recommended **unless its friction is present in
+  today's evidence**. If it is, re-emit it UNDER ITS ORIGINAL ID - that re-emission is the
+  only thing that can produce `recurred-after-fix`, and it is the single most valuable
+  output this report can carry. (Before 2026-08-27 this clause was unconditional, while the
+  digest could detect a failed fix only through exactly that re-emission: the one event
+  proving a fix had failed was the event this rule forbade. Measured consequence:
+  `recurred-after-fix` fired 4 times in the corpus's entire history.) Otherwise check the
+  metrics history and today's scan for its observed effect and report that under the
+  relevant friction pattern, citing the matched line.
 - `deferred` lines suppress nothing; a still-relevant deferred item may be
   re-recommended under its original id.
 
@@ -159,8 +165,17 @@ Report the wrapper-computed digest as facts, worst first:
   summary quoted at the end of its digest line, quote the `last_seen` date, and tie it to
   today's evidence if the pattern is present today. These outrank new recommendations - a
   fix that is not working is the highest-value finding.
-- `status:holding` = taken and no recurrence since; state it briefly as a win. `too-soon` =
-  taken too recently to judge; note and move on.
+- `status:holding` = taken and no recurrence *has been detected* since. State it in one
+  clause, and do NOT call it a win: `holding` is the weakest cell in the digest, because a
+  loop whose fixes all silently fail produces the same rising `holding` count as a loop whose
+  fixes all work. `too-soon` = taken too recently to judge; note and move on.
+- `via:cluster` on a line means the recurrence was found through a restatement cluster - the
+  rec was re-derived under a different id and its own text named the original. Treat it
+  exactly as a same-id recurrence; the clustering is built from the writer's own backrefs.
+- **A RISING `recurred-after-fix` count is the instrument improving, not the loop
+  degrading.** Clustering landed 2026-08-27 and moved the corpus figure 4 -> 14 in one step;
+  the prior 22-day run of zeroes was the digest being unable to see recurrence at all, not
+  an absence of it. Never open work to push this number back down.
 - Each `CHRONIC rec:<id>` = a pattern recurring across the window even if quiet on any single
   day; surface it with its span.
 If the digest is empty (early days, before recs.jsonl fills), write exactly one line:
