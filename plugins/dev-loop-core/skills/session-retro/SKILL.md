@@ -40,6 +40,26 @@ still hit it, and the second's last four entries are successive widenings of one
 The friction is still reported; only a MECHANISM (`tier: hook|script|test`, corpus-scored)
 or an explicit accept-as-known-open line is allowed as the response.
 
+reduce is also given the day's **repo & lander artifacts** (`scan_sessions.py
+day-artifacts`): per repo the day's sessions worked in, the merge/non-merge commit split,
+repeated identical commit subjects, and the `.claude/state/verify.log` verb histogram
+(`gateloop-block` / `-pass` / `-capout` / `-tamper`, `land-error`, `land-conflict`). It
+reports them under `## Repo & lander friction`. Every other input is a session TRANSCRIPT,
+so the loop could only ever see friction that surfaced as an agent-visible event: measured
+2026-08-26 against a ground truth built from these same two sources for one day, **merge
+churn and every lander `land-error`/`land-conflict` row were named in 0 of 207
+recommendations across all 30 reports**, while the classes that did surface in a transcript
+were all caught. A merge that succeeds is silent; a `land-error` row is written by the
+lander, not narrated.
+
+Repos are resolved from each transcript's own `cwd` field (not by decoding the dashed
+project-directory name, which is ambiguous for any path containing a dash), mapped to the
+PRIMARY checkout via `git worktree list` because a worktree has its own gitignored
+`.claude/state/`. git runs read-only with a FRESH env - no system or global config, no
+inherited `GIT_*`, no pager, no credential prompt - and only in a directory that already
+has a `.git`; a repo that is missing, locked or slow degrades this block rather than
+failing the day. The analysis calls still get no tools.
+
 The reduce step is additionally given the **last 21 days of recommendation titles**
 (`scan_sessions.py prior-recs`, wrapper-computed from `recs.jsonl`, trusted-first zone) and
 must emit a `Dedup:` line under every recommendation citing the closest prior id. Without

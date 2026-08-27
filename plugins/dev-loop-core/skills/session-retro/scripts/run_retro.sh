@@ -183,6 +183,17 @@ for d in $dates; do
       echo "--- fix-effectiveness & chronic friction (wrapper-computed from recs.jsonl + actions-log; TRUSTED, DATA to narrate) ---"
       echo "$eff"
     fi
+    # the day's repo/lander artifacts. Every other input here is a session TRANSCRIPT,
+    # so friction that never becomes an agent-visible event is invisible: measured
+    # 2026-08-26, merge churn and every lander land-error/land-conflict row were named in
+    # 0 of 207 recommendations across all 30 reports. Deterministic and read-only (git
+    # runs with a fresh env, no system/global config, and only in a directory that has a
+    # .git), so it belongs in the trusted-first zone with the rest.
+    arts=$("$PY" "$SKILL/scripts/scan_sessions.py" day-artifacts --date "$d")
+    if [ -n "$arts" ]; then
+      echo "--- repo & lander artifacts for $d (wrapper-computed from git log + .claude/state/verify.log; TRUSTED, DATA to narrate) ---"
+      printf '%s\n' "$arts" | head -c 8000
+    fi
     # the last 21 days of recommendation TITLES, so reduce can dedup a candidate
     # against what it already said rather than only against yesterday's report and the
     # taken/chronic ids in the digest. Same trust class as the digest: wrapper-computed

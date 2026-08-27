@@ -6,6 +6,9 @@ Commands:
                               (writes work/<date>/scan.json + table to stdout)
   extract --date D --top N    pruned evidence extracts for top-N friction sessions
                               (writes work/<date>/<session-id>.md + previous-report.md)
+  day-artifacts --date D      the day's repo/lander artifacts (commit split, repeated
+                              subjects, gate-log histogram) for the repos the day's
+                              sessions worked in - friction no transcript records
   prior-recs --date D         the last 21 days of recommendation titles (dedup corpus
                               supplied to the reduce prompt; TRUSTED, wrapper-computed)
   missing-dates               dates since last complete report, up to yesterday
@@ -1455,6 +1458,149 @@ def cmd_prior_recs(day):
         print(line)
 
 
+# --- the day's repo/lander artifacts -----------------------------------------------
+# Everything else this tool reads is a session TRANSCRIPT, so the loop can only see
+# friction that surfaced as an agent-visible event - an error, a stall, a retraction the
+# agent typed. Measured 2026-08-26 against a ground truth built from `git log` and
+# `.claude/state/verify.log` for one day: of six friction classes present that day, the
+# two recorded ONLY in repo/lander artifacts were named in 0 of 207 recommendations
+# across all 30 reports. A merge that succeeds is silent and a `land-error` row is
+# written by the lander, not narrated. This block is the missing channel.
+MAX_ARTIFACT_REPOS = 5
+MAX_REPEATED_SUBJECTS = 3
+MIN_REPEATED_SUBJECT = 2
+GIT_TIMEOUT_SECS = 20
+
+# git in a checkout this tool did not choose is configuration-sensitive, so it gets a
+# FRESH env rather than an edited copy of ours: no system/global config, no credential or
+# terminal prompt, no inherited GIT_* (an inherited GIT_DIR from a hook overrides `-C` and
+# has corrupted a caller's repo before). --no-pager for the same reason.
+GIT_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+           "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "", "HOME": "/nonexistent",
+           "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+
+
+def _git(root, *args):
+    """git stdout, or "" on any failure. Never raises: a repo that is missing, locked,
+    hostile or slow degrades this block, it does not fail the day's report."""
+    import subprocess
+    try:
+        r = subprocess.run(["git", "--no-pager", "-C", str(root), *args],
+                           capture_output=True, text=True, env=GIT_ENV,
+                           timeout=GIT_TIMEOUT_SECS)
+    except Exception:
+        return ""
+    return r.stdout if r.returncode == 0 else ""
+
+
+def _session_cwd(path, limit=50):
+    """The session's working directory, from the transcript's own `cwd` field. Prefer a
+    field the transcript already carries over decoding the dashed project-directory name,
+    which is ambiguous for any path containing a dash."""
+    for i, d in enumerate(iter_lines(path)):
+        if i >= limit:
+            break
+        cwd = d.get("cwd")
+        if isinstance(cwd, str) and cwd.startswith("/") and Path(cwd).is_dir():
+            return cwd
+    return None
+
+
+def _primary_checkout(cwd):
+    """The repo's PRIMARY checkout, or None if `cwd` is not in a git repo. A worktree
+    session's cwd has the same history but its own gitignored `.claude/state/`, so the
+    gate log lives in the primary; `git worktree list` names it first."""
+    if not (Path(cwd) / ".git").exists():
+        return None            # the .git-exists gate: never run git in a non-repo path
+    for line in _git(cwd, "worktree", "list", "--porcelain").splitlines():
+        if line.startswith("worktree "):
+            root = line[len("worktree "):].strip()
+            return root if Path(root).is_dir() else None
+    return None
+
+
+def _artifact_lines_from(name, log_text, verify_text, day):
+    """Pure formatter: (repo name, `git log` output, verify.log text) -> digest lines.
+    Split out from the gathering so the counting is testable without a real repo."""
+    import collections
+    out, subjects, merges, total = [], [], 0, 0
+    for line in log_text.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        parents, subject = parts
+        total += 1
+        if len(parents.split()) > 1:
+            merges += 1
+        # Repeated subjects are scanned over ALL commits, merges included. The thrash
+        # this is here to catch - five identical "regenerate metrics on the merged tree"
+        # inside one minute on 2026-08-25 - lands on MERGE commits, because that is what
+        # a lander produces. Restricting the scan to non-merges hid all five.
+        subjects.append(subject)
+    if total:
+        pct = round(100 * merges / total)
+        out.append(f"ARTIFACTS repo:{name} commits:{total} merges:{merges} "
+                   f"non_merges:{total - merges} merge_pct:{pct}")
+        for subj, n in collections.Counter(subjects).most_common(MAX_REPEATED_SUBJECTS):
+            if n >= MIN_REPEATED_SUBJECT:
+                out.append(f'ARTIFACTS repo:{name} repeated_subject:{n}x '
+                           f'"{_sanitize_summary(subj)}"')
+    verbs = collections.Counter()
+    for line in verify_text.splitlines():
+        f = line.split("\t")
+        if len(f) > 1 and f[0].startswith(day.isoformat()):
+            verbs[_sanitize_summary(f[1])[:40]] += 1
+    if verbs:
+        out.append(f"ARTIFACTS repo:{name} gatelog " +
+                   " ".join(f"{v}:{n}" for v, n in sorted(verbs.items())))
+    return out
+
+
+def day_artifact_lines(day):
+    """Deterministic per-repo artifact digest for `day` (TRUSTED, wrapper-computed).
+    Repos are the PRIMARY checkouts of the directories the day's own sessions worked in -
+    read from each transcript's `cwd`, gated on `.git` existing, capped at
+    MAX_ARTIFACT_REPOS."""
+    scan = REPORTS / "work" / day.isoformat() / "scan.json"
+    if not scan.exists():
+        return []
+    try:
+        sessions = json.loads(scan.read_text()).get("sessions", [])
+    except json.JSONDecodeError:
+        return []
+    roots = []
+    for s in sessions:
+        path = s.get("path")
+        if not isinstance(path, str) or not Path(path).exists():
+            continue
+        cwd = _session_cwd(Path(path))
+        root = _primary_checkout(cwd) if cwd else None
+        if root and root not in roots:
+            roots.append(root)
+        if len(roots) >= MAX_ARTIFACT_REPOS:
+            break
+    out = []
+    for root in sorted(roots):
+        log = _git(root, "log", f"--since={day.isoformat()}T00:00:00",
+                   f"--until={(day + timedelta(days=1)).isoformat()}T00:00:00",
+                   "--format=%p%x09%s")
+        verify = Path(root) / ".claude" / "state" / "verify.log"
+        vtext = ""
+        if verify.is_file():
+            try:
+                vtext = verify.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                pass
+        out += _artifact_lines_from(_sanitize_summary(Path(root).name), log, vtext, day)
+    return out
+
+
+def cmd_day_artifacts(day):
+    """Print the day's repo/lander artifact digest."""
+    for line in day_artifact_lines(day):
+        print(line)
+
+
 def cmd_effectiveness(day):
     """Print the deterministic fix-effectiveness digest for `day`."""
     for line in effectiveness_lines(day):
@@ -2196,6 +2342,53 @@ def selftest():
         # the window is load-bearing: 3 days back drops the 07-06 row entirely
         assert [l.split()[1] for l in prior_rec_lines(date(2026, 7, 10), window=3)] == [
             "rec:2026-07-09#3", "rec:2026-07-05#1"], prior_rec_lines(date(2026, 7, 10), window=3)
+        # --- day-artifacts (item H): the counting, without needing a real repo ---------
+        # `%p` (parent list) is the merge discriminator, not the subject prefix - a
+        # non-merge commit whose subject starts with "Merge" must not count as one.
+        log = "\n".join([
+            "aaa\tfix: real work",
+            "bbb ccc\tdocs: regenerate metrics on the merged tree",
+            "ddd eee\tdocs: regenerate metrics on the merged tree",
+            "fff\tdocs: regenerate metrics",
+            "ggg\tdocs: regenerate metrics",
+            "hhh\tMerge-sort the queue (NOT a merge commit: one parent)",
+            "malformed-line-with-no-tab",
+        ])
+        verify = "\n".join([
+            "2026-07-10T01:00:00Z\tgateloop-block\tabc\tdetail",
+            "2026-07-10T02:00:00Z\tgateloop-block\tabc\tdetail",
+            "2026-07-10T03:00:00Z\tland-error\tabc\tMERGE CONFLICT",
+            "2026-07-09T03:00:00Z\tgateloop-capout\tabc\tother day, must not count",
+            "not a verify line at all",
+        ])
+        al = _artifact_lines_from("myrepo", log, verify, date(2026, 7, 10))
+        assert al[0] == ("ARTIFACTS repo:myrepo commits:6 merges:2 non_merges:4 "
+                         "merge_pct:33"), al
+        # BOTH repeats are reported, and the merge-commit one is the point: on
+        # 2026-08-25 all five identical "regenerate metrics on the merged tree" commits
+        # were merges, so a non-merge-only scan reported zero repeated subjects.
+        assert sorted(al[1:3]) == [
+            'ARTIFACTS repo:myrepo repeated_subject:2x "docs: regenerate metrics on the '
+            'merged tree"',
+            'ARTIFACTS repo:myrepo repeated_subject:2x "docs: regenerate metrics"',
+        ], al
+        assert len(al) == 4, al          # 2 repeats + the split + the gate log; singletons dropped
+        assert al[3] == "ARTIFACTS repo:myrepo gatelog gateloop-block:2 land-error:1", al[3]
+        # empty in, empty out - a repo with no commits and no gate log emits nothing at all
+        assert _artifact_lines_from("myrepo", "", "", date(2026, 7, 10)) == []
+        # The .git gate must stop git from ever RUNNING in a path that is not a repo.
+        # Returning None is not enough - _primary_checkout returns None anyway when git
+        # errors, so only "the subprocess never happened" pins the gate.
+        _real_git, git_calls = _git, []
+        def _spy_git(root, *a):
+            git_calls.append(str(root))
+            return ""
+        globals()["_git"] = _spy_git
+        try:
+            assert _primary_checkout(str(REPORTS)) is None
+            assert git_calls == [], git_calls
+        finally:
+            globals()["_git"] = _real_git
         # a rec first proposed TODAY is not its own prior
         assert all("2026-07-09#3" not in l for l in prior_rec_lines(date(2026, 7, 9))), \
             prior_rec_lines(date(2026, 7, 9))
@@ -2302,6 +2495,8 @@ def main():
         cmd_effectiveness(day)
     elif cmd == "prior-recs":
         cmd_prior_recs(day)
+    elif cmd == "day-artifacts":
+        cmd_day_artifacts(day)
     elif cmd == "ledger":
         cmd_ledger(day)
     elif cmd == "missing-dates":
