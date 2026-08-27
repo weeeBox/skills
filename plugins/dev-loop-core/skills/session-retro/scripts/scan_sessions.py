@@ -989,6 +989,14 @@ def cmd_metrics(day):
     ch = line["coverage_hours"]
     line["tool_calls_per_hour"] = round(line["tool_calls"] / ch, 1) if ch else None
     line["errors_per_hour"] = round(line["errors"] / ch, 2) if ch else None
+    # The effectiveness digest, persisted so it has a history (see effectiveness_counts).
+    line.update(effectiveness_counts(day))
+    # How many actions-log lines the reader could not parse on this date. A silent drop in
+    # the instrument that measures adoption is exactly the defect this pair of fields exists
+    # to make visible; `ledger_non_disposition` is the KNOWN-benign half (FINDING/NOTE/rule:).
+    malformed, non_disp = ledger_drops()
+    line["ledger_malformed"] = malformed
+    line["ledger_non_disposition"] = non_disp
     _upsert_jsonl(REPORTS / "metrics.jsonl", line, key="date")
     print(f"metrics upserted for {line['date']} (coverage_hours={line['coverage_hours']})")
 
@@ -1000,9 +1008,42 @@ def cmd_metrics(day):
 # line marking rec:2026-08-14#7 itself as taken, which is why that rec stayed CHRONIC even
 # after landing (session-retro dimension-2 audit, 2026-08-20). A genuinely empty summary
 # (nothing after "- ") still fails to match.
+# A parenthetical QUALIFIER is allowed in both real positions - after the verb
+# ("deferred (never started) rec:...") and after the rec id ("taken rec:X (part 2 only) - ...").
+# Both shapes occur in the real ledger and the un-qualified regex dropped 31 of 41 otherwise-valid
+# lines, 11 of them "taken" (session-retro instrument audit, 2026-08-26). Rec ids may carry an
+# alpha suffix (#4a). Groups are NAMED because the drop-classification below needs the verb.
 LEDGER_RE = re.compile(
-    r"^- \[(\d{4}-\d{2}-\d{2})\] (?:taken|rejected|deferred) "
-    r"rec:(\d{4}-\d{2}-\d{2})#\d+ - \S.*$")
+    r"^- \[(?P<line_date>\d{4}-\d{2}-\d{2})\] (?P<verb>taken|rejected|deferred)"
+    r"(?: \([^)]*\))? "
+    r"rec:(?P<rec_date>\d{4}-\d{2}-\d{2})#\d+[a-z]?"
+    r"(?: \([^)]*\))? - \S.*$")
+
+# Lines that are deliberately NOT rec dispositions. They are recognised so they can be
+# counted as "known non-disposition" rather than silently swelling the malformed count -
+# a silent drop in the instrument that measures adoption is the defect this pass exists to fix.
+NON_DISPOSITION_RE = re.compile(
+    r"^- \[\d{4}-\d{2}-\d{2}\] (?:FINDING|NOTE)\b"
+    r"|^- \[\d{4}-\d{2}-\d{2}\] \w+ rule:")
+
+
+def ledger_drops():
+    """(malformed, non_disposition) counts over every '- [' line in the actions-log.
+
+    Nothing in the pipeline may drop a ledger line without counting it here.
+    """
+    path = REPORTS / "actions-log.md"
+    if not path.exists():
+        return 0, 0
+    malformed = non_disp = 0
+    for line in path.read_text().splitlines():
+        if not line.startswith("- [") or LEDGER_RE.match(line):
+            continue
+        if NON_DISPOSITION_RE.match(line):
+            non_disp += 1
+        else:
+            malformed += 1
+    return malformed, non_disp
 
 
 def cmd_ledger(day):
@@ -1020,7 +1061,7 @@ def cmd_ledger(day):
         m = LEDGER_RE.match(line)
         if not m:
             continue
-        line_date, rec_date = m.group(1), m.group(2)
+        line_date, rec_date = m.group("line_date"), m.group("rec_date")
         if rec_date >= day.isoformat():
             continue  # rec id from this or a future report: cannot be settled yet
         if line_date < rec_date:
@@ -1145,32 +1186,39 @@ def _load_recs():
     return out
 
 
-def _taken_recs():
+def _taken_recs(day=None):
     """rec-id -> earliest date it was marked taken, from the schema-validated actions-log.
     Non-calendar dates (regex-shaped but invalid) are skipped so cmd_effectiveness's
-    date.fromisoformat can never crash on model-written garbage."""
+    date.fromisoformat can never crash on model-written garbage.
+
+    `day` bounds the ledger to lines written on or before that date. Live this is a no-op
+    (the file only holds past lines when the runner executes), but it is what makes a
+    BACKFILL of a past date reconstruct what was true THEN rather than what is true now.
+    """
     path = REPORTS / "actions-log.md"
     taken = {}
     if not path.exists():
         return taken
     for line in path.read_text().splitlines():
         m = LEDGER_RE.match(line)
-        if not m or "] taken rec:" not in line:
+        if not m or m.group("verb") != "taken":
             continue
-        line_date, rec_date = m.group(1), m.group(2)
+        line_date, rec_date = m.group("line_date"), m.group("rec_date")
+        if day is not None and line_date > day.isoformat():
+            continue  # written after the date being reconstructed
         try:
             date.fromisoformat(line_date); date.fromisoformat(rec_date)
         except ValueError:
             continue  # non-calendar date in the (model-written) actions-log -> skip, never crash
         if line_date < rec_date:
             continue  # acted before the report existed (see cmd_ledger)
-        rid = re.search(r"rec:(\d{4}-\d{2}-\d{2}#\d+)", line).group(1)  # LEDGER_RE already matched
+        rid = re.search(r"rec:(\d{4}-\d{2}-\d{2}#\d+[a-z]?)", line).group(1)  # LEDGER_RE matched
         if rid not in taken or line_date < taken[rid]:
             taken[rid] = line_date
     return taken
 
 
-def cmd_effectiveness(day):
+def effectiveness_lines(day):
     """Deterministic fix-effectiveness + chronic-friction digest (TRUSTED, wrapper-computed
     from recs.jsonl + the schema-validated actions-log; reduce only narrates it). For each
     TAKEN rec, did its id reappear on a report dated AFTER it was taken (recurred despite the
@@ -1193,7 +1241,8 @@ def cmd_effectiveness(day):
     def label(rid):
         return f' "{summ[rid]}"' if rid in summ else ""
 
-    for rid, tdate in sorted(_taken_recs().items()):
+    out = []
+    for rid, tdate in sorted(_taken_recs(day).items()):
         after = [dd for dd in seen.get(rid, []) if dd > tdate]
         if after:
             status, last = "recurred-after-fix", after[-1]
@@ -1201,14 +1250,34 @@ def cmd_effectiveness(day):
             days_since = (day - date.fromisoformat(tdate)).days
             status = "too-soon" if days_since < TOO_SOON_DAYS else "holding"
             last = seen.get(rid, ["none"])[-1] if seen.get(rid) else "none"
-        print(f"EFFECTIVENESS rec:{rid} taken:{tdate} status:{status} "
-              f"last_seen:{last} seen_count:{len(seen.get(rid, []))}{label(rid)}")
+        out.append(f"EFFECTIVENESS rec:{rid} taken:{tdate} status:{status} "
+                   f"last_seen:{last} seen_count:{len(seen.get(rid, []))}{label(rid)}")
     cutoff = (day - timedelta(days=CHRONIC_WINDOW)).isoformat()
     for rid in sorted(seen):
         in_window = [dd for dd in seen[rid] if dd >= cutoff]
         if len(in_window) >= CHRONIC_MIN_DAYS:
-            print(f"CHRONIC rec:{rid} seen_count:{len(in_window)} "
-                  f"dates:{in_window[0]}..{in_window[-1]}{label(rid)}")
+            out.append(f"CHRONIC rec:{rid} seen_count:{len(in_window)} "
+                       f"dates:{in_window[0]}..{in_window[-1]}{label(rid)}")
+    return out
+
+
+def effectiveness_counts(day):
+    """The four digest integers for `day`. Persisted onto the metrics row by cmd_metrics
+    so the digest has a HISTORY - it was previously computed on demand and never written
+    down, which made 'did an adopted fix actually work' unanswerable over time."""
+    lines = effectiveness_lines(day)
+    return {
+        "eff_holding": sum(1 for x in lines if "status:holding" in x),
+        "eff_recurred_after_fix": sum(1 for x in lines if "status:recurred-after-fix" in x),
+        "eff_too_soon": sum(1 for x in lines if "status:too-soon" in x),
+        "eff_chronic": sum(1 for x in lines if x.startswith("CHRONIC")),
+    }
+
+
+def cmd_effectiveness(day):
+    """Print the deterministic fix-effectiveness digest for `day`."""
+    for line in effectiveness_lines(day):
+        print(line)
 
 
 MIN_TREND_COVERAGE_HOURS = 1.0  # below this, a day's rate is too little signal to trust
@@ -1291,16 +1360,9 @@ def cmd_trends(days=14):
                      if COMPLETE_MARKER in p.read_text(encoding="utf-8", errors="replace"))
     if reports:
         latest = date.fromisoformat(reports[-1])
-        import io
-        from contextlib import redirect_stdout
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            cmd_effectiveness(latest)
-        eff_lines = buf.getvalue().splitlines()
-        holding = sum(1 for l in eff_lines if "status:holding" in l)
-        recurred = sum(1 for l in eff_lines if "status:recurred-after-fix" in l)
-        too_soon = sum(1 for l in eff_lines if "status:too-soon" in l)
-        chronic = sum(1 for l in eff_lines if l.startswith("CHRONIC"))
+        c = effectiveness_counts(latest)
+        holding, recurred = c["eff_holding"], c["eff_recurred_after_fix"]
+        too_soon, chronic = c["eff_too_soon"], c["eff_chronic"]
         print(f"effectiveness as of {latest.isoformat()}: holding={holding} "
               f"recurred-after-fix={recurred} too-soon={too_soon} CHRONIC={chronic}")
         if chronic:
@@ -1788,6 +1850,49 @@ def selftest():
             "- [2026-07-09] deferred rec:2026-07-08#3 - long narrative reason with no "
             "trailing parens at all, landed as commit abc123.",
         ], kept
+        # --- widened LEDGER_RE: both parenthetical positions + alpha rec-id suffix ---
+        # Each of these shapes occurs in the real actions-log and was SILENTLY dropped
+        # before 2026-08-26 (31 of 41 drops, 11 of them "taken").
+        for good in (
+            "- [2026-07-09] deferred (never started) rec:2026-07-08#1 - qualifier after verb",
+            "- [2026-07-09] taken rec:2026-07-08#1 (part 2 only) - qualifier after rec id",
+            "- [2026-07-09] taken rec:2026-07-08#4a - alpha suffix on the rec number",
+            "- [2026-07-09] taken rec:2026-07-08#1 (re-scopes rec:2026-07-07#8) - nested rec ref",
+        ):
+            assert LEDGER_RE.match(good), good
+        # ...and the shapes that must STILL be rejected, so widening did not open the gate.
+        for bad in (
+            "- [2026-07-09] taken rec:2026-07-08#1 - ",          # empty summary
+            "- [2026-07-09] maybe rec:2026-07-08#1 - bad verb",
+            "- [2026-07-09] taken rec:2026-07-08 - no rec number",
+            "- [not-a-date] taken rec:2026-07-08#1 - bad line date",
+        ):
+            assert not LEDGER_RE.match(bad), bad
+
+        # --- ledger_drops: nothing is dropped without being counted -------------------
+        (REPORTS / "actions-log.md").write_text(
+            "- [2026-07-09] taken rec:2026-07-08#1 (partial) - parses now\n"
+            "- [2026-07-09] FINDING (not a rec) - a note, not a disposition\n"
+            "- [2026-07-09] NOTE rec:2026-07-08#1 - also not a disposition\n"
+            "- [2026-07-09] taken rule:some-slug - a different id namespace\n"
+            "- [2026-07-09] garbled line with no shape at all\n")
+        malformed, non_disp = ledger_drops()
+        assert (malformed, non_disp) == (1, 3), (malformed, non_disp)
+
+        # --- _taken_recs is bounded by `day`, which is what makes a backfill honest ----
+        (REPORTS / "actions-log.md").write_text(
+            "- [2026-07-09] taken rec:2026-07-08#1 - early\n"
+            "- [2026-07-20] taken rec:2026-07-08#2 - late\n")
+        assert set(_taken_recs(date(2026, 7, 10))) == {"2026-07-08#1"}, _taken_recs(date(2026, 7, 10))
+        assert set(_taken_recs()) == {"2026-07-08#1", "2026-07-08#2"}, _taken_recs()
+
+        # --- effectiveness_counts returns the four persisted integers -----------------
+        counts = effectiveness_counts(date(2026, 7, 20))
+        assert set(counts) == {"eff_holding", "eff_recurred_after_fix",
+                               "eff_too_soon", "eff_chronic"}, counts
+        assert all(isinstance(v, int) for v in counts.values()), counts
+        (REPORTS / "actions-log.md").unlink()
+
         # missing-dates must not strand a gap an out-of-order completion jumped over:
         # a newer date (D-1) complete while an older one (D-2) is still missing.
         for f in REPORTS.glob("????-??-??.md"):
