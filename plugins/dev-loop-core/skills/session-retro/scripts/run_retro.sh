@@ -219,6 +219,11 @@ for d in $dates; do
     done
     echo "--- scan.json ---"
     cat "$work/scan.json"
+    # scan.json has no trailing newline, so without this the NEXT block's delimiter is glued
+    # onto its closing brace: `}--- findings-... ---`. Measured on 24 of 24 preserved reduce
+    # inputs. The trusted/untrusted split relies on delimiters being line-anchored, and one
+    # block per day was not.
+    printf '\n'
     for f in "$work"/findings-*.md; do
       [ -e "$f" ] || continue
       case "$(basename "$f" .md)" in
