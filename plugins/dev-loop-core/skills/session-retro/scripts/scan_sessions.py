@@ -1395,6 +1395,18 @@ def _taken_recs(day=None):
 
 RID_REF_RE = re.compile(r"rec:(\d{4}-\d{2}-\d{2}#\d+[a-z]?)")
 
+# A backref is an edge only if it ASSERTS restatement. The dedup line reduce.md mandates is
+# equally used to declare NON-identity, and scoring the extractor against the real corpus
+# (2026-08-27, AFTER shipping - which was the wrong order) found 5 of 20 edges were exactly
+# that: every rec on 2026-08-26 used "distinct from rec:<id>" to say it is NOT a repeat, and
+# the first version of this clustering read all five as restatements. 75% precision.
+# Checked against the characters BEFORE the reference, not the whole text, so
+# "REPEAT of X, distinct from Y" keeps the X edge and drops the Y edge.
+EDGE_NEGATION_RE = re.compile(
+    r"distinct from|not a repeat|unlike|different from|separate from|as opposed to"
+    r"|rather than|supersed|replaces", re.I)
+EDGE_WINDOW = 90
+
 
 def _cluster_recs(hist):
     """rec-id -> canonical (oldest) id of its restatement cluster.
@@ -1432,9 +1444,14 @@ def _cluster_recs(hist):
                 continue
             find(rid)
             text = f'{rec.get("summary") or ""} {rec.get("dedup") or ""}'
-            for ref in RID_REF_RE.findall(text):
-                if ref != rid:
-                    union(rid, ref)
+            for m in RID_REF_RE.finditer(text):
+                ref = m.group(1)
+                if ref == rid:
+                    continue
+                before = text[max(0, m.start() - EDGE_WINDOW):m.start()]
+                if EDGE_NEGATION_RE.search(before):
+                    continue  # the writer said this is NOT the same finding
+                union(rid, ref)
     return {x: find(x) for x in parent}
 
 
@@ -2376,6 +2393,25 @@ def selftest():
         cl = _cluster_recs(hist)
         assert cl["2026-07-20#3"] == "2026-07-08#1", cl   # newer id folds into the older
         assert cl["2026-07-21#9"] == "2026-07-21#9", cl   # no backref -> its own cluster
+        # A backref under NEGATION is not an edge. Measured on the real corpus 2026-08-27:
+        # 5 of 20 edges were "distinct from rec:<id>", i.e. the writer explicitly saying this
+        # is NOT the same finding, and reading them as restatements produced 3 false
+        # recurred-after-fix verdicts (14 -> 11 once guarded).
+        neg = _cluster_recs([
+            {"report_date": "2026-07-08", "recs": [{"id": "2026-07-08#1", "summary": "original", "dedup": ""}]},
+            {"report_date": "2026-07-09", "recs": [{"id": "2026-07-09#2", "summary": "new rule, distinct from rec:2026-07-08#1", "dedup": ""}]},
+        ])
+        assert neg["2026-07-09#2"] == "2026-07-09#2", neg
+        # ...and the window is per-reference, so a mixed line keeps the asserted edge and
+        # drops only the negated one.
+        mix = _cluster_recs([
+            {"report_date": "2026-07-08", "recs": [{"id": "2026-07-08#1", "summary": "a", "dedup": ""}]},
+            {"report_date": "2026-07-08", "recs": [{"id": "2026-07-08#5", "summary": "b", "dedup": ""}]},
+            {"report_date": "2026-07-09", "recs": [{"id": "2026-07-09#3",
+             "summary": "REPEAT of rec:2026-07-08#1 and it is distinct from rec:2026-07-08#5", "dedup": ""}]},
+        ])
+        assert mix["2026-07-09#3"] == "2026-07-08#1", mix
+        assert mix["2026-07-08#5"] == "2026-07-08#5", mix
 
         # --- _taken_recs is bounded by `day`, which is what makes a backfill honest ----
         (REPORTS / "actions-log.md").write_text(
