@@ -184,7 +184,7 @@ cmd_prepare() {
   # which exits and fires the EXIT trap that `worktree remove --force`s $wt - a log written inside
   # it is destroyed on exactly the path it exists to diagnose. Plain `>` (not `tee`): this
   # function's stdout is the machine-readable KEY=VALUE block the caller parses.
-  local merge_log="$wt.merge.log" suite_log="$wt.suite.log"
+  local merge_log="$wt.merge.log" suite_log="$wt.suite.log" fail_dump="$wt.last-failures"
 
   if ! git -C "$wt" merge --no-ff --no-edit "$candidate" >"$merge_log" 2>&1; then
     git -C "$wt" merge --abort 2>/dev/null
@@ -209,6 +209,20 @@ cmd_prepare() {
     log "land-suite-skipped" "$candidate docs-only integ=${integ:0:8}"
   elif ! ( cd "$wt" && eval "$SUITE_CMD" ) >"$suite_log" 2>&1; then
     log "land-redsuite" "$candidate integ=$(git -C "$wt" rev-parse --short HEAD)"
+    # The suite LOG is already a sibling and survives, but it only names WHICH test failed. The
+    # structured dump - full output, and the hang-dump instrument's thread stacks for a timeout -
+    # is written INSIDE $wt, so the EXIT trap destroys it on exactly the path it exists to
+    # diagnose. Copy it out before `die` fires the trap. Best-effort: a missing dump must never
+    # turn a RED suite into a different failure, so every command here is `|| true`-equivalent.
+    # The `(log: ...)` suffix below is PARSED by the selftest (and by callers), so the dump path
+    # goes on its own stderr line rather than inside those parentheses - appending to the message
+    # would make the existing greedy `s/.*(log: \(.*\))$/\1/p` capture both paths as one.
+    if [ -d "$wt/.claude/state/last-failures" ]; then
+      rm -rf "$fail_dump" 2>/dev/null
+      if cp -R "$wt/.claude/state/last-failures" "$fail_dump" 2>/dev/null; then
+        printf 'lander: failure dump preserved at %s\n' "$fail_dump" >&2
+      fi
+    fi
     die "SUITE RED on the integration commit — discarded, target untouched (log: $suite_log)" 4
   fi
 
@@ -541,6 +555,23 @@ check "red-suite error names a log path" "[ -n \"$redlog\" ]"
 check "red-suite log survives cleanup with the failure output" "[ -s \"$redlog\" ] && grep -q RED_MARKER \"$redlog\""
 check "red-suite log is a sibling, not inside the removed worktree" "[ ! -e \"${redlog%.suite.log}\" ]"
 rm -f "$redlog"
+
+# 5a. RED SUITE with a structured failure DUMP -> the dump outlives the cleanup trap too.
+# The log names WHICH test failed; the dump (full output, and the hang-dump instrument's thread
+# stacks on a timeout) is what diagnoses it, and it is written INSIDE $wt where the trap destroys
+# it. Measured 2026-08-27: a land hit exit 4 on a concurrency test and the dump was already gone
+# by the time the message was read, leaving the failure undiagnosable.
+# The fake suite writes a dump exactly where run_all.sh does, then fails.
+git checkout -q -b session/red-dump main; echo "print('red2')">>src/a.py; git commit -qam red2
+rc=0
+rderr="$(LANDER_SUITE_CMD='sh -c "mkdir -p .claude/state/last-failures/99 && echo DUMP_MARKER > .claude/state/last-failures/99/out.txt; exit 1"' \
+  "$SELF" prepare session/red-dump main 2>&1 >/dev/null)" || rc=$?
+check "red-suite-with-dump prepare still fails" "[ $rc -eq 4 ]"
+rdump="$(printf '%s\n' "$rderr" | sed -n 's/^lander: failure dump preserved at //p')"
+check "red-suite names a preserved dump path" "[ -n \"$rdump\" ]"
+check "preserved dump survives cleanup with its contents" "[ -s \"$rdump/99/out.txt\" ] && grep -q DUMP_MARKER \"$rdump/99/out.txt\""
+check "preserved dump is a sibling, not inside the removed worktree" "[ ! -e \"${rdump%.last-failures}\" ]"
+rm -rf "$rdump" "${rdump%.last-failures}.suite.log"
 
 # 5b. DOCS-ONLY diff -> suite is SKIPPED. Proven with a suite command that would FAIL if it ran,
 # so a pass here cannot come from the fake `true` suite.
