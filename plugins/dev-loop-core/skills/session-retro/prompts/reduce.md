@@ -80,10 +80,20 @@ from the metrics history. Also report the cost/latency axes now in the metrics h
 Call out any sustained trend (3+ days moving the same way) explicitly.
 
 **Every scoreboard number is the one in `scan.json` / `metrics.jsonl`. Copy it; never
-re-derive or re-total it.** The 2026-08-05 report printed 6,061 tool calls where both its own
-`scan.json` and `metrics.jsonl` said 5,677, and then built a "density is essentially flat"
-conclusion on the inflated denominator. Recomputed, that day's error rise was significant
-(z = 3.56). If a figure you want is not in those files, say it is unavailable.
+re-derive or re-total it.** For day totals use **`scan.json`'s top-level `totals` object** -
+`totals.tool_calls`, `totals.errors`, `totals.interrupts`, `totals.retries`,
+`totals.denials`, `totals.sessions`. Do NOT sum the per-session `tools` dicts yourself.
+
+This rule was previously impossible to obey and was disobeyed accordingly. `scan.json` had
+no day total, and `metrics.jsonl`'s row for the report date is written AFTER stamping, so
+the only way to produce a tool-call total was the in-head re-total the rule forbids.
+**Measured 2026-08-27 across the 24 preserved reduce inputs: the narrated tool-call total
+disagreed with its own `scan.json` on 18 of them - 75%, median 6.3%, max 20.1%.** The
+2026-08-05 report printed 6,061 where its own `scan.json` said 5,677 and built a "density is
+essentially flat" conclusion on the inflated denominator (recomputed, that day's error rise
+was significant, z = 3.56); it was the median case, not an outlier. `totals` now exists so
+the instruction is followable. If a figure you want is not in those files, say it is
+unavailable.
 
 **Tag every scoreboard row and every factual claim about a prior session with an evidence
 class, and put the class in the row.** Use exactly these:

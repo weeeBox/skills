@@ -723,8 +723,30 @@ def scan_day(day):
             "active_no_in_day_events": active_no_events}
 
 
+def _scan_totals(sessions):
+    """Day totals, written into scan.json so the reduce model can COPY them.
+
+    reduce.md orders "every scoreboard number is the one in scan.json / metrics.jsonl; copy
+    it, never re-derive or re-total it" - but scan.json carried no day total and the
+    metrics.jsonl row for the report date is written AFTER stamping, so the model was
+    structurally forced to sum a `tools` dict across ~25 sessions in its head, which is
+    exactly what the rule forbids. Measured 2026-08-27 over the 24 preserved reduce inputs:
+    the narrated tool-call total disagreed with its own scan.json on 18 of 24 days, median
+    6.3%, max 20.1%. This is not a new computation - it is the same sum cmd_metrics already
+    performs, moved earlier so the number exists when the model needs it."""
+    return {
+        "tool_calls": sum(sum(s["tools"].values()) for s in sessions),
+        "errors": sum(s["errors"] for s in sessions),
+        "interrupts": sum(s["interrupts"] for s in sessions),
+        "retries": sum(s["retries"] for s in sessions),
+        "denials": sum(s["denials"] for s in sessions),
+        "sessions": len(sessions),
+    }
+
+
 def cmd_scan(day):
     result = scan_day(day)
+    result["totals"] = _scan_totals(result["sessions"])
     workdir = REPORTS / "work" / day.isoformat()
     workdir.mkdir(parents=True, exist_ok=True)
     (workdir / "scan.json").write_text(json.dumps(result, indent=1))
@@ -2326,6 +2348,18 @@ def selftest():
         # origin.kind wins over the text fallback, in BOTH directions
         assert not is_injected_turn(_row("<task-notification> x", origin={"kind": "human"}))
 
+        # --- scan.json totals: the number reduce is told to copy must exist ------------
+        # Asserted against an INDEPENDENT re-sum, not against itself, and the degenerate
+        # case is pinned: an empty day must give 0, not a missing key.
+        _sess = [{"tools": {"Bash": 3, "Read": 2}, "errors": 1, "interrupts": 0,
+                  "retries": 1, "denials": 0},
+                 {"tools": {"Bash": 4}, "errors": 2, "interrupts": 1, "retries": 0,
+                  "denials": 1}]
+        _t = _scan_totals(_sess)
+        assert _t == {"tool_calls": 9, "errors": 3, "interrupts": 1, "retries": 1,
+                      "denials": 1, "sessions": 2}, _t
+        assert _scan_totals([])["tool_calls"] == 0, _scan_totals([])
+
         # --- widened LEDGER_RE: both parenthetical positions + alpha rec-id suffix ---
         # Each of these shapes occurs in the real actions-log and was SILENTLY dropped
         # before 2026-08-26 (31 of 41 drops, 11 of them "taken").
@@ -2658,6 +2692,21 @@ def selftest():
                 assert name.split("/", 1)[1] in ids, (name, ids)
             assert r["still_active"] == ["-proj/inday"], r["still_active"]
             assert r["active_no_in_day_events"] == 1, r["active_no_in_day_events"]
+            # cmd_scan must WRITE totals, not merely be able to compute them. Asserting
+            # _scan_totals directly stays GREEN when the call site is deleted - which is
+            # exactly how the first version of this test passed under mutation.
+            _real_reports = REPORTS
+            try:
+                with tempfile.TemporaryDirectory() as rd:
+                    REPORTS = Path(rd)
+                    cmd_scan(date(2026, 7, 8))
+                    on_disk = json.loads(
+                        (REPORTS / "work" / "2026-07-08" / "scan.json").read_text())
+                    assert "totals" in on_disk, list(on_disk)
+                    assert on_disk["totals"]["sessions"] == 1, on_disk["totals"]
+                    assert on_disk["totals"]["tool_calls"] == 0, on_disk["totals"]
+            finally:
+                REPORTS = _real_reports
     finally:
         PROJECTS = real_projects
     print("selftest OK")
