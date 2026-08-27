@@ -1038,6 +1038,14 @@ def cmd_extract(day, top):
         # project hash in the name: same session basename in two projects must not collide
         h8 = hashlib.md5(s["project"].encode()).hexdigest()[:8]
         (workdir / f"extract-{s['session']}-{h8}.md").write_text("\n".join(out))
+    # Friction rank, for the runner's double-map: a single map call's TAIL of findings
+    # does not reproduce (mean pairwise theme overlap ~0.51 across three re-runs of one
+    # real extract, 2026-08-26), so the top sessions are analyzed twice and only themes
+    # appearing in both are promoted. `picked` is already in rank order; the filenames
+    # are not, hence this file.
+    (workdir / "rank.txt").write_text(
+        "".join(f"extract-{s['session']}-"
+                f"{hashlib.md5(s['project'].encode()).hexdigest()[:8]}\n" for s in picked))
     # stage previous complete report for the repeat-findings comparison
     prev = [p for p in sorted(REPORTS.glob("????-??-??.md"))
             if p.stem < day.isoformat() and COMPLETE_MARKER in p.read_text()]

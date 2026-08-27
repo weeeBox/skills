@@ -177,6 +177,34 @@ the ruleset or invent problems to look productive. Concrete fixes belong in Reco
 (with a rec id); this section is the diagnosis.
 
 ## Recommendations
+**TWO-RUN RULE - applies before anything else in this section.** Some sessions are
+analyzed TWICE: their findings arrive as both `findings-<id>` and `findings-<id>-run2`,
+two independent analyses of the identical input. For those sessions, a theme becomes a
+recommendation ONLY if it appears in BOTH runs. A theme present in one run only goes to
+`## Provisional (single-run)` below - unranked, no `[rec: ...]` tag, no Next-action
+prompt. Match by SUBJECT, not wording; the two runs describe the same thing differently.
+Sessions with only one findings file are unaffected: their findings rank normally.
+This is not a quality judgement on the dropped themes. Measured 2026-08-26, three
+independent re-runs of one real extract shared only ~51% of their themes, and three
+themes appeared in exactly one document of four - including the one that became a
+permanent rule in an always-loaded 63 KB instruction file. A single run's tail is
+sampling noise, and this section is where noise becomes permanent.
+
+**BARRED THEMES.** Two themes have each consumed 22 days and ~9 recommendation ids
+without closing:
+  1. putting the worktree/containment constraints into the subagent/agent files;
+  2. mechanically enforcing the don't-stop-with-queued-work rule (widening the Stop
+     guard).
+Do NOT emit a `[claude-md]` or otherwise prose-tier recommendation on either. Its own
+latest entry concedes the substitution table IS already inlined and subagents still hit
+it, and the other theme's last four entries are literally "widen the Stop guard a
+2nd/3rd/4th time" - so a further restatement is the third design where the terminal
+option is due. If today's evidence hits one of them, still report the friction under
+`## Top friction patterns` and the chronic entry under `## Fix effectiveness & chronic
+friction`, and then either propose a MECHANISM (`tier: hook|script|test`, scored against
+the real corpus per the tier rule below) or write one line saying the friction is
+accepted as known-open. Neither counts as a new prose rule. Other themes are unaffected.
+
 Ranked list, each tagged `[rec: <date>#<n>]`. Every recommendation MUST have BOTH:
 - Evidence: project + session id + timestamp or quoted snippet. Cite ONE specific
   timestamp, never a range - a range hides which event you mean.
@@ -221,11 +249,18 @@ Tag each [skill] [claude-md] [docs] [code-org] [tooling] [permissions].
 No evidence or no artifact -> drop it. Generic advice ("write better prompts",
 "reduce errors") is banned.
 
+## Provisional (single-run)
+Themes from a double-analyzed session that appeared in only ONE of its two runs, one line
+each: the theme and which run it came from. No `[rec: ...]` tags, no ranking, no
+Next-action prompts - these are candidates for tomorrow, not findings. If every theme
+reproduced, or no session was analyzed twice, write exactly one line: "None."
+
 ## Previously rejected
 One line per suppressed id: the id + the matched ledger line. Omit the section if none.
 
 ## Next actions
-EVERY recommendation in ## Recommendations gets a Next-action prompt, in the same rank
+EVERY recommendation in ## Recommendations gets a Next-action prompt (nothing in
+## Provisional (single-run) does), in the same rank
 order - no cap, no silent drop. (The old "top 3" cap dropped rec:2026-08-14#7 - actions-
 log backfill - from dispatch on 4 of 5 consecutive days despite it being re-recommended
 every single one; a report that names a fix but never queues it as a prompt is why it

@@ -118,6 +118,33 @@ for d in $dates; do
     done
     [ -n "$ok" ] || { echo "map FAILED for $id (dropped after retries)"; dropped="$dropped $id"; }
   done
+  # Second, INDEPENDENT map call on the top-RERUN_TOP friction sessions. A single map
+  # call reproduces its two strongest findings and little else (P5, 2026-08-26: mean
+  # pairwise theme overlap ~0.51 over three re-runs of one real extract; three themes
+  # appeared in exactly one document of four, and the one that became a permanent global
+  # rule was among them). reduce promotes only themes present in BOTH runs; the rest go
+  # to a provisional section that mints no rec id. Best-effort: a failed re-run just
+  # leaves that session single-run, which reduce handles.
+  RERUN_TOP="${RERUN_TOP:-2}"
+  if [ -s "$work/rank.txt" ]; then
+    for id in $(head -"$RERUN_TOP" "$work/rank.txt"); do
+      [ -s "$work/$id.md" ] || continue
+      [ -s "$work/findings-$id.md" ] || continue   # run 1 failed: a lone run 2 proves nothing
+      if [ -s "$work/findings-$id-run2.md" ]; then echo "reusing run2 for $id"; continue; fi
+      echo "re-analyzing $id (run 2)"
+      touch "$LOCK"
+      for try in 1 2; do
+        if cat "$SKILL/prompts/map.md" "$work/$id.md" | run_model > "$work/findings-$id-run2.md" \
+             2>>"$work/map-err-$id-run2.log" \
+           && [ -s "$work/findings-$id-run2.md" ]; then break; fi
+        echo "map run2 attempt $try failed for $id"
+        rm -f "$work/findings-$id-run2.md"
+      done
+    done
+  else
+    echo "NOTE: no rank.txt for $d; skipping the run-2 reproducibility pass"
+  fi
+
   # If extracts existed but EVERY map failed, the run is bad (transient) - leave the date
   # uncovered to retry. Otherwise proceed: 0 extracts => scan-only no-op report; partial
   # => degraded report (dropped sessions logged, not silently omitted).
@@ -183,7 +210,10 @@ for d in $dates; do
     cat "$work/scan.json"
     for f in "$work"/findings-*.md; do
       [ -e "$f" ] || continue
-      echo "--- $(basename "$f") ---"
+      case "$(basename "$f" .md)" in
+        *-run2) echo "--- $(basename "$f") (RUN 2: an INDEPENDENT re-analysis of the same session as the matching findings file without -run2; see the two-run rule) ---" ;;
+        *) echo "--- $(basename "$f") ---" ;;
+      esac
       cat "$f"
     done
     if [ -e "$work/previous-report.md" ]; then

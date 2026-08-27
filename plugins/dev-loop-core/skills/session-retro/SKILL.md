@@ -20,6 +20,26 @@ It also tracks recommendation recurrence across days (`recs.jsonl`) and reports,
 recommendation, whether the friction it targeted actually stopped ("Fix effectiveness &
 chronic friction"), so a fix that is not working surfaces instead of silently repeating.
 
+The top `RERUN_TOP` (default 2) friction sessions are analyzed **twice**, by two
+independent map calls on the identical extract (`findings-<id>.md` and
+`findings-<id>-run2.md`; the friction rank comes from `work/<date>/rank.txt`, written by
+`extract`). reduce promotes a theme to a recommendation only if it appears in BOTH runs;
+themes from one run only land in a `## Provisional (single-run)` section that mints no rec
+id and gets no Next-action prompt. Measured 2026-08-26, three independent re-runs of one
+real extract shared only ~51% of their themes and three themes appeared in exactly one
+document of four - one of which had already become a permanent rule in the always-loaded
+global instruction file. The two strongest findings reproduced unanimously; it is the tail
+that does not, and the tail is what this filters. Cost is +2 map calls/day (plan quota).
+A failed re-run degrades to single-run for that session rather than blocking the day.
+
+reduce is also **barred from emitting prose-tier recommendations on two themes** - putting
+the worktree/containment constraints into the agent files, and widening the Stop guard for
+the don't-stop-with-queued-work rule. Each has consumed 22 days and ~9 rec ids; the first
+theme's own latest entry concedes the substitution table is already inlined and subagents
+still hit it, and the second's last four entries are successive widenings of one guard.
+The friction is still reported; only a MECHANISM (`tier: hook|script|test`, corpus-scored)
+or an explicit accept-as-known-open line is allowed as the response.
+
 The reduce step is additionally given the **last 21 days of recommendation titles**
 (`scan_sessions.py prior-recs`, wrapper-computed from `recs.jsonl`, trusted-first zone) and
 must emit a `Dedup:` line under every recommendation citing the closest prior id. Without
