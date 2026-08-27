@@ -252,6 +252,32 @@ citing its exact id. Check before queueing, and append the outcome line when you
   bullets do). If the two disagree, the counter is wrong until shown otherwise - a plausible
   implementation is not evidence. A counter with no recorded hand-check is a diagnostic aid,
   never a trend axis and never the basis of a recommendation.
+- **`errors` is SPLIT as of 2026-08-26, and `tool_failures` is the honest axis.** The
+  undivided counter summed four incompatible things: on 2026-08-25, of 47 in-day `is_error`
+  blocks, **32 were genuine tool failures, 12 were policy blocks** (worktree containment
+  refusals, stale-read protocol guards, hook guard refusals, classifier denials) **and 3 were
+  harness outages** (model timeout, the 2-minute Bash ceiling's exit 143). All 15 non-failures
+  were read individually and confirmed. A fall in `errors_per_hour` is therefore equally
+  consistent with "the code broke less", "the guardrails were relaxed" and "the API had a
+  better day" - it is retained for continuity with pre-2026-08-26 rows but **must not be read
+  as friction**. `tool_failures_per_hour` is the axis. `classify_error`'s fallback is
+  `tool_failure` on purpose: a guard shape nobody has listed yet shows up as over-counted
+  friction (visible) instead of being absorbed into `policy_block` (invisible).
+  `friction()` now weights `tool_failures` and no longer adds `denials` on top of `errors`,
+  of which it was a strict subset - a permission denial used to score 4 against a real test
+  failure's 3.
+- **`user_turns` HAND-CHECK, and it now passes.** Session `3ece6495` (2026-08-25): the counter
+  read **164**; an independent hand count of genuine human messages found **19**; after the
+  fix it reads **19**. Day-wide the same day goes 421 -> 148 user turns with 438 reclassified
+  as `injected_turns`. The discriminator is the transcript's own **`origin.kind`** field
+  ("human" vs "task-notification", plus `isMeta` for slash-command echoes) - not a text
+  heuristic. Two things made the earlier regex attempt score 1 of 133: injected rows carry
+  `message.content` as a plain **str**, so `blocks()` returns `[]` and any block-list-only
+  test sees nothing; and the tag vocabulary is open-ended while `origin.kind` is closed.
+  **This matters beyond the counter**: `user_turns` is `friction_score`'s DENOMINATOR, so
+  inflating it deflated friction on exactly the heavily-delegating sessions, and
+  `pick_sessions` ranks by that score. Re-ranking 2026-08-25 with the corrected score changes
+  **3 of the 8 sessions** that would get an analyst call.
 - **`self_retractions` PASSES its acceptance gate as of 2026-08-10 and is now a trend
   axis.** It counts the AGENT
   retracting its own prior claim, on assistant turns (`RETRACTION_RE`) - distinct from

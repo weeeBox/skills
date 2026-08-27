@@ -33,6 +33,96 @@ MAX_EXTRACT_BYTES = 100_000
 MAX_GENERATION_SECS = float(os.environ.get("RETRO_MAX_GENERATION_SECS", 1800))
 TRUNC_SLOT = "\x00truncation-header-slot"  # placeholder, filled once the body is built
 DENIAL_RE = re.compile(r"doesn't want to proceed|denied by|permission denied", re.I)
+
+# `errors` (every is_error tool_result) sums four incompatible things, so a fall in it is
+# equally consistent with "the code broke less" and "the guardrails were relaxed" and "the
+# API had a better day". Categorising one real day's 151 errors: ~76 genuine tool failures,
+# 22 permission/classifier denials, 17 worktree containment refusals, 20 stale-read protocol
+# nudges, 7 harness outages, 6 hook-guard refusals (instrument audit, 2026-08-26). Only the
+# first is friction the agent can reduce by working better. Patterns below are taken from
+# real result bodies, not invented.
+#
+# A guard said no. Terminal-by-policy or self-correcting in one turn; the agent adapts and
+# moves on. More of these can mean the guards got STRICTER, which is not a regression.
+POLICY_BLOCK_RE = re.compile(
+    r"this session is isolated in the worktree"        # worktree containment refusal
+    r"|file has been modified since read"              # stale-read protocol guard
+    r"|has not been read yet\b"                        # read-before-edit protocol guard
+    r"|DESTRUCTIVE COMMAND IN A FALLBACK POSITION"     # destructive-git-guard
+    r"|DESTROYING THE RECOVERY LAYER"                  # destructive-git-guard
+    r"|ON THE DEFAULT BRANCH"                          # commit --no-verify guard
+    r"|EnterWorktree and retry"                        # worktree-guard
+    r"|requested permissions?\b|permission to use",
+    re.I)
+
+# Not the agent's behaviour at all: the model endpoint or the harness failed.
+HARNESS_OUTAGE_RE = re.compile(
+    r"is temporarily unavailable"                      # classifier/model timeout
+    r"|classifier temporarily unavailable"
+    r"|Command timed out after"                        # harness Bash ceiling (exit 143)
+    r"|\b(?:503|overloaded_error|RESOURCE_EXHAUSTED|UNAVAILABLE)\b"
+    r"|API Error: 5\d\d",
+    re.I)
+
+
+def classify_error(txt):
+    """One is_error body -> 'harness_outage' | 'policy_block' | 'tool_failure'.
+
+    Order matters: an outage is checked first because a timed-out command also carries an
+    exit code, and a denial is checked before the fallback because DENIAL_RE bodies are
+    otherwise shapeless. Everything unmatched is a genuine tool failure - the fallback is
+    the honest branch, so a new guard shape shows up as tool_failure (visible, over-counted)
+    rather than being silently absorbed into policy_block (invisible, under-counted).
+    """
+    if HARNESS_OUTAGE_RE.search(txt):
+        return "harness_outage"
+    if POLICY_BLOCK_RE.search(txt) or DENIAL_RE.search(txt):
+        return "policy_block"
+    return "tool_failure"
+
+
+# A user-role row is not necessarily a human. Harness-injected blocks (background-task
+# notifications, skill preambles, slash-command echoes, Stop-hook feedback) and, in a
+# subagent transcript, the parent-authored brief all arrive as user turns. Counting them
+# overstated human involvement 8.6x on one measured session and, because user_turns is
+# friction_score's DENOMINATOR, made heavily-delegating sessions rank artificially clean -
+# which decides which sessions get an analyst call at all (instrument audit, 2026-08-26).
+def is_injected_turn(d):
+    """True when a `user`-role row was written by the harness, not typed by a human.
+
+    The transcript carries this STRUCTURALLY - `origin.kind` is "human" for a real turn and
+    names the injector otherwise ("task-notification", ...), and `isMeta` flags the
+    slash-command/caveat echoes. Prefer both over any text heuristic: measured on one real
+    session-day, origin.kind splits 132 task-notifications from 18 human turns, and the 18
+    matches an independent hand count of 19 genuine messages. The regex below is a fallback
+    for rows that predate `origin`, and it must run against the raw string content because
+    `blocks()` returns [] when `message.content` is a plain str - which is exactly the shape
+    every injected row uses, and why a text-only test saw 1 of 133 of them.
+    """
+    if d.get("isMeta"):
+        return True
+    origin = d.get("origin")
+    if isinstance(origin, dict) and origin.get("kind"):
+        return origin["kind"] != "human"
+    return bool(INJECTED_TURN_RE.search(raw_text_of(d)))
+
+
+def raw_text_of(d):
+    """All user-visible text on a row, whether content is a str or a block list."""
+    content = (d.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content
+    return " ".join(text_of(b) for b in blocks(d) if isinstance(b, dict))
+
+
+INJECTED_TURN_RE = re.compile(
+    r"<task-notification>"
+    r"|<local-command-(?:caveat|stdout)>"
+    r"|<command-(?:name|message|args)>"
+    r"|Stop hook feedback:"
+    r"|^Base directory for this skill:"
+    r"|^\s*<system-reminder>",
+    re.M)
 # Verbal friction the per-turn density score would otherwise miss (no tool error thrown):
 # a user CORRECTING the agent, or repeatedly NUDGING it to continue. Both are precise by
 # construction - a correction matches a correction-specific phrase (never a bare verb that
@@ -289,7 +379,8 @@ def text_of(block):
 def scan_file(path, start, end):
     """Stats for one transcript file, counting only events inside [start, end)."""
     s = {
-        "user_turns": 0, "assistant_turns": 0, "tools": {}, "errors": 0,
+        "user_turns": 0, "injected_turns": 0, "assistant_turns": 0, "tools": {}, "errors": 0,
+        "tool_failures": 0, "policy_blocks": 0, "harness_outages": 0,
         "error_samples": [], "interrupts": 0, "denials": 0, "perm_switches": 0,
         "retries": 0, "self_retractions": 0, "first_ts": None, "last_ts": None, "events": 0,
         "in_tokens": 0, "out_tokens": 0, "cache_read_tokens": 0,
@@ -408,7 +499,8 @@ def scan_file(path, start, end):
                         s["tool_secs"][nm] = s["tool_secs"].get(nm, 0) + (ts - t0).total_seconds()
                     txt = text_of(b)
                     if b.get("is_error"):
-                        s["errors"] += 1
+                        s["errors"] += 1  # retained: total, for continuity with older rows
+                        s[classify_error(txt) + "s"] += 1
                         snip = txt.strip().split("\n")[0][:200]
                         if len(s["error_samples"]) < 10:
                             s["error_samples"].append(snip)
@@ -426,16 +518,23 @@ def scan_file(path, start, end):
                 if "[Request interrupted" in txt:
                     s["interrupts"] += 1
             if not has_tool_result:
-                s["user_turns"] += 1
-                # verbal friction: only genuine user turns. The interrupt marker is
-                # itself a user text turn - skip it (already counted as an interrupt).
-                utext = " ".join(text_of(b) for b in blocks(d)
-                                 if isinstance(b, dict) and b.get("type") == "text")
-                if "[Request interrupted" not in utext:
-                    if CORRECTION_RE.search(utext):
-                        s["corrections"] += 1
-                    if NUDGE_RE.match(utext.strip()):
-                        s["nudges"] += 1
+                # NB: if/else, never `continue` - the gap-timeline append below runs for
+                # every user/assistant row, and skipping it for injected turns would drop
+                # them from the wall-clock partition and silently re-break the very
+                # attribution that human_wait/idle depends on.
+                if is_injected_turn(d):
+                    s["injected_turns"] += 1  # harness-injected, not a human turn
+                else:
+                    s["user_turns"] += 1
+                    # verbal friction: only genuine user turns. The interrupt marker is
+                    # itself a user text turn - skip it (already counted as an interrupt).
+                    utext = " ".join(text_of(b) for b in blocks(d)
+                                     if isinstance(b, dict) and b.get("type") == "text")
+                    if "[Request interrupted" not in utext:
+                        if CORRECTION_RE.search(utext):
+                            s["corrections"] += 1
+                        if NUDGE_RE.match(utext.strip()):
+                            s["nudges"] += 1
         if gap_idx is not None:
             all_gaps[gap_idx][4] = ("assistant" if t == "assistant"
                                     else "tool_result" if has_tool_result else "user")
@@ -508,7 +607,8 @@ def scan_file(path, start, end):
 
 
 def merge_sub(parent, sub):
-    for k in ("errors", "interrupts", "denials", "retries", "assistant_turns",
+    for k in ("errors", "tool_failures", "policy_blocks", "harness_outages",
+              "injected_turns", "interrupts", "denials", "retries", "assistant_turns",
               "in_tokens", "out_tokens", "cache_read_tokens", "cache_write_tokens",
               "corrections", "nudges", "gate_calls", "self_retractions"):
         parent[k] += sub[k]
@@ -536,7 +636,12 @@ def friction(s):
     # ponytail: naive weighted density; tune weights when reports misrank.
     # corrections/nudges are verbal friction (no tool error) - .get keeps pre-migration
     # scan.json and the probe dict below KeyError-free.
-    weighted = (3 * s["errors"] + 5 * s["interrupts"] + 2 * s["retries"] + s["denials"]
+    # `denials` used to be added ON TOP of `errors`, of which it is a strict subset - so a
+    # permission denial scored 4 and a real test failure scored 3. Now the weighted term is
+    # tool_failures only; policy blocks and harness outages are reported but not scored.
+    # .get keeps pre-migration scan.json readable (falls back to the old undivided total).
+    fails = s.get("tool_failures", s["errors"])
+    weighted = (3 * fails + 5 * s["interrupts"] + 2 * s["retries"]
                 + 4 * s.get("corrections", 0) + 2 * s.get("nudges", 0))
     turns = max(s["user_turns"] + s["assistant_turns"], 1)
     return round(100.0 * weighted / turns, 1)
@@ -948,6 +1053,11 @@ def cmd_metrics(day):
         "sessions": len(ss),
         "tool_calls": sum(sum(s["tools"].values()) for s in ss),
         "errors": sum(s["errors"] for s in ss),
+        # The split: only tool_failures is friction the agent can reduce by working better.
+        "tool_failures": sum(s.get("tool_failures", 0) for s in ss),
+        "policy_blocks": sum(s.get("policy_blocks", 0) for s in ss),
+        "harness_outages": sum(s.get("harness_outages", 0) for s in ss),
+        "injected_turns": sum(s.get("injected_turns", 0) for s in ss),
         "interrupts": sum(s["interrupts"] for s in ss),
         "retries": sum(s["retries"] for s in ss),
         "denials": sum(s["denials"] for s in ss),
@@ -989,6 +1099,9 @@ def cmd_metrics(day):
     ch = line["coverage_hours"]
     line["tool_calls_per_hour"] = round(line["tool_calls"] / ch, 1) if ch else None
     line["errors_per_hour"] = round(line["errors"] / ch, 2) if ch else None
+    # The honest primary axis. `errors_per_hour` is retained for continuity with rows
+    # written before 2026-08-26 but must not be read as "friction" - see classify_error.
+    line["tool_failures_per_hour"] = round(line["tool_failures"] / ch, 2) if ch else None
     # The effectiveness digest, persisted so it has a history (see effectiveness_counts).
     line.update(effectiveness_counts(day))
     # How many actions-log lines the reader could not parse on this date. A silent drop in
@@ -1850,6 +1963,40 @@ def selftest():
             "- [2026-07-09] deferred rec:2026-07-08#3 - long narrative reason with no "
             "trailing parens at all, landed as commit abc123.",
         ], kept
+        # --- classify_error: the split, from real result bodies ----------------------
+        for body, want in (
+            ("Exit code 1 (eval):cd:1: no such file or directory", "tool_failure"),
+            ("Exit code 128 fatal: renaming failed", "tool_failure"),
+            ("This session is isolated in the worktree /x, but this command's cwd",
+             "policy_block"),
+            ("<tool_use_error>File has been modified since read", "policy_block"),
+            ("DESTRUCTIVE COMMAND IN A FALLBACK POSITION.", "policy_block"),
+            ("`commit --no-verify` ON THE DEFAULT BRANCH (main).", "policy_block"),
+            ("Permission for this action was denied by the Claude Code auto mode classifier",
+             "policy_block"),
+            ("The user doesn't want to proceed with this tool use.", "policy_block"),
+            ("claude-sonnet-5 is temporarily unavailable (timed out)", "harness_outage"),
+            ("Exit code 143 Command timed out after 2m 0s", "harness_outage"),
+        ):
+            assert classify_error(body) == want, (want, classify_error(body), body[:40])
+        # The fallback must be tool_failure: a NEW guard shape shows up as over-counted
+        # friction (visible) rather than silently absorbed into policy_block (invisible).
+        assert classify_error("something nobody has seen before") == "tool_failure"
+
+        # --- is_injected_turn: structured origin beats any text heuristic -------------
+        def _row(content, **kw):
+            return {"type": "user", "message": {"role": "user", "content": content}, **kw}
+        assert is_injected_turn(_row("hi", origin={"kind": "task-notification"}))
+        assert not is_injected_turn(_row("hi", origin={"kind": "human"}))
+        assert is_injected_turn(_row("<command-name>/clear</command-name>", isMeta=True))
+        # content as a plain STRING is the shape every injected row uses; a test that only
+        # reads block lists sees none of them (that bug scored 1 of 133 before this fix).
+        assert is_injected_turn(_row("<task-notification> <task-id>abc</task-id>"))
+        assert not is_injected_turn(_row("please fix the parser"))
+        assert not is_injected_turn(_row([{"type": "text", "text": "please fix the parser"}]))
+        # origin.kind wins over the text fallback, in BOTH directions
+        assert not is_injected_turn(_row("<task-notification> x", origin={"kind": "human"}))
+
         # --- widened LEDGER_RE: both parenthetical positions + alpha rec-id suffix ---
         # Each of these shapes occurs in the real actions-log and was SILENTLY dropped
         # before 2026-08-26 (31 of 41 drops, 11 of them "taken").
