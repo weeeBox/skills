@@ -1561,13 +1561,16 @@ def day_artifact_lines(day):
     Repos are the PRIMARY checkouts of the directories the day's own sessions worked in -
     read from each transcript's `cwd`, gated on `.git` existing, capped at
     MAX_ARTIFACT_REPOS."""
+    def none(reason):
+        return [f"ARTIFACTS none: {reason}"]
+
     scan = REPORTS / "work" / day.isoformat() / "scan.json"
     if not scan.exists():
-        return []
+        return none("no scan.json for this date")
     try:
         sessions = json.loads(scan.read_text()).get("sessions", [])
     except json.JSONDecodeError:
-        return []
+        return none("scan.json is unreadable")
     roots = []
     for s in sessions:
         path = s.get("path")
@@ -1579,6 +1582,13 @@ def day_artifact_lines(day):
             roots.append(root)
         if len(roots) >= MAX_ARTIFACT_REPOS:
             break
+    if not roots:
+        # Live this cannot happen (a session's cwd exists while its transcript does), but a
+        # REPLAY over a day whose transcripts have since been pruned resolves no repo -
+        # measured on 2026-08-08, which emitted an empty block indistinguishable from a
+        # quiet day.
+        return none("no repo resolved from the day's sessions "
+                    "(transcripts pruned, or no session ran inside a git checkout)")
     out = []
     for root in sorted(roots):
         log = _git(root, "log", f"--since={day.isoformat()}T00:00:00",
@@ -2376,6 +2386,22 @@ def selftest():
         assert al[3] == "ARTIFACTS repo:myrepo gatelog gateloop-block:2 land-error:1", al[3]
         # empty in, empty out - a repo with no commits and no gate log emits nothing at all
         assert _artifact_lines_from("myrepo", "", "", date(2026, 7, 10)) == []
+        # Every "nothing to report" exit must SAY so. The roots-empty case is the one
+        # measured live (a replayed day whose transcripts were pruned); a session row whose
+        # transcript no longer exists reproduces it exactly.
+        assert day_artifact_lines(date(2026, 7, 10)) == [
+            "ARTIFACTS none: no scan.json for this date"], day_artifact_lines(date(2026, 7, 10))
+        _w = REPORTS / "work" / "2026-07-10"
+        _w.mkdir(parents=True, exist_ok=True)
+        (_w / "scan.json").write_text(json.dumps(
+            {"sessions": [{"path": str(REPORTS / "gone.jsonl")}]}))
+        assert day_artifact_lines(date(2026, 7, 10)) == [
+            "ARTIFACTS none: no repo resolved from the day's sessions "
+            "(transcripts pruned, or no session ran inside a git checkout)"], \
+            day_artifact_lines(date(2026, 7, 10))
+        (_w / "scan.json").write_text("{ not json")
+        assert day_artifact_lines(date(2026, 7, 10)) == [
+            "ARTIFACTS none: scan.json is unreadable"], day_artifact_lines(date(2026, 7, 10))
         # The .git gate must stop git from ever RUNNING in a path that is not a repo.
         # Returning None is not enough - _primary_checkout returns None anyway when git
         # errors, so only "the subprocess never happened" pins the gate.
