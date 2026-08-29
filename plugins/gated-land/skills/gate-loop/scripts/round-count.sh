@@ -13,14 +13,27 @@
 # FIELD-aware (awk -F '\t'), so an event name appearing in a DETAIL field can never be
 # mistaken for a row of that type.
 #
+# FIELD POSITION IS NOT FIXED, so the branch is looked for in fields 3..NF rather than in $5.
+# SKILL.md documented a 4-field row and sessions improvised a 5th, so both shapes are live in one
+# log. Measured 2026-08-29 over a real ledger: of the gateloop rows carrying a session/ value, 62
+# sat in field 5 and 9 in field 4. Pinning $5 undercounts — three rounds on one branch read as
+# one — and an undercounting cap is a cap that can be exceeded, which is fail-OPEN and the exact
+# defect class this counter exists to close.
+#
+# The match is EXACT against a whole field, never a prefix or substring, so a detail string that
+# merely mentions another branch cannot be counted.
+#
 # ponytail: a reused branch name (a deleted and recreated session/<slug>) over-counts, which
-# stops the loop EARLY — the safe direction. Rows written before field 5 existed carry no
-# branch and match nothing, so a branch in flight across this change restarts at 0 once.
+# stops the loop EARLY — the safe direction.
 set -uo pipefail
 
 count() { local log="$1" br="$2"
   if [ ! -f "$log" ]; then echo 0; return; fi
-  awk -F '\t' -v br="$br" '$2=="gateloop-block" && $5==br {c++} END{print c+0}' "$log"
+  awk -F '\t' -v br="$br" '
+    $2 == "gateloop-block" {
+      for (i = 3; i <= NF; i++) if ($i == br) { c++; break }
+    }
+    END { print c+0 }' "$log"
 }
 
 selftest() {
@@ -54,6 +67,16 @@ selftest() {
   # an event name quoted in a DETAIL field must not be counted
   row 2026-08-23T06:30:00Z gateloop-capout aab0 'the gateloop-block rows above stand' session/mem-gaps
   want detail-substring 7 "$L" session/mem-gaps
+
+  # FIELD 4 vs FIELD 5. Both shapes are live in one log; pinning $5 read three rounds as one.
+  # Its own log, so the count is unambiguous rather than an offset from the arc above.
+  local L4="$d/f4.log"
+  printf '2026-08-29T09:00:00Z\tgateloop-block\thead\tr1 findings\tsession/x\n' >> "$L4"
+  printf '2026-08-29T09:10:00Z\tgateloop-block\thead\tsession/x\n'              >> "$L4"
+  printf '2026-08-29T09:20:00Z\tgateloop-block\thead\tsession/x\n'              >> "$L4"
+  want field4-rows-counted 3 "$L4" session/x
+  # PRESENCE CONTROL: a counter hard-wired to 3 would pass the line above.
+  want field4-other-branch 0 "$L4" session/y
 
   # a branch with no rows, and legacy 4-field rows that carry no branch
   want fresh-branch 0 "$L" session/fresh
