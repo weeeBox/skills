@@ -248,7 +248,16 @@ Do NOT emit a `[claude-md]` or otherwise prose-tier recommendation on either. It
 latest entry concedes the substitution table IS already inlined and subagents still hit
 it, and the other theme's last four entries are literally "widen the Stop guard a
 2nd/3rd/4th time" - so a further restatement is the third design where the terminal
-option is due. If today's evidence hits one of them, still report the friction under
+option is due. The Stop-guard theme is additionally CLOSED on measurement, not just on
+repetition: labelled by OUTCOME rather than by the wording of the stopping message,
+agent-side premature stopping accounts for 39h of 1268h of total human-wait (3.0%), and
+2.7% of the wait in gaps over an hour, because ~97% of that wait ends with a substantive
+human message carrying new direction the agent did not have. Positives number 25-31
+depending on the gap threshold, decaying smoothly with no natural cutoff, so no predicate
+can be validly scored against them. Do not propose a fourth matcher or a state-based stop
+check without first refuting that measurement
+(`.venv/bin/python .claude/state/stop-corpus.py` in the scratch repo).
+If today's evidence hits one of them, still report the friction under
 `## Top friction patterns` and the chronic entry under `## Fix effectiveness & chronic
 friction`, and then either propose a MECHANISM (`tier: hook|script|test`, scored against
 the real corpus per the tier rule below) or write one line saying the friction is
@@ -259,18 +268,41 @@ Ranked list, each tagged `[rec: <date>#<n>]`. Every recommendation MUST have BOT
   timestamp, never a range - a range hides which event you mean.
 - A concrete artifact inline: exact CLAUDE.md rule text, skill name + outline, exact
   command, specific file/dir to reorganize, or a settings/permission change.
-- ENFORCEMENT TIER, stated explicitly as `tier: hook|script|test|prose`. A rule a hook, a
-  script, or a test can enforce MUST ship as that, not as prose; `tier: prose` is the fallback
-  for judgment rules only and must say in one clause why no mechanical form exists. Measured
-  2026-08-26: of 101 distinct pinned rules in the global CLAUDE.md, ZERO are enforced by any
-  hook - the four rec-ids cited across every hook are four widenings of one rule - while the
-  two most-repeated prose rules both recurred on 2026-08-25, one of them stated three separate
-  times in the file and fired three times in a day. More prose is measurably not working.
+- ENFORCEMENT TIER, stated explicitly as `tier: hook|script|test`. **`prose` is NOT a
+  recommendation tier.** A friction whose only available remedy is more prose in CLAUDE.md is
+  reported under its friction pattern and then explicitly closed with
+  `no mechanism - not recommended`, naming in one clause why no hook, script or test can carry
+  it. It does NOT become a numbered recommendation, does not get a rec-id, and is not carried
+  into the Next actions section. Reporting the friction is the deliverable; queueing prose is
+  not.
+  **Measured 2026-08-27, and this is why:** a CLAUDE.md prose rule does not change the
+  behaviour it forbids. Natural experiment on the "never append `; echo rc=$?` to a
+  backgrounded job" rule, which landed 2026-08-13 - violation RATE (violations per
+  backgrounded Bash call, same detector both sides) was 760/2443 = 31.11% over the 9 days
+  before and 588/1831 = 32.11% over the 14 days after; excluding the landing day, 27.3%. A
+  drift indistinguishable from noise across 1831 opportunities. That sits alongside the
+  2026-08-26 count that of 101 distinct pinned rules in the global CLAUDE.md, ZERO are enforced
+  by any hook, while the two most-repeated prose rules both recurred on 2026-08-25.
+  Prose is not a weak mechanism, it is not a measurable one; recommending it spends a session's
+  execution budget for no detected effect and inflates the taken-rec count with work that
+  cannot pay off.
   Before proposing `tier: hook`, score the matcher against the real corpus per rec:2026-08-23#4
   and print `real=N flagged=M CAUGHT=K`; a shape firing on more than ~1% of all calls of its
-  kind is a deny-list, and must be narrowed or dropped rather than shipped. A rule whose
+  kind is a deny-list, and must be narrowed or dropped rather than shipped. **Score on
+  PRECISION, not fire-rate**: a high fire-rate on a genuinely endemic defect is not a
+  false-positive rate, and conflating the two kills good matchers (2026-08-27: a shape flagged
+  19.92% of backgrounded calls and 238 of the 332 hits were real violations). A rule whose
   trigger is a CLAIM the agent writes later cannot be a PreToolUse hook at all - the hook
-  cannot see a sentence that does not exist yet - so it is `tier: prose` by construction.
+  cannot see a sentence that does not exist yet, so that friction is reported and closed as
+  `no mechanism`, never shipped as prose.
+  **Before recommending anything against a friction pattern, check the pattern's own
+  attribution holds.** A ranked pattern is a hypothesis about CAUSE, not just a count: label a
+  sample by OUTCOME (what happened next) rather than by the wording that produced the count,
+  and state the addressable fraction. 2026-08-29: the #1 pattern for eight consecutive days,
+  "premature stopping", was ranked on `human_wait` being 64% of session-seconds; labelled by
+  outcome, the agent-side share is 39h of 1268h = 3.0%, because ~97% of that wait ends with a
+  substantive human message carrying new direction. Eight days of recommendations and three
+  matcher designs rested on the unchecked attribution.
 - DEDUP against the last 21 days, using the `PRIOR rec:...` list supplied above. Read it
   before you write the ranked list, and give every recommendation a `Dedup:` line
   immediately under its heading, in one of exactly two shapes:

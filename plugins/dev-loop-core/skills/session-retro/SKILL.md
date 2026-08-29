@@ -32,13 +32,22 @@ global instruction file. The two strongest findings reproduced unanimously; it i
 that does not, and the tail is what this filters. Cost is +2 map calls/day (plan quota).
 A failed re-run degrades to single-run for that session rather than blocking the day.
 
-reduce is also **barred from emitting prose-tier recommendations on two themes** - putting
-the worktree/containment constraints into the agent files, and widening the Stop guard for
-the don't-stop-with-queued-work rule. Each has consumed 22 days and ~9 rec ids; the first
-theme's own latest entry concedes the substitution table is already inlined and subagents
-still hit it, and the second's last four entries are successive widenings of one guard.
-The friction is still reported; only a MECHANISM (`tier: hook|script|test`, corpus-scored)
-or an explicit accept-as-known-open line is allowed as the response.
+reduce is **barred from emitting prose-tier recommendations at all** (`prompts/reduce.md`,
+ENFORCEMENT TIER). Prose is not a weak mechanism, it is not a measurable one: a natural
+experiment on the "never append `; echo rc=$?`" rule, which landed 2026-08-13, put the
+violation rate at 31.11% over the 9 days before and 32.11% over the 14 days after, across
+1831 opportunities. The friction is still reported; only a MECHANISM
+(`tier: hook|script|test`, corpus-scored) or an explicit `no mechanism - not recommended`
+line is allowed as the response.
+
+Two themes are additionally closed outright, not merely down-tiered - putting the
+worktree/containment constraints into the agent files, and widening the Stop guard for the
+don't-stop-with-queued-work rule. Each consumed 22 days and ~9 rec ids; the first theme's own
+latest entry concedes the substitution table is already inlined and subagents still hit it,
+and the second's last four entries are successive widenings of one guard. The Stop-guard theme
+is now closed on evidence rather than on repetition: labelled by outcome, agent-side premature
+stopping is 39h of 1268h of human-wait (3.0%), because ~97% of that wait ends with a
+substantive human message carrying new direction. Do not re-open either without refuting that.
 
 reduce is also given the day's **repo & lander artifacts** (`scan_sessions.py
 day-artifacts`): per repo the day's sessions worked in, the merge/non-merge commit split,
