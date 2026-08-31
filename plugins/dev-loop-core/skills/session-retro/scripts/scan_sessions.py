@@ -1102,6 +1102,11 @@ def cmd_metrics(day):
         "cache_write_tokens": sum(s.get("cache_write_tokens", 0) for s in ss),
         "max_duration_secs": max((s.get("duration_secs", 0) for s in ss), default=0),
         "gate_calls": sum(s.get("gate_calls", 0) for s in ss),
+        # The TOTAL, not only the day's worst round: max answers "how long was the longest wait"
+        # and nothing answered "how much of the day went into gating", which is the number a
+        # gate-hours-per-land ratio needs. Session-hours like the wall-clock partition beside it -
+        # concurrent sessions overlap, so it is compared against those, never against 24h.
+        "gate_wait_secs": round(sum(s.get("gate_wait_secs", 0) for s in ss), 1),
         "max_gate_wait_secs": max((s.get("max_gate_wait_secs", 0) for s in ss), default=0),
         # wall-clock partition, summed across sessions (they overlap, so these are
         # session-hours, not clock-hours - compare the three against each other, not the day)
@@ -2274,7 +2279,11 @@ def selftest():
         (work / "scan.json").write_text(json.dumps({"sessions": [
             {"tools": {"Bash": 2}, "errors": 1, "interrupts": 0, "retries": 1,
              "denials": 0, "friction_score": 12.5, "total_tokens": 300,
-             "cache_write_tokens": 50, "duration_secs": 40.0}]}))
+             "cache_write_tokens": 50, "duration_secs": 40.0,
+             "gate_wait_secs": 30.0, "max_gate_wait_secs": 20.0},
+            {"tools": {}, "errors": 0, "interrupts": 0, "retries": 0, "denials": 0,
+             "friction_score": 1.0, "gate_wait_secs": 12.0,
+             "max_gate_wait_secs": 12.0}]}))
         cmd_metrics(date(2026, 7, 8))
         cmd_metrics(date(2026, 7, 8))
         lines = (REPORTS / "metrics.jsonl").read_text().splitlines()
@@ -2282,6 +2291,10 @@ def selftest():
         m = json.loads(lines[0])
         assert m["top_friction"] == 12.5
         assert (m["tokens"], m["cache_write_tokens"], m["max_duration_secs"]) == (300, 50, 40.0), m
+        # gate wait is SUMMED across sessions while its max is a MAX - two sessions of 30s and 12s
+        # are 42s of gating whose worst single round was 20s. Summing the maxes, or maxing the
+        # sums, both read 42/42 here and neither answers the question the other one asks.
+        assert (m["gate_wait_secs"], m["max_gate_wait_secs"]) == (42.0, 20.0), m
         # a pre-migration scan.json (no token fields) must not KeyError -> .get defaults
         (work / "scan.json").write_text(json.dumps({"sessions": [
             {"tools": {}, "errors": 0, "interrupts": 0, "retries": 0,
@@ -2289,6 +2302,7 @@ def selftest():
         cmd_metrics(date(2026, 7, 8))
         m2 = json.loads((REPORTS / "metrics.jsonl").read_text().splitlines()[0])
         assert m2["tokens"] == 0 and m2["max_duration_secs"] == 0, m2
+        assert m2["gate_wait_secs"] == 0.0, m2      # .get default, not a KeyError
         # ledger filter: valid passes (with OR without a trailing "(reason)" - real
         # actions-log.md prose settled on narrative endings with no parens starting
         # ~2026-08-12, and the old end-anchor dropped 72 of 103 real lines as
