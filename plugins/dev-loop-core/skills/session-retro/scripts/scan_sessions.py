@@ -1578,6 +1578,28 @@ def effectiveness_lines(day):
                 len(proposed), taken_n, verb_counts.get("applied", 0),
                 verb_counts.get("deferred", 0), verb_counts.get("rejected", 0),
                 len(undisposed), 100.0 * taken_n / len(proposed)))
+    # Per-TAG take rate. The aggregate above says adoption is the constraint; this asks whether
+    # it is concentrated anywhere. On the live corpus (2026-09-01) it is NOT, and this line
+    # exists mainly to keep that answer honest. Every UNDISPOSED id inside the window that day
+    # was `[claude-md]`, which reads as "prose recs do not get taken" - but measured, claude-md
+    # is 63/125 = 50% against an overall 51.9%. It dominates UNDISPOSED because it dominates
+    # VOLUME (125 of 210 proposed, 60%), not because its rate is worse. tooling 60% and skill
+    # 59% sit above; the lowest is code-org at 4/13 = 31%, n=13 and not separable from noise.
+    # So tag is a WEAK discriminator here and must not be used to justify the prose-tier ban -
+    # that ban rests on its own 1831-opportunity violation-rate measurement, not on this line.
+    # Read a tag's rate only when its n is large and the gap is wide; otherwise report neither.
+    tag_tot, tag_taken = collections.Counter(), collections.Counter()
+    for rid in proposed:
+        m = re.match(r"\s*\[([a-z-]+)\]", summ.get(rid, ""))
+        tag = m.group(1) if m else "untagged"
+        tag_tot[tag] += 1
+        if disp.get(rid) == "taken":
+            tag_taken[tag] += 1
+    if tag_tot:
+        parts = ["%s:%d/%d=%.0f%%" % (tg, tag_taken[tg], n, 100.0 * tag_taken[tg] / n)
+                 for tg, n in tag_tot.most_common()]
+        out.append("TAG-OUTCOMES taken/proposed " + " ".join(parts))
+
     win = (day - timedelta(days=PRIOR_REC_WINDOW)).isoformat()
     for rid in undisposed:
         dates = seen.get(rid, [])

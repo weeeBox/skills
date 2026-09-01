@@ -326,6 +326,14 @@ Ranked list, each tagged `[rec: <date>#<n>]`. Every recommendation MUST have BOT
   - Two or more UNDISPOSED ids on the same subject means that subject is barred by
     MEASUREMENT, exactly like the hand-written BARRED THEMES above, and needs no human to
     add it to that list. Report the friction and stop proposing against it.
+  - `TAG-OUTCOMES taken/proposed <tag>:K/N=R%` is the per-tag take rate. **Cite it only when
+    N is large and R is far from the overall `take_rate`** - it is a weak discriminator and
+    exists mostly to stop you drawing the obvious wrong inference from UNDISPOSED. Worked
+    example, 2026-09-01: every UNDISPOSED id that day was `[claude-md]`, which reads as
+    "prose recs are not taken", but claude-md measured 63/125 = 50% against an overall
+    51.9%. It dominated UNDISPOSED because it was 60% of everything ever proposed, not
+    because its rate was worse. Never use this line to argue for or against the prose-tier
+    ban, which rests on its own violation-rate measurement.
 - DEDUP against the last 21 days, using the `PRIOR rec:...` list supplied above. Read it
   before you write the ranked list, and give every recommendation a `Dedup:` line
   immediately under its heading, in one of exactly two shapes:
