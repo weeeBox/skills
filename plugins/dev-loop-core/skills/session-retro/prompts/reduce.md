@@ -309,6 +309,23 @@ Ranked list, each tagged `[rec: <date>#<n>]`. Every recommendation MUST have BOT
   outcome, the agent-side share is 39h of 1268h = 3.0%, because ~97% of that wait ends with a
   substantive human message carrying new direction. Eight days of recommendations and three
   matcher designs rested on the unchecked attribution.
+- **USE THE LEDGER-COVERAGE AND UNDISPOSED LINES before you rank.** The digest now carries
+  the non-taken half of the loop's own history, because ranking against a success-only view
+  of it is survivorship bias: measured 2026-09-01, `taken` covered 110 of the 210 ids ever
+  proposed, so the 12 `rejected`, 11 `deferred`, 16 `applied` and 62 never-judged ids were
+  invisible here.
+  - `LEDGER-COVERAGE ... take_rate:N%` is the fraction of everything you have ever proposed
+    that was actually taken. If it is falling, the constraint is adoption, not detection -
+    prefer ONE mechanism-tier recommendation over a long ranked list, and say so in one line.
+  - An `UNDISPOSED rec:<id>` line means you already proposed that thing inside the dedup
+    window and nobody acted on it - not that it was rejected, and not that it was done. If
+    your recommendation's `Dedup:` line names an UNDISPOSED id, re-proposing it unchanged is
+    the failure mode: either RAISE its tier (name the hook/script/test that a prose rule
+    could not carry), or close it under its friction pattern as `known-open, N days
+    undisposed`. Do not re-emit it identically under a fresh id.
+  - Two or more UNDISPOSED ids on the same subject means that subject is barred by
+    MEASUREMENT, exactly like the hand-written BARRED THEMES above, and needs no human to
+    add it to that list. Report the friction and stop proposing against it.
 - DEDUP against the last 21 days, using the `PRIOR rec:...` list supplied above. Read it
   before you write the ranked list, and give every recommendation a `Dedup:` line
   immediately under its heading, in one of exactly two shapes:

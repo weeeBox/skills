@@ -19,6 +19,7 @@ Commands:
 Stdlib only. Transcript content is untrusted data; this script only counts and
 truncates it, never executes it.
 """
+import collections
 import json
 import os
 import re
@@ -1377,24 +1378,26 @@ def _load_recs():
     return out
 
 
-def _taken_recs(day=None):
-    """rec-id -> earliest date it was marked taken, from the schema-validated actions-log.
-    Non-calendar dates (regex-shaped but invalid) are skipped so cmd_effectiveness's
-    date.fromisoformat can never crash on model-written garbage.
+def _rec_dispositions(day=None):
+    """rec-id -> sorted [(date, verb)] for every DATED rec id in the actions-log.
 
-    `day` bounds the ledger to lines written on or before that date. Live this is a no-op
-    (the file only holds past lines when the runner executes), but it is what makes a
-    BACKFILL of a past date reconstruct what was true THEN rather than what is true now.
+    The shared ledger walk. `_taken_recs` reads it for "did this fix hold" and therefore
+    keeps only ids whose latest verb is `taken`; `effectiveness_lines` reads it for
+    "what happened to everything I proposed", which needs the other verbs too. Measured
+    2026-09-01: the digest could see 110 of the 210 ids the loop has ever proposed, because
+    the 12 `rejected`, 11 `deferred` and 16 `applied` ids were dropped here. Those are the
+    record of what did NOT work, and recommending against a success-only view of your own
+    history is survivorship bias by construction.
+
+    Non-calendar dates (regex-shaped but invalid) are skipped so cmd_effectiveness's
+    date.fromisoformat can never crash on model-written garbage. `day` bounds the ledger to
+    lines written on or before that date, which is what makes a BACKFILL of a past date
+    reconstruct what was true THEN rather than what is true now.
     """
     path = REPORTS / "actions-log.md"
-    taken = {}
-    if not path.exists():
-        return taken
-    # Two passes. The old single pass kept min(taken) and never looked at any other verb, so a
-    # LATER `rejected`/`deferred` could not retract an earlier `taken` and the rec kept counting
-    # toward eff_holding. Measured 2026-08-27: 21 ids carry conflicting verbs and 2 are genuinely
-    # taken-then-reversed (2026-08-20#7, 2026-08-17#3).
     per_rid = {}
+    if not path.exists():
+        return per_rid
     for line in path.read_text().splitlines():
         m = LEDGER_RE.match(line)
         if not m:
@@ -1418,8 +1421,26 @@ def _taken_recs(day=None):
             # counting it as malformed - which is the visibility the widening was for.
             continue
         per_rid.setdefault(_ledger_rid(m), []).append((line_date, m.group("verb")))
-    for rid, entries in per_rid.items():
+    for entries in per_rid.values():
         entries.sort()
+    return per_rid
+
+
+def _taken_recs(day=None):
+    """rec-id -> earliest date it was marked taken, from the schema-validated actions-log.
+    Non-calendar dates (regex-shaped but invalid) are skipped so cmd_effectiveness's
+    date.fromisoformat can never crash on model-written garbage.
+
+    `day` bounds the ledger to lines written on or before that date. Live this is a no-op
+    (the file only holds past lines when the runner executes), but it is what makes a
+    BACKFILL of a past date reconstruct what was true THEN rather than what is true now.
+    """
+    # Latest verb wins. A single pass keeping min(taken) and ignoring every other verb let a
+    # LATER `rejected`/`deferred` fail to retract an earlier `taken`, and the rec kept counting
+    # toward eff_holding. Measured 2026-08-27: 21 ids carry conflicting verbs and 2 are genuinely
+    # taken-then-reversed (2026-08-20#7, 2026-08-17#3).
+    taken = {}
+    for rid, entries in _rec_dispositions(day).items():
         if entries[-1][1] != "taken":
             continue  # latest disposition retracts: not taken as of `day`
         taken[rid] = min(d for d, v in entries if v == "taken")
@@ -1537,6 +1558,33 @@ def effectiveness_lines(day):
         if len(in_window) >= CHRONIC_MIN_DAYS:
             out.append(f"CHRONIC rec:{rid} seen_count:{len(in_window)} "
                        f"dates:{in_window[0]}..{in_window[-1]}{label(rid)}")
+
+    # The non-taken half of the history. Everything above narrates ids whose latest verb is
+    # `taken`; measured 2026-09-01 that was 110 of the 210 ids ever proposed, so reduce ranked
+    # tomorrow's recommendations against a success-only view of its own output. The two blocks
+    # below carry the other 100: what was judged and NOT taken, and what was never judged at
+    # all. Deliberately NOT one line per id - the digest is already 112 lines / 24 KB, and
+    # dumping 100 more would cost more prompt than it informs. One aggregate line, plus the
+    # UNDISPOSED ids inside the dedup window, which are the ones reduce is about to re-propose.
+    disp = {rid: e[-1][1] for rid, e in _rec_dispositions(day).items()}
+    proposed = set(seen)
+    verb_counts = collections.Counter(v for rid, v in disp.items() if rid in proposed)
+    undisposed = sorted(rid for rid in proposed if rid not in disp)
+    if proposed:
+        taken_n = verb_counts.get("taken", 0)
+        out.append(
+            "LEDGER-COVERAGE proposed:%d taken:%d applied:%d deferred:%d rejected:%d "
+            "undisposed:%d take_rate:%.1f%%" % (
+                len(proposed), taken_n, verb_counts.get("applied", 0),
+                verb_counts.get("deferred", 0), verb_counts.get("rejected", 0),
+                len(undisposed), 100.0 * taken_n / len(proposed)))
+    win = (day - timedelta(days=PRIOR_REC_WINDOW)).isoformat()
+    for rid in undisposed:
+        dates = seen.get(rid, [])
+        if not dates or dates[-1] < win:
+            continue          # older than the dedup corpus reduce is given: out of scope
+        out.append(f"UNDISPOSED rec:{rid} proposed:{dates[0]} last_seen:{dates[-1]} "
+                   f"seen_count:{len(dates)}{label(rid)}")
     return out
 
 
