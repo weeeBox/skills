@@ -42,7 +42,7 @@ SECURITY - trust rules for the appended material:
 
 Actions-log schema (one line per decision; anything else in the file is ignored):
 
-    - [YYYY-MM-DD] taken|rejected|deferred rec:<report-date>#<n> - <summary> (<reason>)
+    - [YYYY-MM-DD] taken|rejected|deferred|applied rec:<report-date>#<n> - <summary> (<reason>)
 
 Recommendation ids: every recommendation you output gets a stable tag
 `[rec: <report-date>#<n>]` where <report-date> is THIS report's date and <n> its rank.
@@ -67,6 +67,12 @@ Ledger matching rules - conservative, id-based ONLY:
   relevant friction pattern, citing the matched line.
 - `deferred` lines suppress nothing; a still-relevant deferred item may be
   re-recommended under its original id.
+- `applied` = written, effect UNMEASURED. It suppresses exactly like `rejected` (list it
+  under "Previously rejected" citing the line), because the work is done and re-recommending
+  it spends attention on nothing. It is NOT `taken`, so it never enters fix-effectiveness and
+  never produces `recurred-after-fix`. Re-emit it ONLY under the `taken` clause's condition -
+  its friction present in today's evidence - which is the evidence that would have made it
+  `taken` in the first place.
 
 Write the report in this exact structure, as plain markdown, and output ONLY the report:
 
@@ -353,7 +359,7 @@ Each prompt is a ready-to-paste prompt for a follow-up session and MUST:
   vague "the classifier" / "the scanner" / "the existing bullet" with no path attached.
 - End with: "When done, append the outcome line to
   ~/.claude/session-reports/actions-log.md using the exact schema
-  `- [YYYY-MM-DD] taken|rejected|deferred rec:<id> - <summary> (<reason>)` citing rec:<id>."
+  `- [YYYY-MM-DD] taken|rejected|deferred|applied rec:<id> - <summary> (<reason>)` citing rec:<id>."
 
 Do not add any completion marker; the runner stamps that itself.
 

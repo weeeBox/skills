@@ -1171,8 +1171,14 @@ def cmd_metrics(day):
 # regex dropped as malformed (3) or that NON_DISPOSITION_RE's `\w+ rule:` arm absorbed as
 # prose (4). Measured 2026-08-27: 7 real dispositions of 176 never reached the digest.
 # `superseded` is a verb because the log already carries 3 such lines with real id->id links.
+# `applied` is the third disposition for WRITTEN, EFFECT UNMEASURED. `taken` is defined as
+# APPLIED AND OBSERVED TAKING EFFECT and `deferred` as not-started; 16 of the ledger's 37
+# deferred items were neither, so the deferred count overstated open work by ~43% and each of
+# the 16 resurfaced daily as an open rec (actions-log reconciliation, 2026-09-01). Mechanically
+# `applied` behaves like `rejected`/`deferred` here - it is not `taken`, so it never enters the
+# effectiveness index - and reduce.md gives it the suppression half.
 LEDGER_RE = re.compile(
-    r"^- \[(?P<line_date>\d{4}-\d{2}-\d{2})\] (?P<verb>taken|rejected|deferred|superseded)"
+    r"^- \[(?P<line_date>\d{4}-\d{2}-\d{2})\] (?P<verb>taken|rejected|deferred|superseded|applied)"
     r"(?: \([^)]*\))? "
     r"(?:rec:(?P<rec_date>\d{4}-\d{2}-\d{2})#(?P<rec_n>\d+[a-z]?)"
     r"|(?P<kind>rec|rule):(?P<slug>[A-Za-z][A-Za-z0-9._-]*))"
@@ -2420,6 +2426,7 @@ def selftest():
             ("- [2026-08-27] taken rec:loop-detection-latency - slug id, no report date", "rec:loop-detection-latency"),
             ("- [2026-08-26] rejected rule:bash-command-shape-hook - a rule adoption", "rule:bash-command-shape-hook"),
             ("- [2026-08-26] superseded rec:2026-08-15#4 - subsumed by a later rec", "2026-08-15#4"),
+            ("- [2026-09-01] applied rec:2026-08-15#4 - written, effect unmeasured", "2026-08-15#4"),
         ):
             m = LEDGER_RE.match(good)
             assert m, good

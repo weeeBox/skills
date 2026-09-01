@@ -196,7 +196,8 @@ resuming turn opened with *"Not done… Taking #2 and #7 now"*). The global rule
 first bullet of `~/.claude/CLAUDE.md` and was in context in every one of those sessions - prose is
 not the lever.
 
-A rec is open unless `session-reports/actions-log.md` carries a `taken`/`rejected`/`deferred` line
+A rec is open unless `session-reports/actions-log.md` carries a
+`taken`/`rejected`/`deferred`/`applied` line
 citing its exact id. Check before queueing, and append the outcome line when you finish one.
 
 ## Closing the loop (metrics + actions ledger)
@@ -405,10 +406,12 @@ citing its exact id. Check before queueing, and append the outcome line when you
   nameable (not neutral async wait) - so a slow/thrashing codex or agy gate surfaces as a
   finding instead of hiding inside `largest_gaps`.
 - `session-reports/actions-log.md` - recommendation-outcome ledger, STRICT schema:
-  `- [YYYY-MM-DD] taken|rejected|deferred rec:<report-date>#<n> - <summary> (<reason>)`.
+  `- [YYYY-MM-DD] taken|rejected|deferred|applied rec:<report-date>#<n> - <summary> (<reason>)`.
   When you act on (or reject) a report recommendation - including manually - append an
   outcome line citing its `rec:` id. Reports suppress only on exact id match to a
-  `rejected` line and outcome-check `taken` ones; non-conforming lines are ignored.
+  `rejected` or `applied` line and outcome-check `taken` ones; non-conforming lines are
+  ignored. `applied` = written but effect unmeasured: done, so it stops resurfacing, but it
+  is not `taken` and never enters fix-effectiveness.
 
 ## Cost
 
