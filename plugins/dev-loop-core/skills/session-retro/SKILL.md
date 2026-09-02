@@ -123,8 +123,15 @@ usable days are in range), and an effectiveness-digest snapshot (holding /
 recurred-after-fix / too-soon / CHRONIC counts) as of the most recent stamped report. A
 day with `coverage_hours` below `MIN_TREND_COVERAGE_HOURS` (no sessions, or an all-retro-
 stub day) is marked `low-coverage` and excluded from the split - never silently averaged
-in as if it were a great quiet day. `errors_per_hour` is the primary axis;
-`friction_score` is printed too but is noisier (tracks how messy what was ATTEMPTED was,
+in as if it were a great quiet day. `tool_failures_per_hour` is the primary axis;
+`errors_per_hour` is the pre-2026-08-26 undivided counter, printed for continuity with
+old rows and never a friction axis. **An axis missing from part of the window is printed
+`NOT COMPARABLE` with its coverage instead of being trended** - it changed definition
+inside the window, so the direction would report WHEN the counter landed rather than how
+the work went. Measured 2026-09-02 on 36 days of this machine's own history:
+`tool_failures_per_hour` existed on 7 of 30 usable days while `trends` printed
+`errors/hr (primary) ... (down)` across both the 08-17 wall-clock re-bucketing and the
+08-26 error split. `friction_score` is printed too but is noisier (tracks how messy what was ATTEMPTED was,
 not whether the process is improving) - a shrinking CHRONIC count over weeks is the
 stronger "is this actually getting better" signal. Read-only: never writes
 recs.jsonl/actions-log.md/metrics.jsonl.

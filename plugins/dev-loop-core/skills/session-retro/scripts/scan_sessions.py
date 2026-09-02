@@ -1915,9 +1915,12 @@ def cmd_trends(days=14):
     rows, plus an effectiveness-digest snapshot as of the most recent stamped report.
     Read-only - never writes recs.jsonl/actions-log.md/metrics.jsonl.
 
-    `errors_per_hour` / `tool_calls_per_hour` are the primary axes (already rate-
-    normalized, so a busy day and a quiet day are comparable - a raw count conflates
-    volume with quality). A day with < MIN_TREND_COVERAGE_HOURS of coverage (no sessions,
+    `tool_failures_per_hour` / `tool_calls_per_hour` are the primary axes (already
+    rate-normalized, so a busy day and a quiet day are comparable - a raw count conflates
+    volume with quality). `errors_per_hour` is the pre-2026-08-26 UNDIVIDED counter - it
+    also sums policy blocks and harness outages, so a fall in it is equally consistent
+    with "the guardrails were relaxed" and "the API had a better day"; it is printed for
+    continuity with old rows and is never a friction axis. A day with < MIN_TREND_COVERAGE_HOURS of coverage (no sessions,
     or an all-retro-stub day) is marked `low-coverage` in the table and EXCLUDED from the
     trend split, never silently averaged in as if it were a great quiet day.
     `top_friction`/friction_score is printed too but is the noisier axis - it tracks how
@@ -1928,8 +1931,9 @@ def cmd_trends(days=14):
     if not rows:
         print("no metrics.jsonl history yet")
         return
-    print(f"{'date':<12} {'sess':>4} {'cov_h':>6} {'tools/hr':>9} {'err/hr':>7} "
-          f"{'friction':>9} {'gates':>6} {'max_gate_wait':>13} {'human_wait%':>12}")
+    print(f"{'date':<12} {'sess':>4} {'cov_h':>6} {'tools/hr':>9} {'tf/hr':>7} "
+          f"{'err/hr':>7} {'friction':>9} {'gates':>6} {'max_gate_wait':>13} "
+          f"{'human_wait%':>12}")
     usable = []
     for r in rows:
         ch = r.get("coverage_hours")
@@ -1943,7 +1947,9 @@ def cmd_trends(days=14):
             return f"{v if v is not None else '-':>{width}}"
 
         print(f"{r['date']:<12} {r.get('sessions', 0):>4} {cell(ch, 6)} "
-              f"{cell(r.get('tool_calls_per_hour'), 9)} {cell(r.get('errors_per_hour'), 7)} "
+              f"{cell(r.get('tool_calls_per_hour'), 9)} "
+              f"{cell(r.get('tool_failures_per_hour'), 7)} "
+              f"{cell(r.get('errors_per_hour'), 7)} "
               f"{r.get('top_friction', 0):>9} {r.get('gate_calls', 0):>6} "
               f"{r.get('max_gate_wait_secs', 0):>13} {cell(hw_pct, 12)}"
               f"{' low-coverage' if low else ''}")
@@ -1957,9 +1963,24 @@ def cmd_trends(days=14):
     if len(usable) >= MIN_TREND_SPLIT_DAYS:
         half = len(usable) // 2
         first, second = usable[:half], usable[half:]
-        for key, label_ in (("errors_per_hour", "errors/hr (primary)"),
+        for key, label_ in (("tool_failures_per_hour", "tool_failures/hr (primary)"),
+                            ("errors_per_hour", "errors/hr (legacy mixed counter)"),
                             ("tool_calls_per_hour", "tool_calls/hr"),
                             ("top_friction", "friction_score (noisier axis)")):
+            # A key missing from part of the window changed DEFINITION inside it (added,
+            # or split off an older counter), so the two halves measure different things
+            # and the printed direction is an artifact of WHEN the counter landed. Refuse
+            # the split instead of printing a number nobody can read. Measured 2026-09-02
+            # on this machine's own history: `tool_failures_per_hour` existed on 7 of 30
+            # usable days, while this function printed `errors/hr (primary) ... (down)`
+            # off the undivided counter that scan_file's own comments say must not be read
+            # as friction - across both the 08-17 wall-clock re-bucketing and the 08-26
+            # error split.
+            have = sum(1 for r in usable if r.get(key) is not None)
+            if have < len(usable):
+                print(f"trend {label_}: NOT COMPARABLE - present on {have} of "
+                      f"{len(usable)} usable days (counter added or redefined mid-window)")
+                continue
             a, b_ = avg(first, key), avg(second, key)
             if a is not None and b_ is not None:
                 direction = "down" if b_ < a else ("up" if b_ > a else "flat")
@@ -2786,19 +2807,29 @@ def selftest():
         # above, so reordering them can't silently break this one.
         for f in REPORTS.glob("????-??-??.md"):
             f.unlink()
-        for iso, epr, tph, fric in [
-            ("2026-07-20", 10.0, 100.0, 30.0), ("2026-07-21", 12.0, 110.0, 32.0),
-            ("2026-07-22", 8.0, 90.0, 28.0), ("2026-07-23", 10.0, 100.0, 30.0),
-            ("2026-07-24", 2.0, 50.0, 10.0), ("2026-07-25", 3.0, 55.0, 12.0),
-            ("2026-07-26", 1.0, 45.0, 8.0), ("2026-07-27", 2.0, 50.0, 10.0),
-        ]:
-            _upsert_jsonl(REPORTS / "metrics.jsonl", {
-                "date": iso, "sessions": 5, "coverage_hours": 5.0,
-                "errors_per_hour": epr, "tool_calls_per_hour": tph, "top_friction": fric,
-                "gate_calls": 1, "max_gate_wait_secs": 1.0, "work_secs": 10.0,
-                "human_wait_secs": 10.0, "blocked_secs": 0.0, "model_latency_secs": 0.0,
-                "idle_secs": 0.0,
-            }, key="date")
+        def _write_metrics(tf_from):
+            """Fixture writer. `tf_from` = first date carrying tool_failures_per_hour,
+            so one call makes the counter partial (added mid-window, like the real
+            2026-08-26 error split) and another makes it cover every usable day."""
+            for iso, epr, tph, fric in [
+                ("2026-07-20", 10.0, 100.0, 30.0), ("2026-07-21", 12.0, 110.0, 32.0),
+                ("2026-07-22", 8.0, 90.0, 28.0), ("2026-07-23", 10.0, 100.0, 30.0),
+                ("2026-07-24", 2.0, 50.0, 10.0), ("2026-07-25", 3.0, 55.0, 12.0),
+                ("2026-07-26", 1.0, 45.0, 8.0), ("2026-07-27", 2.0, 50.0, 10.0),
+            ]:
+                row = {
+                    "date": iso, "sessions": 5, "coverage_hours": 5.0,
+                    "errors_per_hour": epr, "tool_calls_per_hour": tph,
+                    "top_friction": fric,
+                    "gate_calls": 1, "max_gate_wait_secs": 1.0, "work_secs": 10.0,
+                    "human_wait_secs": 10.0, "blocked_secs": 0.0,
+                    "model_latency_secs": 0.0, "idle_secs": 0.0,
+                }
+                if iso >= tf_from:
+                    row["tool_failures_per_hour"] = epr / 2
+                _upsert_jsonl(REPORTS / "metrics.jsonl", row, key="date")
+
+        _write_metrics("2026-07-24")   # counter present on the last 4 of 8 days
         # a low-coverage day in the SAME window must not pollute the trend average
         _upsert_jsonl(REPORTS / "metrics.jsonl", {
             "date": "2026-07-19", "sessions": 0, "coverage_hours": None,
@@ -2815,13 +2846,30 @@ def selftest():
         with _rso(buf_t):
             cmd_trends(days=9)
         out_t = buf_t.getvalue()
-        assert "trend errors/hr (primary): first-half avg 10.0 -> second-half avg 2.0 (down)" in out_t, out_t
+        # tool_failures_per_hour is on the last 4 rows only -> the split must be
+        # REFUSED for it, while the fully-present keys still trend.
+        assert ("trend tool_failures/hr (primary): NOT COMPARABLE - present on 4 of 8 "
+                "usable days (counter added or redefined mid-window)") in out_t, out_t
+        assert ("trend errors/hr (legacy mixed counter): first-half avg 10.0 -> "
+                "second-half avg 2.0 (down)") in out_t, out_t
         assert "trend tool_calls/hr: first-half avg 100.0 -> second-half avg 50.0 (down)" in out_t, out_t
         assert ("trend friction_score (noisier axis): first-half avg 30.0 -> "
                 "second-half avg 10.0 (down)") in out_t, out_t
         row_2026_07_19 = next(l for l in out_t.splitlines() if l.startswith("2026-07-19"))
         assert "low-coverage" in row_2026_07_19, row_2026_07_19
         assert "effectiveness as of 2026-07-27: holding=1" in out_t, out_t
+
+        # Same window, same numbers, counter now on EVERY usable day -> the refusal
+        # lifts and the primary axis trends. Without this half the assert above passes
+        # for a cmd_trends that simply never trends tool_failures/hr at all.
+        _write_metrics("2026-07-20")
+        buf_t2 = _io.StringIO()
+        with _rso(buf_t2):
+            cmd_trends(days=9)
+        out_t2 = buf_t2.getvalue()
+        assert ("trend tool_failures/hr (primary): first-half avg 5.0 -> "
+                "second-half avg 1.0 (down)") in out_t2, out_t2
+        assert "NOT COMPARABLE" not in out_t2, out_t2
     REPORTS = real_reports
 
     # --- still_active must name only sessions that HAVE a record (2026-08-10) ---
