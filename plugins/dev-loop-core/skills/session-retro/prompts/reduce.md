@@ -90,6 +90,14 @@ re-derive or re-total it.** For day totals use **`scan.json`'s top-level `totals
 `totals.tool_calls`, `totals.errors`, `totals.interrupts`, `totals.retries`,
 `totals.denials`, `totals.sessions`. Do NOT sum the per-session `tools` dicts yourself.
 
+**State the analysis coverage in the Scoreboard, every day**: `totals.sessions_analyzed` of
+`totals.sessions_eligible` eligible (`totals.analysis_coverage_pct`%), against
+`totals.sessions` on the day. The analyst cap is fixed while the session count is not, so the
+share of the day actually READ falls as the day gets busier - 25-36% on the busiest days
+measured over 36 days, against 52.8% overall. Every finding below it is drawn from that share, so a reader who is
+not shown the denominator reads "8 sessions analyzed" as "the day". If the field is absent
+(a scan.json predating it), write `coverage unavailable` - never drop the line.
+
 This rule was previously impossible to obey and was disobeyed accordingly. `scan.json` had
 no day total, and `metrics.jsonl`'s row for the report date is written AFTER stamping, so
 the only way to produce a tool-call total was the in-head re-total the rule forbids.

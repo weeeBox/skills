@@ -952,6 +952,22 @@ def is_retro_stub(s):
     return not _first_user_text(s["path"]).startswith(REDUCE_ANCHOR) if s.get("path") else True
 
 
+def eligible_sessions(sessions):
+    """Sessions that CAN take an analysis slot - everything but the retro's own calls.
+
+    The denominator of the coverage ratio, and the input pick_sessions ranks. One
+    definition, used by both: a denominator computed separately from the filter it
+    describes drifts the first time either moves.
+    """
+    return [s for s in sessions if not is_retro_stub(s)]
+
+
+def coverage_pct(analyzed, eligible):
+    """Share of eligible sessions that got an analyst call. None when nothing was
+    eligible - a day with no analysable sessions has no coverage, which is not 0%."""
+    return round(100.0 * analyzed / eligible, 1) if eligible else None
+
+
 def pick_sessions(sessions, cap):
     """Choose which `cap` sessions get an evidence extract -> (picked, slow_reserved).
 
@@ -970,7 +986,7 @@ def pick_sessions(sessions, cap):
     were dropped entirely. Key on the actual cut instead, with a duration floor so a quiet
     day cannot reserve trivia.
     """
-    sessions = [s for s in sessions if not is_retro_stub(s)]
+    sessions = eligible_sessions(sessions)
     fric = [s for s in sessions if s["friction_score"] > 0]
     above_cut = {(s["project"], s["session"]) for s in fric[:cap]}
     slow = sorted((s for s in sessions if s.get("duration_secs", 0) > 0),
@@ -1080,7 +1096,29 @@ def cmd_extract(day, top):
             if p.stem < day.isoformat() and COMPLETE_MARKER in p.read_text()]
     if prev:
         (workdir / "previous-report.md").write_text(prev[-1].read_text())
+    # COVERAGE. The `--top 8` cap is fixed while the session count is not, so the
+    # share of the day an analyst ever sees FALLS as the day gets busier - the days with
+    # the most friction to find are the ones seen least. Measured 2026-09-02 over 36 days:
+    # 216 of 409 eligible sessions analysed (52.8%), but 25.0% on 08-04, 28.6% on 08-26 and
+    # 36.4% on 08-17 - the three busiest. (A first pass put this at 38% by dividing by RAW
+    # session count; retro stubs are not work and do not belong in the denominator. The
+    # ratio is only honest against `eligible_sessions()`, which is why it is computed here
+    # rather than by a reader dividing two numbers that look adjacent.)
+    # Nothing reported this: the report says "8 sessions analysed", never "of 28". Written
+    # into scan.json's `totals` (not computed here for print only) so reduce copies it
+    # under the same copy-never-re-derive rule as every other day total, and so
+    # cmd_metrics can carry it into metrics.jsonl for a trend.
+    eligible = eligible_sessions(result["sessions"])
+    result.setdefault("totals", {}).update({
+        "sessions_eligible": len(eligible),
+        "sessions_analyzed": len(picked),
+        "analysis_coverage_pct": coverage_pct(len(picked), len(eligible)),
+    })
+    scan_path.write_text(json.dumps(result, indent=1))
     print(f"extracted {len(picked)} sessions to {workdir}")
+    print(f"analysis coverage: {len(picked)} of {len(eligible)} eligible "
+          f"({result['totals']['analysis_coverage_pct']}%) of "
+          f"{len(result['sessions'])} sessions on the day")
 
 
 def cmd_metrics(day):
@@ -1151,6 +1189,12 @@ def cmd_metrics(day):
     # How many actions-log lines the reader could not parse on this date. A silent drop in
     # the instrument that measures adoption is exactly the defect this pair of fields exists
     # to make visible; `ledger_non_disposition` is the KNOWN-benign half (FINDING/NOTE/rule:).
+    # Analysis coverage, written by cmd_extract into scan.json's totals. Absent on a
+    # stub day (extract never ran) and on any scan.json predating the field - None, not 0.
+    _tot = scan.get("totals", {})
+    line["sessions_eligible"] = _tot.get("sessions_eligible")
+    line["sessions_analyzed"] = _tot.get("sessions_analyzed")
+    line["analysis_coverage_pct"] = _tot.get("analysis_coverage_pct")
     malformed, non_disp = ledger_drops()
     line["ledger_malformed"] = malformed
     line["ledger_non_disposition"] = non_disp
@@ -2402,6 +2446,16 @@ def selftest():
     assert len(picked) == 8, ids
     assert "long" in ids and [s["session"] for s in reserved] == ["long"], (ids, reserved)
     assert "stub1" not in ids and "stub2" not in ids, ids
+    # The coverage denominator is the ELIGIBLE set - every session that could have taken
+    # a slot, including the quiet ones the cap never reaches. Only the retro's own calls
+    # are excluded (they are not work). These two "stub" fixtures are ordinary quiet
+    # sessions, so they stay in the denominator: 8 of 11 analysed, 72.7%.
+    assert len(eligible_sessions(day_sessions)) == 11, len(eligible_sessions(day_sessions))
+    assert coverage_pct(len(picked), len(eligible_sessions(day_sessions))) == 72.7
+    assert coverage_pct(1, 2) == 50.0 and coverage_pct(0, 0) is None
+    # a retro stub IS excluded - it is the pipeline analysing itself, not a session
+    assert len(eligible_sessions(day_sessions + [_s("r", 0, 100, project="-", tools={},
+                                                    user_turns=1)])) == 11
     # floor: on a quiet day nothing below SLOW_RESERVE_MIN_SECS may be reserved
     _, quiet = pick_sessions([_s("f0", 5, 100), _s("stub1", 0, 60)], 8)
     assert quiet == [], quiet
@@ -2911,6 +2965,13 @@ def selftest():
                     assert "totals" in on_disk, list(on_disk)
                     assert on_disk["totals"]["sessions"] == 1, on_disk["totals"]
                     assert on_disk["totals"]["tool_calls"] == 0, on_disk["totals"]
+                    # cmd_extract must WRITE the coverage back, not merely compute it
+                    cmd_extract(date(2026, 7, 8), 8)
+                    after = json.loads(
+                        (REPORTS / "work" / "2026-07-08" / "scan.json").read_text())
+                    assert after["totals"]["sessions_eligible"] == 1, after["totals"]
+                    assert after["totals"]["sessions_analyzed"] == 0, after["totals"]
+                    assert after["totals"]["analysis_coverage_pct"] == 0.0, after["totals"]
             finally:
                 REPORTS = _real_reports
     finally:

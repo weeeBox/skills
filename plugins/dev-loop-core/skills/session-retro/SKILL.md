@@ -214,6 +214,20 @@ citing its exact id. Check before queueing, and append the outcome line when you
   codex/agy review-gate volume and slowest single wait, and the wall-clock partition below);
   the reduce prompt reads the last 14 for trends. Upserted atomically by
   `scan_sessions.py metrics --date D` after a report completes; safe to backfill manually.
+- **Analysis coverage (`sessions_analyzed` / `sessions_eligible` /
+  `analysis_coverage_pct`).** Written by `extract` into `scan.json`'s `totals`, carried into
+  `metrics.jsonl`, and stated by reduce in the Scoreboard. `--top 8` is fixed while the
+  session count is not, so the share of a day an analyst ever reads FALLS as the day gets
+  busier - and the busiest days are the ones with the most friction to find. Measured
+  2026-09-02 over 36 days: **216 of 409 eligible sessions analyzed (52.8%), falling to 25.0%
+  (08-04), 28.6% (08-26) and 36.4% (08-17) on the busiest days**, with nothing anywhere
+  reporting it - the report said "8 sessions analyzed" and never "of 28". Divide by RAW
+  session count instead and you get 38%, which is wrong in the other direction: retro stubs
+  are not work. The denominator is the ELIGIBLE set (`eligible_sessions()`: retro stubs
+  dropped, quiet sessions kept, since a quiet session could have taken a slot), so it is the
+  same filter `pick_sessions` ranks - one definition, not two. This is an instrument, not a
+  fix: it makes "is 8 the right cap" a question with data behind it instead of a constant
+  nobody revisits.
 - **Wall-clock partition (`work_secs` / `human_wait_secs` / `blocked_secs` /
   `model_latency_secs` / `idle_secs`).** Every inter-event gap lands in exactly one bucket, so
   the five sum to the session's span. **A gap is classified by the PAIR of events that bound
