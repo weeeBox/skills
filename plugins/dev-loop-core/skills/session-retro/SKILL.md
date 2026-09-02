@@ -309,7 +309,17 @@ citing its exact id. Check before queueing, and append the outcome line when you
   trajectory - while TOOL_ERROR, the friction evidence, is 0.5% of the bytes. Do not rebuild
   that. The default stays at 100,000 because raising it spends plan quota every day, which is
   a decision for the reader; override it for one investigation with
-  `RETRO_MAX_EXTRACT_BYTES=400000 ... extract --date D`.
+  `RETRO_MAX_EXTRACT_BYTES=400000 ... extract --date D`. **Two things the override does not
+  do on its own.** (1) `run_retro.sh` reuses any existing `findings-<id>.md` (its line
+  `reusing findings for $id`), so re-extracting at a bigger cap and re-running the day
+  analyses NOTHING new - delete the matching `findings-*.md` too, or the larger extract is
+  never read. (2) It is one budget for all 8 extracts, so raising it to see one mega-session
+  also inflates the ones already under the cap; the extract header now carries
+  `extract_cap=` / `body_budget=` so an artifact says which budget produced it, since
+  otherwise two extracts of the same session at different caps are indistinguishable.
+  Set it too high and the map call overruns the model context, gets retried 3x and then
+  DROPPED - so the session you raised the cap to see is the one missing from the report;
+  the cause is in `work/<date>/map-err-<id>.log`.
 - **The whole TRAJECTORY is clipped from the middle too, for the same reason** (fixed 2026-08-17,
   `trajectory_clip`). The extract loop used to `break` at the byte cap, which kept the session's
   HEAD - but a session's lands, cleanups and destructive commands live in its TAIL. Measured on

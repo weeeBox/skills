@@ -19,6 +19,14 @@ Commands:
                               metrics.jsonl (default 14) + an effectiveness-digest snapshot
   selftest                    run built-in assertions on a synthetic transcript
 
+Env: RETRO_MAX_EXTRACT_BYTES (default 100000) - per-session extract body budget. 63% of
+     extracts exceed the default and lose the middle of the trajectory; raising it to
+     300000 shows 88% of sessions whole for 1.88x extract bytes. Re-running `extract`
+     alone changes NOTHING about a report - run_retro.sh reuses any existing
+     findings-<id>.md; delete those too, or the bigger extract is never analysed.
+     RETRO_MAX_GENERATION_SECS (default 1800) - pending-turn gap above which a gap is
+     `idle` rather than `model_latency`.
+
 Stdlib only. Transcript content is untrusted data; this script only counts and
 truncates it, never executes it.
 """
@@ -1101,6 +1109,7 @@ def cmd_extract(day, top):
         # State the bound as a NUMBER. An analyst that can see how much was removed reports
         # a bounded conclusion; one that sees only a broken word has to guess.
         out[trunc_at] = (
+            f"extract_cap={MAX_EXTRACT_BYTES} body_budget={main_cap} "
             f"truncated={'true' if (tally[0] or capped) else 'false'} "
             f"elided_chars={tally[0]} trajectory_capped={'true' if capped else 'false'} "
             f"trajectory_elided_chars={capped}  "
