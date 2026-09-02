@@ -11,6 +11,9 @@ Commands:
                               sessions worked in - friction no transcript records
   prior-recs --date D         the last 21 days of recommendation titles (dedup corpus
                               supplied to the reduce prompt; TRUSTED, wrapper-computed)
+  memory-health               memory files at/near the loader's silent-truncation limits
+                              (25000 chars / 200 lines / ~200 chars per index entry);
+                              cross-project, silent when healthy, CURRENT state not --date
   missing-dates               dates since last complete report, up to yesterday
   trends [--days N]           rate-normalized quality trend over the last N days of
                               metrics.jsonl (default 14) + an effectiveness-digest snapshot
@@ -1819,6 +1822,70 @@ def cmd_day_artifacts(day):
         print(line)
 
 
+# Memory-file limits, READ OUT OF THE CLAUDE CODE BUNDLE (2.1.258), not guessed:
+#   var Wl="MEMORY.md", PD=200, B$=25000, AGt=4*B$, pCe=200, bJ=4096;
+#   function E1e(e){let n=e.trim();return{trimmed:n,lineCount:_n(n,"\n")+1,byteCount:n.length}}
+# so a memory file is measured on its TRIMMED content, and BOTH a char limit and a LINE limit
+# apply. `AGt` is NOT a budget - it is the `She(e,0,AGt)` read cap - and treating it as one gives
+# a meaningless 827%-of-total reading. `pCe` is the per-index-entry guidance the loader names as
+# "index entries are too long".
+#
+# Why the retro carries this at all: the failure is SILENT BY DESIGN. On overflow the loader
+# emits "Only part of it was loaded" and never says WHICH entries went dark, and it cuts the
+# TAIL at a line boundary (`w.slice(0, I>0?I:B$)`), so in a newest-first index the oldest
+# entries disappear first and nothing in a session reveals it. No transcript event exists for
+# reduce to notice, which is exactly the class the day-artifacts block was added for.
+MEM_CHAR_LIMIT = 25000
+MEM_LINE_LIMIT = 200
+MEM_ENTRY_CHARS = 200
+MEM_WARN_AT = 0.85      # report a file this close to either limit, before it silently truncates
+
+
+def memory_health_lines():
+    """One line per memory file at risk of silent truncation, across ALL projects.
+
+    Cross-project on purpose: per-project memory only loads inside its own repo, so a project
+    the user has not opened lately is exactly where an overflow goes unnoticed longest. Healthy
+    files emit nothing - this block is silent until something is actually near a limit.
+
+    Takes NO `day`, unlike every other wrapper-computed block here, and that is a real
+    limitation rather than an oversight: memory files are untracked and unversioned, with no
+    per-day record to reconstruct from, so a BACKFILLED report carries TODAY's memory state and
+    not the state on its own report date. Says so on the line itself via `as_of`, so a reader of
+    an old report cannot mistake it for a measurement of that day.
+    """
+    out = []
+    if not PROJECTS.is_dir():
+        return out
+    for mem in sorted(PROJECTS.glob("*/memory")):
+        for path in sorted(mem.glob("*.md")):
+            try:
+                body = path.read_text(errors="replace").strip()
+            except OSError:
+                continue        # unreadable memory file must never fail the retro
+            chars, lines = len(body), body.count("\n") + 1
+            is_index = path.name == "MEMORY.md"
+            long_entries = sum(1 for ln in body.split("\n") if len(ln) > MEM_ENTRY_CHARS)
+            over = chars > MEM_CHAR_LIMIT or lines > MEM_LINE_LIMIT
+            near = (chars >= MEM_CHAR_LIMIT * MEM_WARN_AT
+                    or lines >= MEM_LINE_LIMIT * MEM_WARN_AT)
+            if not (over or near or (is_index and long_entries)):
+                continue
+            out.append(
+                "MEMORY-HEALTH %s project:%s file:%s chars:%d/%d(%.0f%%) lines:%d/%d "
+                "over_%dch_lines:%d as_of:%s" % (
+                    "OVER" if over else "NEAR", mem.parent.name, path.name,
+                    chars, MEM_CHAR_LIMIT, 100.0 * chars / MEM_CHAR_LIMIT,
+                    lines, MEM_LINE_LIMIT, MEM_ENTRY_CHARS, long_entries,
+                    date.today().isoformat()))
+    return out
+
+
+def cmd_memory_health():
+    for line in memory_health_lines():
+        print(line)
+
+
 def cmd_effectiveness(day):
     """Print the deterministic fix-effectiveness digest for `day`."""
     for line in effectiveness_lines(day):
@@ -2822,6 +2889,8 @@ def main():
         cmd_recs(day)
     elif cmd == "effectiveness":
         cmd_effectiveness(day)
+    elif cmd == "memory-health":
+        cmd_memory_health()
     elif cmd == "prior-recs":
         cmd_prior_recs(day)
     elif cmd == "day-artifacts":

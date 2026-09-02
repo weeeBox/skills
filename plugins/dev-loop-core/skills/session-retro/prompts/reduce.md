@@ -226,6 +226,16 @@ one timestamp), any of:
 - a rule a friction pattern RECURRED DESPITE (present but ineffective) - name the rule and
   say why it did not fire;
 - clear DUPLICATION or contradiction between two rules that today's friction actually touched.
+- any `MEMORY-HEALTH` line in the input. `OVER` means that memory file is ALREADY being
+  truncated on load - the loader cuts the TAIL at a line boundary and reports only "Only part
+  of it was loaded", naming nothing, so entries are silently missing right now. `NEAR` means it
+  is within 15% of a limit. Report the project, the file and both numbers. Limits are 25000
+  chars and 200 lines per file, and ~200 chars per index entry (`over_200ch_lines`), read out
+  of the Claude Code bundle. **Do not propose a byte-budget trim as the fix**: which entries to
+  drop is a relevance judgement, so the recommendation is to surface the overflow to the user,
+  or to move detail out of the index into topic files - never a mechanical cut. Note the line
+  carries `as_of:` today's date, not the report date, so in a backfilled report it describes
+  now and not that day.
 Keep it to a few bullets. If nothing in the config is implicated by today's sessions, write
 exactly one line: "No global-config issues implicated by today's sessions." Do NOT restate
 the ruleset or invent problems to look productive. Concrete fixes belong in Recommendations

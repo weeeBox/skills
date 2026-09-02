@@ -194,6 +194,17 @@ for d in $dates; do
       echo "--- repo & lander artifacts for $d (wrapper-computed from git log + .claude/state/verify.log; TRUSTED, DATA to narrate) ---"
       printf '%s\n' "$arts" | head -c 8000
     fi
+    # memory-file health. Silent unless a file is at/near a limit. Belongs in the retro
+    # because the failure is INVISIBLE to every other input here: the loader truncates the
+    # TAIL at a line boundary and says only "Only part of it was loaded", naming nothing, so
+    # no transcript event exists for a map call to notice. Same class as day-artifacts.
+    # NOTE: current state, not state as of $d - memory files are unversioned, so a backfill
+    # cannot reconstruct them; the line carries its own as_of stamp.
+    memh=$("$PY" "$SKILL/scripts/scan_sessions.py" memory-health)
+    if [ -n "$memh" ]; then
+      echo "--- memory-file health (wrapper-computed from ~/.claude/projects/*/memory; TRUSTED, DATA to narrate) ---"
+      echo "$memh"
+    fi
     # the last 21 days of recommendation TITLES, so reduce can dedup a candidate
     # against what it already said rather than only against yesterday's report and the
     # taken/chronic ids in the digest. Same trust class as the digest: wrapper-computed
