@@ -242,9 +242,13 @@ citing its exact id. Check before queueing, and append the outcome line when you
   | 24 | 97.1% | 457 | 1.64x |
   | every eligible | 100.0% | 469 | 1.69x |
 
-  Unlike the byte budget, **each extra session is a whole additional `claude -p` call**
-  (~75K tokens at the Cost section's measured rate), so this is real daily plan quota rather
-  than a longer prompt - which is why the default stays at 8. Raise it for a single run with
+  Each extra session is a whole additional `claude -p` call rather than a longer prompt,
+  but **not a whole extra prompt prefix**: sequential map calls cache-READ the ~60K prefix
+  (measured with a no-flag control - see the `retro-analyst` bullet above), so the marginal
+  cost is roughly the extract body plus that call's output, ~35K tokens at the default byte
+  budget, most of it cache-read. Do NOT price an added session at the 680K/8 run average -
+  that average is dominated by cache writes the marginal call does not repeat. The default
+  stays at 8 because it is still real daily quota and the reader owns that decision. Raise it for a single run with
   `RETRO_MAX_ANALYSIS_SESSIONS=16 bash run_retro.sh`. Note the same caveat as the byte
   budget: a date whose report is already stamped will not be reprocessed, and existing
   `findings-<id>.md` are reused, so a re-run at a higher cap analyses only the sessions that

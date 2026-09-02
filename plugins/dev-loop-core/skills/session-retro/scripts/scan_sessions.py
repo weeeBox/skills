@@ -91,9 +91,12 @@ MAX_EXTRACT_BYTES = int(os.environ.get("RETRO_MAX_EXTRACT_BYTES", 100_000))
 #    24           97.1%        457     1.64x
 #    every        100.0%       469     1.69x
 #
-# Unlike the byte budget, each extra session is a whole additional `claude -p` call
-# (~75K tokens at the Cost section's measured 680K for 8 maps + 1 reduce), so this is
-# real daily quota, not just a longer prompt. Default stays at 8; override for a run:
+# Each extra session is a whole additional `claude -p` call, but NOT a whole extra prompt
+# prefix - sequential map calls cache-READ it (SKILL.md, measured with a no-flag control),
+# so the marginal cost is the extract body plus that call's output, ~35K tokens at the
+# default byte budget. Pricing an added session at the run average (680K/8) double-counts
+# cache writes the marginal call does not repeat. Still real daily quota, so the default
+# stays at 8; override for a run:
 #   RETRO_MAX_ANALYSIS_SESSIONS=16 bash run_retro.sh
 # `--top N` still LOWERS it per-invocation and is clamped to this value, so a stray
 # `--top 50` cannot blow the budget open by accident.
