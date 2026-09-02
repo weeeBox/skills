@@ -34,7 +34,34 @@ PROJECTS = Path.home() / ".claude" / "projects"
 REPORTS = Path.home() / ".claude" / "session-reports"
 COMPLETE_MARKER = "<!-- retro-complete -->"
 ACTIVE_GRACE_SECS = 15 * 60  # sessions written to in the last 15 min are deferred
-MAX_EXTRACT_BYTES = 100_000
+# Body budget for one session extract. NOT a context limit - the largest extract
+# measured is 537KB (~134K tokens) and fits in one map call - it is an undocumented COST
+# limit, and it is what makes trajectory_clip drop the middle of a session.
+#
+# Measured 2026-09-02 over 129 preserved extracts: 63% exceed this, median uncapped size
+# 149KB, p90 327KB, max 538KB. Raising it buys whole sessions nearly linearly, and the
+# ceiling is cheap - removing it entirely costs 2x extract bytes total:
+#
+#       cap        total input   extracts seen WHOLE
+#   100,000 (now)    1.00x         48 of 129 (37%)
+#   200,000          1.62x         90 of 129 (70%)
+#   300,000          1.88x        113 of 129 (88%)
+#   600,000          1.99x        129 of 129 (100%)
+#
+# Trimming the per-message caps instead does NOT work and was measured before this was
+# written: 80% of an extract's bytes are tool_use args + tool_result bodies, but most of
+# those lines are already under their 300-char cap, so cutting them to 80/150 buys only
+# 19-32% and the worst session still loses 73% of its trajectory. TOOL_ERROR - the
+# friction evidence itself - is 0.5% of the bytes. Raising the budget is the only lever
+# that moves this.
+#
+# The default is left at 100_000: raising it spends plan quota daily, which is the
+# reader's call, not this file's. Override per-run for one investigation:
+#   RETRO_MAX_EXTRACT_BYTES=400000 python3 scan_sessions.py extract --date D --top 8
+# A single extract that overruns the model context is already dropped and logged by
+# run_retro.sh after its retries, so a too-large override degrades that session rather
+# than failing the day.
+MAX_EXTRACT_BYTES = int(os.environ.get("RETRO_MAX_EXTRACT_BYTES", 100_000))
 # Longest a single model generation is allowed to be before the gap is called `idle` instead.
 # A user->assistant gap of 30s is generation latency; the same gap at 10h47m is the machine
 # sitting on a pending turn (2026-08-16 session 78476725, which alone was 98.4% of that day's
@@ -859,7 +886,8 @@ def sub_errors(s, start, end, out, size, tally=None):
     for sub in sorted(subdir.glob("*.jsonl")):
         for d in iter_lines(sub):
             if size > MAX_EXTRACT_BYTES:
-                out.append("[extract truncated at 100KB cap]")
+                out.append(f"[extract truncated at the "
+                           f"{MAX_EXTRACT_BYTES:,}-byte cap]")
                 return size
             if d.get("type") != "user":
                 continue

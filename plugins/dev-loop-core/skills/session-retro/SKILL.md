@@ -296,6 +296,20 @@ citing its exact id. Check before queueing, and append the outcome line when you
   chars elided, `78476725` 8,185, `88d5288a` 8,267, `92572f74` 7,418, `a06cd63c` 5,276,
   `5a9c5769` 1,618). `elided_chars` covers only the per-message clipping - `trajectory_capped`
   is the separate whole-event case, counted by `trajectory_elided_chars`.
+- **The extract body budget is `RETRO_MAX_EXTRACT_BYTES` (default 100,000) and it is
+  what decides how much of a big session is ever read.** Measured 2026-09-02 over 129
+  preserved extracts: **63% exceed it**, median uncapped 149KB, p90 327KB, max 538KB - so
+  the middle-clipping below is not an edge case, it is the common path. It is NOT a context
+  limit (538KB is ~134K tokens and fits one map call); it is a cost limit. Raising it buys
+  whole sessions nearly linearly and the ceiling is cheap - **removing it entirely costs 2x
+  extract bytes** (100K->1.00x/37% whole, 200K->1.62x/70%, 300K->1.88x/88%, 600K->1.99x/100%).
+  **Trimming the per-message caps instead is measured DEAD**: 80% of the bytes are tool_use
+  args and tool_result bodies, but most of those lines already sit under their 300-char cap,
+  so cutting them to 80/150 buys 19-32% and the worst session still loses 73% of its
+  trajectory - while TOOL_ERROR, the friction evidence, is 0.5% of the bytes. Do not rebuild
+  that. The default stays at 100,000 because raising it spends plan quota every day, which is
+  a decision for the reader; override it for one investigation with
+  `RETRO_MAX_EXTRACT_BYTES=400000 ... extract --date D`.
 - **The whole TRAJECTORY is clipped from the middle too, for the same reason** (fixed 2026-08-17,
   `trajectory_clip`). The extract loop used to `break` at the byte cap, which kept the session's
   HEAD - but a session's lands, cleanups and destructive commands live in its TAIL. Measured on
