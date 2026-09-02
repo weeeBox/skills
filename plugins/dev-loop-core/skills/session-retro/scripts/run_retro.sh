@@ -91,7 +91,10 @@ for d in $dates; do
     echo "no sessions on $d, stub report written"
     continue
   fi
-  "$PY" "$SKILL/scripts/scan_sessions.py" extract --date "$d" --top 8 || { echo "extract FAILED for $d"; fail_reasons="$fail_reasons extract:$d"; continue; }
+  # No --top: the session cap is scan_sessions.py's MAX_ANALYSIS_SESSIONS (default 8,
+  # env RETRO_MAX_ANALYSIS_SESSIONS). Passing a literal here would shadow the env var
+  # and duplicate the default in two languages.
+  "$PY" "$SKILL/scripts/scan_sessions.py" extract --date "$d" || { echo "extract FAILED for $d"; fail_reasons="$fail_reasons extract:$d"; continue; }
 
   # map: one analyst call per extract (sequential; bounded inputs). The claude -p call
   # fails intermittently (empty output), so retry each 3x. Findings use stable

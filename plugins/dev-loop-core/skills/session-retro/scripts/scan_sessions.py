@@ -19,7 +19,10 @@ Commands:
                               metrics.jsonl (default 14) + an effectiveness-digest snapshot
   selftest                    run built-in assertions on a synthetic transcript
 
-Env: RETRO_MAX_EXTRACT_BYTES (default 100000) - per-session extract body budget. 63% of
+Env: RETRO_MAX_ANALYSIS_SESSIONS (default 8) - how many sessions get an analyst call.
+     53.3% of eligible sessions at 8; 87.0% at 16 for 1.50x the map calls. `--top N` only
+     lowers it. Each extra session is a whole extra model call, i.e. real daily quota.
+     RETRO_MAX_EXTRACT_BYTES (default 100000) - per-session extract body budget. 63% of
      extracts exceed the default and lose the middle of the trajectory; raising it to
      300000 shows 88% of sessions whole for 1.88x extract bytes. Re-running `extract`
      alone changes NOTHING about a report - run_retro.sh reuses any existing
@@ -74,6 +77,27 @@ MAX_EXTRACT_BYTES = int(os.environ.get("RETRO_MAX_EXTRACT_BYTES", 100_000))
 # A user->assistant gap of 30s is generation latency; the same gap at 10h47m is the machine
 # sitting on a pending turn (2026-08-16 session 78476725, which alone was 98.4% of that day's
 # reported work_secs).
+# How many sessions get an analyst (map) call. The BREADTH budget, as
+# MAX_EXTRACT_BYTES is the depth one - and the binding constraint of the two: the cap is
+# fixed while the session count is not, so coverage FALLS as a day gets busier.
+#
+# Measured 2026-09-02 over 30 scanned days, 409 eligible sessions (map calls include the
+# RERUN_TOP=2 second pass, so the multiplier is of the whole daily map spend):
+#
+#     N        coverage   map calls   vs N=8
+#     8 (now)     53.3%        278     1.00x
+#    12           73.3%        360     1.29x
+#    16           87.0%        416     1.50x
+#    24           97.1%        457     1.64x
+#    every        100.0%       469     1.69x
+#
+# Unlike the byte budget, each extra session is a whole additional `claude -p` call
+# (~75K tokens at the Cost section's measured 680K for 8 maps + 1 reduce), so this is
+# real daily quota, not just a longer prompt. Default stays at 8; override for a run:
+#   RETRO_MAX_ANALYSIS_SESSIONS=16 bash run_retro.sh
+# `--top N` still LOWERS it per-invocation and is clamped to this value, so a stray
+# `--top 50` cannot blow the budget open by accident.
+MAX_ANALYSIS_SESSIONS = int(os.environ.get("RETRO_MAX_ANALYSIS_SESSIONS", 8))
 MAX_GENERATION_SECS = float(os.environ.get("RETRO_MAX_GENERATION_SECS", 1800))
 TRUNC_SLOT = "\x00truncation-header-slot"  # placeholder, filled once the body is built
 DENIAL_RE = re.compile(r"doesn't want to proceed|denied by|permission denied", re.I)
@@ -988,6 +1012,16 @@ def is_retro_stub(s):
     return not _first_user_text(s["path"]).startswith(REDUCE_ANCHOR) if s.get("path") else True
 
 
+def analysis_cap(top):
+    """Sessions that may take an analyst call: `--top` clamped to the configured ceiling.
+
+    `--top` can only ever LOWER the count. Raising the ceiling is deliberately the env
+    var and not a flag, because a flag is a per-invocation typo away from spending 50
+    map calls, while the env var is a decision someone makes once for a run.
+    """
+    return min(top, MAX_ANALYSIS_SESSIONS)
+
+
 def eligible_sessions(sessions):
     """Sessions that CAN take an analysis slot - everything but the retro's own calls.
 
@@ -1058,7 +1092,7 @@ def cmd_extract(day, top):
     scan_path = workdir / "scan.json"
     result = json.loads(scan_path.read_text()) if scan_path.exists() else cmd_scan(day)
     start, end = day_bounds(day)
-    cap = min(top, 8)
+    cap = analysis_cap(top)
     picked, slow_added = pick_sessions(result["sessions"], cap)
     if slow_added:
         print("slow-reserved extracts (long wall-clock, below the friction cut): "
@@ -2483,6 +2517,9 @@ def selftest():
     assert len(picked) == 8, ids
     assert "long" in ids and [s["session"] for s in reserved] == ["long"], (ids, reserved)
     assert "stub1" not in ids and "stub2" not in ids, ids
+    # `--top` lowers, never raises; the ceiling is what the env var moves
+    assert analysis_cap(3) == 3 and analysis_cap(50) == MAX_ANALYSIS_SESSIONS
+    assert analysis_cap(MAX_ANALYSIS_SESSIONS + 1) == MAX_ANALYSIS_SESSIONS
     # The coverage denominator is the ELIGIBLE set - every session that could have taken
     # a slot, including the quiet ones the cap never reaches. Only the retro's own calls
     # are excluded (they are not work). These two "stub" fixtures are ordinary quiet
@@ -3027,8 +3064,9 @@ def main():
     if cmd == "scan":
         cmd_scan(day)
     elif cmd == "extract":
-        top = int(args[args.index("--top") + 1]) if "--top" in args else 8
-        cmd_extract(day, min(top, 8))
+        top = (int(args[args.index("--top") + 1]) if "--top" in args
+               else MAX_ANALYSIS_SESSIONS)
+        cmd_extract(day, analysis_cap(top))
     elif cmd == "metrics":
         cmd_metrics(day)
     elif cmd == "recs":

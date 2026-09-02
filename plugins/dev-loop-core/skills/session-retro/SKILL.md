@@ -228,6 +228,28 @@ citing its exact id. Check before queueing, and append the outcome line when you
   same filter `pick_sessions` ranks - one definition, not two. This is an instrument, not a
   fix: it makes "is 8 the right cap" a question with data behind it instead of a constant
   nobody revisits.
+- **The cap itself is `RETRO_MAX_ANALYSIS_SESSIONS` (default 8).** `--top N` can only
+  LOWER it - it is clamped by `analysis_cap()` so a stray `--top 50` cannot open the budget
+  by accident - and `run_retro.sh` deliberately passes no `--top` so the env var is the one
+  place the number lives. Measured over 30 days and 409 eligible sessions (map calls include
+  the `RERUN_TOP=2` second pass):
+
+  | N | coverage | map calls | vs N=8 |
+  |---|---|---|---|
+  | 8 (default) | 53.3% | 278 | 1.00x |
+  | 12 | 73.3% | 360 | 1.29x |
+  | 16 | 87.0% | 416 | 1.50x |
+  | 24 | 97.1% | 457 | 1.64x |
+  | every eligible | 100.0% | 469 | 1.69x |
+
+  Unlike the byte budget, **each extra session is a whole additional `claude -p` call**
+  (~75K tokens at the Cost section's measured rate), so this is real daily plan quota rather
+  than a longer prompt - which is why the default stays at 8. Raise it for a single run with
+  `RETRO_MAX_ANALYSIS_SESSIONS=16 bash run_retro.sh`. Note the same caveat as the byte
+  budget: a date whose report is already stamped will not be reprocessed, and existing
+  `findings-<id>.md` are reused, so a re-run at a higher cap analyses only the sessions that
+  had no findings file - which for a raised cap is exactly the newly-added ones, so this one
+  works as expected.
 - **Wall-clock partition (`work_secs` / `human_wait_secs` / `blocked_secs` /
   `model_latency_secs` / `idle_secs`).** Every inter-event gap lands in exactly one bucket, so
   the five sum to the session's span. **A gap is classified by the PAIR of events that bound
