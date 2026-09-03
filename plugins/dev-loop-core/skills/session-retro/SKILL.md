@@ -49,11 +49,16 @@ named subcommands, so a sixth would be dead code.
 Four guards, each closing a way the axis could flatter itself, and each with its own name in
 `reason:` so a reader can tell which one fired:
 
-- **Pre-stamp, per rec.** `run_retro.sh` runs `validate-report` before the `mv`/stamp and
-  rejects a report where any mechanism rec lacks a usable `Probe:`. Per-rec, not a whole-file
-  count: under a count, one rec carrying two probes masks another carrying none. Blocks close
-  on the next rec heading OR the next `## ` section, so a `Probe:` under `## Next actions`
-  cannot attach to the rec above it.
+- **Pre-stamp, per rec, and PROPORTIONAL.** `run_retro.sh` runs `validate-report` before the
+  `mv`/stamp. Per-rec, not a whole-file count: under a count, one rec carrying two probes
+  masks another carrying none. Blocks close on the next rec heading OR the next `## ` section,
+  so a `Probe:` under `## Next actions` cannot attach to the rec above it. It fails closed
+  ONLY when no mechanism rec complied at all, which means the contract did not land; a partial
+  miss stamps the report and prints a warning. Measured 2026-09-02, a strict version of this
+  check rejected four of the five most recent real reports, and clearing it depends on reduce
+  obeying a PROSE instruction - the mechanism this repo measured at 31.11% compliance before a
+  rule versus 32.11% after. Losing a day's report to enforce an instrument is the wrong trade:
+  the report is the deliverable, the probe is a measurement of it.
 - **Baseline.** A probe that never fired in the 14 days before its report is discarded at
   record time. `probe_drop` names why one was not kept - `invalid`, `no-baseline`,
   `thin-baseline`, `declared-none` - because `cmd_recs` runs AFTER the stamp and can reject
