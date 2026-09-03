@@ -1538,8 +1538,13 @@ def _sanitize_summary(s):
     return s[:120]
 
 
-MECH_TIER_RE = re.compile(r"^\s*(?:\*\*)?tier:\s*(hook|script|test)\b", re.I)
-PROBE_LINE_RE = re.compile(r"^\s*(?:\*\*)?Probe:\s*(.+)$")
+# ONE definition, used by BOTH the pre-stamp validator and cmd_recs. They had different
+# regexes and therefore different opinions about which markdown counts: the validator
+# rejected `**Probe:** x` while cmd_recs accepted it, so a report could pass the gate
+# with a probe the gate could not see, or vice versa.
+MECH_TIER_RE = re.compile(r"^\s*\*{0,2}tier:\*{0,2}\s*(hook|script|test)\b", re.I)
+PROBE_LINE_RE = re.compile(r"^\s*\*{0,2}Probe:\*{0,2}\s*(.+)$")
+DECLARED_NONE_RE = re.compile(r"(?i)^none\s*-\s*\S")
 
 
 def report_probe_gaps(text):
@@ -1584,7 +1589,7 @@ def report_probe_gaps(text):
         p = PROBE_LINE_RE.match(line)
         if p:
             v = p.group(1).strip()
-            if valid_probe(v) is not None or re.match(r"(?i)none\s*-\s*\S", v):
+            if valid_probe(v) is not None or DECLARED_NONE_RE.match(v):
                 state["probe"] = True
     close()
     return gaps, mech_total
@@ -1609,8 +1614,21 @@ def cmd_validate_report(path):
     finding about this loop. The instrument reports its own coverage instead of holding the
     deliverable hostage to it.
     """
-    gaps, mech = report_probe_gaps(Path(path).read_text(encoding="utf-8", errors="replace"))
+    text = Path(path).read_text(encoding="utf-8", errors="replace")
+    gaps, mech = report_probe_gaps(text)
+    if not mech:
+        # Zero mechanism recs is the gate's fail-open shape: an empty `gaps` reads as a pass
+        # whether the report genuinely had none or the parser simply did not recognise the
+        # markdown. Distinguish the two by looking for rec headings at all, and SAY which,
+        # so a silent formatting drift shows up in the runner log instead of disabling this
+        # check without a trace.
+        n_recs = sum(1 for l in text.splitlines() if l.lstrip().startswith("**[rec:"))
+        print("probe gate: no mechanism-tier recs recognised (%d rec headings seen)" % n_recs,
+              file=sys.stderr)
+        return 0
     if not gaps:
+        print("probe gate: %d of %d mechanism recs carry a probe" % (len(mech), len(mech)),
+              file=sys.stderr)
         return 0
     msg = "mechanism recs with no Probe: line: %s (%d of %d)" % (
         " ".join(gaps), len(gaps), len(mech))
@@ -1642,16 +1660,24 @@ def cmd_recs(day):
     # prompts/reduce.md). Stored so the fresh-id-restatement rate is measurable in-band
     # rather than only by re-clustering the corpus by hand: a rec with repeat False and
     # no Dedup line is the writer skipping the gate.
-    dedup, probe, cur = {}, {}, None
+    dedup, probe, mech, cur = {}, {}, set(), None
     for line in lines:
         m = REC_TAG_RE.search(line)
         if line.lstrip().startswith("**[rec:") and m:
             cur = f"{m.group(1)}#{m.group(2)}"
             continue
+        if line.startswith("## "):
+            # Section-scoped, exactly like report_probe_gaps. Without this the first `Probe:`
+            # anywhere later in the document - under `## Next actions`, in quoted evidence -
+            # attaches to whichever recommendation happened to come last.
+            cur = None
+            continue
+        if cur and MECH_TIER_RE.match(line):
+            mech.add(cur)
         d = re.match(r"\s*(?:\*\*)?Dedup:\*{0,2}\s*(.+)$", line)
         if d and cur and cur not in dedup:
             dedup[cur] = _sanitize_summary(d.group(1))
-        p = re.match(r"\s*(?:\*\*)?Probe:\*{0,2}\s*(.+)$", line)
+        p = PROBE_LINE_RE.match(line)
         if p and cur and cur not in probe:
             # NOT _sanitize_summary: it strips <, > and " and truncates at 120, which would
             # silently rewrite a probe into a DIFFERENT literal that still matches things.
@@ -1689,7 +1715,10 @@ def cmd_recs(day):
     # matched as the literal "none - ...", which would find nothing and be reported as
     # `no-baseline` - i.e. as a broken probe rather than a declared absence. Three failure
     # modes, three names.
-    declared_none = {rid for rid, p in probe.items() if p.lower().startswith("none")}
+    # The VALIDATOR's grammar, not startswith("none"): `nonexistent file or directory` and
+    # `none of the required checks ran` are real friction literals that would otherwise pass
+    # the gate as probes and then be erased as declared absences after the stamp.
+    declared_none = {rid for rid, p in probe.items() if DECLARED_NONE_RE.match(p)}
     valid = {rid: v for rid, v in ((r, valid_probe(p)) for r, p in probe.items()
                                    if r not in declared_none)
              if v is not None}
@@ -1700,7 +1729,13 @@ def cmd_recs(day):
                 baseline[rid] += n
     for rid, rec in recs.items():
         if rid not in probe:
-            rec["probe"], rec["probe_baseline"], rec["probe_drop"] = "", None, ""
+            # A MECHANISM rec with no Probe: line at all is the case cmd_validate_report
+            # justifies stamping on the grounds that it is "counted in PROBE-UNMEASURED" -
+            # and until this branch existed, it was not: probe_drop was "" and probe_lines
+            # counted only invalid/no-baseline/declared-none, so the rec vanished from BOTH
+            # the scored set and the gap total. `absent` is what makes that claim true.
+            rec["probe"], rec["probe_baseline"] = "", None
+            rec["probe_drop"] = "absent" if rid in mech else ""
         elif rid in declared_none:
             rec["probe"], rec["probe_baseline"], rec["probe_drop"] = "", None, "declared-none"
         elif rid not in valid:
@@ -2046,14 +2081,25 @@ def probe_lines(day):
                     # count, which is the one outcome this instrument may never produce - a
                     # mechanism rec absent from its own tally.
                     dropped.add(rid)
-            elif rec.get("probe_drop") in ("invalid", "no-baseline", "declared-none"):
+            elif rec.get("probe_drop") in ("invalid", "no-baseline", "declared-none", "absent"):
                 # All three are the same thing to a reader of the digest: a mechanism rec that
                 # landed with no outcome measurement. Named separately in recs.jsonl so the
                 # REASON is recoverable, counted together here so the gap cannot hide behind
                 # its own taxonomy.
                 dropped.add(rid)
+    # LATEST taken date, not _taken_recs' earliest. Measured on the live ledger, 5 rec ids
+    # carry more than one `taken` line (3 of them three times): 2026-08-23#4 was taken on
+    # 08-24 and again on 08-27, so windows centred on 08-24 put the days BEFORE the second
+    # application into the `after` side and score a delta against a fix that was still being
+    # applied. _taken_recs keeps returning the earliest on purpose - the effectiveness digest
+    # wants first adoption - so this is a probe-local policy, not a change to that function.
     all_taken = _taken_recs(day)
-    taken = {rid: t for rid, t in all_taken.items() if rid in probes}
+    latest = {}
+    for rid, entries in _rec_dispositions(day).items():
+        dates = [d for d, verb in entries if verb == "taken"]
+        if dates:
+            latest[rid] = max(dates)
+    taken = {rid: latest.get(rid, t) for rid, t in all_taken.items() if rid in probes}
     unmeasured = sum(1 for rid in dropped if rid in all_taken)
     if not taken:
         return ["PROBE-UNMEASURED n:%d" % unmeasured] if unmeasured else []
@@ -3566,7 +3612,7 @@ def selftest():
         "Probe: a signature absent from every transcript\n\n"
         "**[rec: 2026-07-08#3] NEW - a claude-md rec, no probe required**\n"
         "Dedup: no prior\n"
-        "tier: hook\n\n"
+        "tier: claude-md\n\n"
         "**[rec: 2026-07-08#4] NEW - a probe that barely fired**\n"
         "Dedup: no prior\n"
         "tier: script\n"
@@ -3579,7 +3625,15 @@ def selftest():
         "Dedup: no prior\n"
         "tier: script\n"
         "Probe: none - the friction is a missing turn, which emits nothing\n\n"
-        "## Next actions\n")
+        "**[rec: 2026-07-08#8] NEW - a literal that merely STARTS with none**\n"
+        "Dedup: no prior\n"
+        "tier: script\n"
+        "Probe: nonexistent file or directory\n\n"
+        "**[rec: 2026-07-08#7] NEW - a MECHANISM rec with no Probe line at all**\n"
+        "Dedup: no prior\n"
+        "**tier:** test\n\n"
+        "## Next actions\n"
+        "Probe: leaked in from the next-actions section\n")
     (pdir_2 / "-proj-a").mkdir(parents=True)
     with (pdir_2 / "-proj-a" / "s1.jsonl").open("w") as f:
         # PROBE_MIN_BASELINE hits for #1, exactly one for #4 (thin), none for #2.
@@ -3606,10 +3660,23 @@ def selftest():
     assert by_id["2026-07-08#2"]["probe"] == "", by_id
     assert by_id["2026-07-08#2"]["probe_baseline"] == 0, by_id
     assert by_id["2026-07-08#2"]["probe_drop"] == "no-baseline", by_id
-    # No Probe: line at all -> absence recorded as null, never as 0.
+    # A NON-mechanism rec needs no probe: absence recorded as null, and NOT as a gap.
     assert by_id["2026-07-08#3"]["probe"] == "", by_id
     assert by_id["2026-07-08#3"]["probe_baseline"] is None, by_id
     assert by_id["2026-07-08#3"]["probe_drop"] == "", by_id
+    # A MECHANISM rec with no Probe: line is `absent`. Until this existed it recorded "" and
+    # was counted by nothing - not scored, not in PROBE-UNMEASURED - which is the state
+    # cmd_validate_report cites when it stamps a partial miss. It also proves the fully-bold
+    # `**tier:** test` form is recognised; it was not, and the two parsers disagreed about it.
+    assert by_id["2026-07-08#7"]["probe"] == "", by_id
+    # #7 is the LAST rec before `## Next actions`, which carries a stray `Probe:` line. If
+    # cmd_recs did not close the block at the section, #7 would silently adopt it and be
+    # measured against a literal from prose it has nothing to do with.
+    assert by_id["2026-07-08#7"]["probe_drop"] == "absent", by_id
+    # `nonexistent file or directory` merely STARTS with "none". It is a real friction
+    # literal, and a startswith() test erases it as a declared absence after it has already
+    # passed the pre-stamp gate as a probe.
+    assert by_id["2026-07-08#8"]["probe_drop"] == "no-baseline", by_id
     # Fired, but too thinly to score. KEPT with its count, flagged, never silently scored.
     assert by_id["2026-07-08#4"]["probe"] == "a rare and thinly attested phrase", by_id
     assert by_id["2026-07-08#4"]["probe_baseline"] == 1, by_id
@@ -3721,6 +3788,8 @@ def selftest():
         _pv_rec("2026-07-08#2", "a rare and thinly attested phrase"),
         # Declared a probe and lost it: an unmeasured mechanism rec.
         _pv_rec("2026-07-08#3", "", baseline=0, drop="no-baseline"),
+        # A mechanism rec that never carried a Probe: line at all.
+        _pv_rec("2026-07-08#4", "", baseline=None, drop="absent"),
     ], main_metrics)
     globals()["probe_counts"] = fake_counts
     try:
@@ -3750,7 +3819,10 @@ def selftest():
     assert "status:unmeasurable" in t and "reason:thin-baseline" in t, t
     assert "matches_before:0" in t, t
     assert "rec:2026-07-08#3" not in by_rec, by_rec
-    assert "PROBE-UNMEASURED n:1" in pl, pl
+    # BOTH gap kinds count: `no-baseline` (#3) and `absent` (#4). An `absent` rec in neither
+    # the scored set nor this total is the state cmd_validate_report cites when it stamps a
+    # partial miss, so that justification is only true while this reads 2.
+    assert "PROBE-UNMEASURED n:2" in pl, pl
     # THE ROUND-1 BLOCKER, pinned: the digest that reaches reduce must carry these lines.
     # effectiveness_lines is the only one of the five subcommands on the reduce-input path
     # that this axis rides; a PROBE line that exists but never reaches it is a shipped no-op.
@@ -3813,6 +3885,24 @@ def selftest():
         shutil.rmtree(pv5, ignore_errors=True)
     assert len(pl5) == 1, pl5
     assert "n_before:7 n_after:4" in pl5[0], pl5   # 07-10..07-13 only
+    # (e) TWO `taken` lines. Windows must centre on the LATER application: measured on the
+    #     live ledger, 5 rec ids carry more than one, and centring on the first puts days
+    #     that precede the second application into the `after` side.
+    pv6 = _pv_setup([_pv_rec("2026-07-08#1", "isolated in the worktree")], main_metrics,
+                    # BOTH dates must be >= the rec's own report date: _rec_dispositions
+                    # drops any line where line_date < rec_date ("acted before the report
+                    # existed"), so a pre-report take is filtered and the fixture would
+                    # silently exercise the single-take path instead.
+                    log=("- [2026-07-09] taken rec:2026-07-08#1 - first application\n"
+                         "- [2026-07-12] taken rec:2026-07-08#1 - reapplied properly\n"))
+    globals()["probe_counts"] = fake_counts
+    try:
+        pl6 = [l for l in probe_lines(date(2026, 7, 18)) if l.startswith("PROBE rec:")]
+    finally:
+        globals()["probe_counts"], globals()["REPORTS"] = t3_counts, t3_reports
+        shutil.rmtree(pv6, ignore_errors=True)
+    assert len(pl6) == 1, pl6
+    assert "taken:2026-07-12" in pl6[0], pl6   # the LATER application, not the first
     print("probe verdict OK")
 
     print("selftest OK")
