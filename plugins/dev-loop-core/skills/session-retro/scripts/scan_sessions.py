@@ -1686,6 +1686,8 @@ def cmd_recs(day):
     print(f"recs upserted for {day.isoformat()}: {len(recs)} rec-ids")
 
 
+PROBE_WINDOW_DAYS = 7      # days each side of the take date that a probe rate averages over
+PROBE_MIN_WINDOW_DAYS = 5  # covered days required on EACH side before a delta is scored
 PROBE_BASELINE_DAYS = 14  # days before its report over which a probe's baseline is counted
 PROBE_MIN_BASELINE = 5    # baseline matches required before a probe is scored, not just kept
 PRIOR_REC_WINDOW = 21   # calendar days of prior rec titles shown to reduce for dedup
@@ -1937,7 +1939,157 @@ def effectiveness_lines(day):
             continue          # older than the dedup corpus reduce is given: out of scope
         out.append(f"UNDISPOSED rec:{rid} proposed:{dates[0]} last_seen:{dates[-1]} "
                    f"seen_count:{len(dates)}{label(rid)}")
+    # The outcome half. Appended HERE, not exposed as its own subcommand, because
+    # reduce-input.txt is assembled from exactly five subcommands and `probes` is not
+    # one of them - a separate CLI would be dead code on the digest path.
+    out.extend(probe_lines(day))
+
     return out
+
+
+def probe_lines(day):
+    """Deterministic outcome digest: for each TAKEN rec carrying a probe, the probe's match
+    rate per coverage-hour before and after the day it was taken.
+
+    This is the only line in the report not derived from what a previous report said.
+    `status:holding` in the EFFECTIVENESS block means nobody restated the rec - measured on
+    this corpus, raw-id recurrence had fired 0 times in 115 taken recs, so `holding` is very
+    nearly the default verdict rather than a finding. A probe rate is counted from transcripts
+    by a literal the writer chose but whose VALUE it does not supply.
+
+    Rate, not raw count, because a busy day and a quiet day are otherwise incomparable - the
+    same reason `errors_per_hour` replaced `errors`. The denominator is `coverage_hours` from
+    metrics.jsonl; a day with no metrics row has no denominator and is SKIPPED rather than
+    counted as a zero, which would read as an improvement.
+
+    Two guards keep a number off a line that cannot support one. A window needs
+    PROBE_MIN_WINDOW_DAYS covered days on EACH side - "nonempty" would let a verdict be
+    computed from one day per side and flip daily. A probe needs PROBE_MIN_BASELINE matches
+    IN THE PRE-TAKE WINDOW - not the stored `probe_baseline`, which counts the days before the
+    REPORT and so need not overlap the window being compared at all. Neither is dropped: both
+    report `status:unmeasurable`, because the count is the evidence these thresholds get
+    revisited against.
+
+    `control:` is the same before/after ratio over the day's overall tool-failure rate. A probe
+    rate can fall because the fix worked or because the week got quieter, and without the
+    control those are indistinguishable. It is coverage-WEIGHTED from raw fields, the same
+    shape as the probe rate: an unweighted mean of daily rates would give a 0.2-hour day and a
+    24-hour day equal weight, so disagreement could be a weighting artifact. No ratio-of-ratios
+    is computed - at these n's it would be a precise-looking number built from two noisy ones.
+    """
+    cov, ctrl = {}, {}
+    for r in _load_metrics():
+        d, h = r.get("date"), r.get("coverage_hours")
+        if isinstance(d, str) and isinstance(h, (int, float)) and h > 0:
+            cov[d] = float(h)
+            # RAW tool_failures, not tool_failures_per_hour: the control is re-normalized
+            # over the window's own summed hours so it is the same shape as the probe rate.
+            tf = r.get("tool_failures")
+            if isinstance(tf, (int, float)):
+                ctrl[d] = float(tf)
+    probes, dropped = {}, set()
+    for row in _load_recs():
+        for rec in row.get("recs", []):
+            rid, pat = rec.get("id"), rec.get("probe")
+            if not isinstance(rid, str):
+                continue
+            if isinstance(pat, str) and pat:
+                # Re-validate on READ. cmd_recs is not the only writer of recs.jsonl -
+                # _upsert_jsonl applies no schema, so a hand edit, a backfill or a future
+                # writer can put anything here. A consumer that trusts its store because
+                # some producer validated once is the fail-open this axis cannot afford.
+                v = valid_probe(pat)
+                if v is not None:
+                    probes[rid] = v
+                else:
+                    # Invalid but non-empty. It must land in `dropped`, not vanish: falling
+                    # through would drop the rec from BOTH the scored set and the unmeasured
+                    # count, which is the one outcome this instrument may never produce - a
+                    # mechanism rec absent from its own tally.
+                    dropped.add(rid)
+            elif rec.get("probe_drop") in ("invalid", "no-baseline", "declared-none"):
+                # All three are the same thing to a reader of the digest: a mechanism rec that
+                # landed with no outcome measurement. Named separately in recs.jsonl so the
+                # REASON is recoverable, counted together here so the gap cannot hide behind
+                # its own taxonomy.
+                dropped.add(rid)
+    all_taken = _taken_recs(day)
+    taken = {rid: t for rid, t in all_taken.items() if rid in probes}
+    unmeasured = sum(1 for rid in dropped if rid in all_taken)
+    if not taken:
+        return ["PROBE-UNMEASURED n:%d" % unmeasured] if unmeasured else []
+
+    # One corpus walk per DAY covering every probe that needs that day, rather than one walk
+    # per probe: the windows of different recs overlap heavily.
+    need = collections.defaultdict(dict)
+    sides = {}
+    for rid, tdate in taken.items():
+        td = date.fromisoformat(tdate)
+        before = [td - timedelta(days=k) for k in range(1, PROBE_WINDOW_DAYS + 1)]
+        after = [td + timedelta(days=k) for k in range(1, PROBE_WINDOW_DAYS + 1)]
+        before = [d for d in before if d.isoformat() in cov]
+        after = [d for d in after if d.isoformat() in cov and d < day]
+        sides[rid] = (before, after)
+        for d in before + after:
+            need[d][rid] = probes[rid]
+    counted = {d: probe_counts(d, pats) for d, pats in sorted(need.items())}
+
+    def matches(rid, days):
+        return sum(counted[d].get(rid, 0) for d in days)
+
+    def rate(rid, days):
+        h = sum(cov[d.isoformat()] for d in days)
+        return matches(rid, days) / h if h else None
+
+    def control_rate(days):
+        d_ok = [d for d in days if d.isoformat() in ctrl]
+        h = sum(cov[d.isoformat()] for d in d_ok)
+        return (sum(ctrl[d.isoformat()] for d in d_ok) / h if h else None), len(d_ok)
+
+    def pct(before_v, after_v):
+        if before_v is None or after_v is None or before_v == 0:
+            return "n/a"
+        return "%+.1f%%" % (100.0 * (after_v - before_v) / before_v)
+
+    out = []
+    for rid in sorted(taken):
+        before, after = sides[rid]
+        if not before or not after:
+            continue   # nothing measured on one side at all: no line, not a zero
+        rb, ra = rate(rid, before), rate(rid, after)
+        if rb is None or ra is None:
+            continue
+        mb, ma = matches(rid, before), matches(rid, after)
+        cb, nb_ctrl = control_rate(before)
+        ca, na_ctrl = control_rate(after)
+        ctrl_ok = (cb is not None and ca is not None
+                   and nb_ctrl >= PROBE_MIN_WINDOW_DAYS and na_ctrl >= PROBE_MIN_WINDOW_DAYS)
+        # One name per failing guard, in a fixed precedence. A bare `unmeasurable` cannot
+        # tell a short window from a thin baseline from a missing control, and a reader who
+        # cannot tell those apart cannot act on any of them.
+        if len(before) < PROBE_MIN_WINDOW_DAYS or len(after) < PROBE_MIN_WINDOW_DAYS:
+            reason = "short-window"
+        elif mb < PROBE_MIN_BASELINE:
+            reason = "thin-baseline"
+        elif not ctrl_ok:
+            reason = "no-control"
+        else:
+            reason = ""
+        out.append("PROBE rec:%s taken:%s status:%s reason:%s before:%.2f after:%.2f "
+                   "delta:%s control:%s control_status:%s matches_before:%d "
+                   "matches_after:%d n_before:%d n_after:%d" %
+                   (rid, taken[rid], "measured" if not reason else "unmeasurable",
+                    reason or "-", rb, ra,
+                    pct(rb, ra), pct(cb, ca), "ok" if ctrl_ok else "missing",
+                    mb, ma, len(before), len(after)))
+    out.append("PROBE-UNMEASURED n:%d" % unmeasured)
+    return out
+
+
+def cmd_probes(day):
+    """Manual inspection only. The digest path is effectiveness_lines - see its tail."""
+    for l in probe_lines(day):
+        print(l)
 
 
 def effectiveness_counts(day):
@@ -1950,6 +2102,13 @@ def effectiveness_counts(day):
         "eff_recurred_after_fix": sum(1 for x in lines if "status:recurred-after-fix" in x),
         "eff_too_soon": sum(1 for x in lines if "status:too-soon" in x),
         "eff_chronic": sum(1 for x in lines if x.startswith("CHRONIC")),
+        # No cache and no second walk: `lines` already holds the PROBE rows.
+        "probes_measured": sum(1 for x in lines if x.startswith("PROBE rec:")
+                               and "status:measured" in x),
+        "probes_improved": sum(1 for x in lines if x.startswith("PROBE rec:")
+                               and "status:measured" in x and " delta:-" in x),
+        "probes_unmeasured": next((int(x.split("n:")[1]) for x in lines
+                                   if x.startswith("PROBE-UNMEASURED")), 0),
     }
 
 
@@ -2329,6 +2488,15 @@ def cmd_trends(days=14):
             print("  a CHRONIC rec recurring across weeks despite landing is the strongest "
                   "single signal something isn't actually improving - see that day's report's "
                   "Fix effectiveness section for which one(s)")
+        pm, pi = c.get("probes_measured") or 0, c.get("probes_improved") or 0
+        pu = c.get("probes_unmeasured") or 0
+        if pm:
+            print(f"probes: {pi}/{pm} measured fixes reduced their own friction signature"
+                  + (f" ({pu} more landed unmeasured)" if pu else ""))
+        else:
+            print(f"probes: none measured yet ({pu} taken mechanism recs carry no usable "
+                  f"probe; a measurable one needs {PROBE_MIN_BASELINE}+ baseline matches "
+                  f"and {PROBE_MIN_WINDOW_DAYS} covered days each side)")
 
 
 def selftest():
@@ -2973,10 +3141,15 @@ def selftest():
         assert set(_taken_recs(date(2026, 7, 10))) == {"2026-07-08#1"}, _taken_recs(date(2026, 7, 10))
         assert set(_taken_recs()) == {"2026-07-08#1", "2026-07-08#2"}, _taken_recs()
 
-        # --- effectiveness_counts returns the four persisted integers -----------------
+        # --- effectiveness_counts returns the persisted integers ----------------------
+        # Pinned as an exact set on purpose: every key here is written onto the metrics row
+        # by cmd_metrics, so a silently added or renamed one changes the schema of a file
+        # with two years of history and no migration.
         counts = effectiveness_counts(date(2026, 7, 20))
         assert set(counts) == {"eff_holding", "eff_recurred_after_fix",
-                               "eff_too_soon", "eff_chronic"}, counts
+                               "eff_too_soon", "eff_chronic",
+                               "probes_measured", "probes_improved",
+                               "probes_unmeasured"}, counts
         assert all(isinstance(v, int) for v in counts.values()), counts
         (REPORTS / "actions-log.md").unlink()
 
@@ -3424,6 +3597,145 @@ def selftest():
     assert report_probe_gaps(none_bare) == ["2026-07-08#9"], report_probe_gaps(none_bare)
     print("probe gate OK")
 
+    # --- probe verdict lines (Task 3) ---
+    t3_reports, t3_counts = globals()["REPORTS"], globals()["probe_counts"]
+
+    def _pv_rec(rid, probe, baseline=40, drop=""):
+        return {"id": rid, "repeat": False, "summary": "s", "dedup": "",
+                "probe": probe, "probe_baseline": baseline, "probe_drop": drop}
+
+    def _pv_setup(recs, metrics_rows, log=None):
+        d = Path(tempfile.mkdtemp())
+        globals()["REPORTS"] = d
+        (d / "recs.jsonl").write_text(
+            json.dumps({"report_date": "2026-07-08", "recs": recs}) + "\n")
+        (d / "actions-log.md").write_text(log or "".join(
+            "- [2026-07-09] taken rec:%s - did it\n" % r["id"] for r in recs))
+        (d / "metrics.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in metrics_rows))
+        return d
+
+    def _pv_row(day, hours=10.0, failures=None):
+        r = {"date": day, "coverage_hours": hours}
+        if failures is not None:
+            r["tool_failures"] = failures
+        return r
+
+    # tool_failures is deliberately NOT equal to coverage_hours, and NOT flat across the
+    # split: with 10.0/10.0 on every day a control computed from the wrong field is
+    # numerically identical to the right one, and the fixture cannot tell them apart.
+    _before = ["2026-07-%02d" % n for n in range(2, 9)]     # 7 days
+    _after = ["2026-07-%02d" % n for n in range(10, 17)]    # 7 days
+    main_metrics = ([_pv_row(d, 10.0, 4.0) for d in _before]
+                    + [_pv_row("2026-07-09", 10.0, 3.0)]     # the take date itself
+                    + [_pv_row(d, 10.0, 2.0) for d in _after])
+    calls = []
+
+    def fake_counts(day, patterns):
+        calls.append(day.isoformat())
+        pre = day.isoformat() < "2026-07-09"
+        return {rid: (2 if (pre and rid == "2026-07-08#1") else 0) for rid in patterns}
+
+    pv_dir = _pv_setup([
+        _pv_rec("2026-07-08#1", "isolated in the worktree"),
+        # Stored baseline 40 from report time, but fires ZERO times in the window compared.
+        _pv_rec("2026-07-08#2", "a rare and thinly attested phrase"),
+        # Declared a probe and lost it: an unmeasured mechanism rec.
+        _pv_rec("2026-07-08#3", "", baseline=0, drop="no-baseline"),
+    ], main_metrics)
+    globals()["probe_counts"] = fake_counts
+    try:
+        pl = probe_lines(date(2026, 7, 18))
+        eff = effectiveness_lines(date(2026, 7, 18))
+    finally:
+        globals()["probe_counts"], globals()["REPORTS"] = t3_counts, t3_reports
+        shutil.rmtree(pv_dir, ignore_errors=True)
+    by_rec = {l.split()[1]: l for l in pl if l.startswith("PROBE rec:")}
+    m = by_rec["rec:2026-07-08#1"]
+    # 2 matches x 7 days / (10 coverage hours x 7 days) = 0.20 before; 0.00 after.
+    assert "status:measured" in m and "reason:-" in m, m
+    assert "before:0.20" in m and "after:0.00" in m, m
+    assert "delta:-100.0%" in m, m
+    # Counted in the window actually compared - NOT the stored baseline.
+    assert "matches_before:14 matches_after:0" in m, m
+    # Control from RAW tool_failures, coverage-weighted: 28/70 = 0.40 -> 14/70 = 0.20.
+    # Computed from coverage_hours instead it would read +0.0%.
+    assert "control:-50.0%" in m and "control_status:ok" in m, m
+    # Only days WITH a metrics row are in the window; a day with no denominator is skipped,
+    # never counted as a zero (which would read as an improvement).
+    assert "n_before:7 n_after:7" in m, m
+    # The take date belongs to NEITHER side. 2026-07-09 HAS a metrics row here, so this
+    # assertion is live rather than incidentally satisfied by a gap in the fixture.
+    assert "2026-07-09" not in calls, calls
+    t = by_rec["rec:2026-07-08#2"]
+    assert "status:unmeasurable" in t and "reason:thin-baseline" in t, t
+    assert "matches_before:0" in t, t
+    assert "rec:2026-07-08#3" not in by_rec, by_rec
+    assert "PROBE-UNMEASURED n:1" in pl, pl
+    # THE ROUND-1 BLOCKER, pinned: the digest that reaches reduce must carry these lines.
+    # effectiveness_lines is the only one of the five subcommands on the reduce-input path
+    # that this axis rides; a PROBE line that exists but never reaches it is a shipped no-op.
+    assert any(l.startswith("PROBE rec:2026-07-08#1") for l in eff), eff[-4:]
+    assert any(l.startswith("PROBE-UNMEASURED") for l in eff), eff[-4:]
+
+    # (a) SHORT WINDOW. Baseline is healthy (3/day x 2 days = 6 >= PROBE_MIN_BASELINE) but
+    #     only 2 covered days a side, so the window floor is the ONLY thing that can fire.
+    def thick_counts(day, patterns):
+        return {rid: (3 if day.isoformat() < "2026-07-09" else 0) for rid in patterns}
+
+    pv2 = _pv_setup([_pv_rec("2026-07-08#1", "isolated in the worktree")],
+                    [_pv_row(d, 10.0, 4.0) for d in
+                     ("2026-07-07", "2026-07-08", "2026-07-10", "2026-07-11")])
+    globals()["probe_counts"] = thick_counts
+    try:
+        pl2 = [l for l in probe_lines(date(2026, 7, 18)) if l.startswith("PROBE rec:")]
+    finally:
+        globals()["probe_counts"], globals()["REPORTS"] = t3_counts, t3_reports
+        shutil.rmtree(pv2, ignore_errors=True)
+    assert len(pl2) == 1, pl2
+    assert "status:unmeasurable" in pl2[0] and "reason:short-window" in pl2[0], pl2
+    assert "n_before:2 n_after:2" in pl2[0] and "matches_before:6" in pl2[0], pl2
+
+    # (b) NO CONTROL. 7 covered days a side, healthy baseline - but only 2 days carry
+    #     tool_failures, which is the real shape of this corpus before 2026-08-26.
+    thin_ctrl = ([_pv_row(d, 10.0, 4.0 if d >= "2026-07-07" else None) for d in _before]
+                 + [_pv_row(d, 10.0, 2.0 if d >= "2026-07-15" else None) for d in _after])
+    pv3 = _pv_setup([_pv_rec("2026-07-08#1", "isolated in the worktree")], thin_ctrl)
+    globals()["probe_counts"] = fake_counts
+    try:
+        pl3 = [l for l in probe_lines(date(2026, 7, 18)) if l.startswith("PROBE rec:")]
+    finally:
+        globals()["probe_counts"], globals()["REPORTS"] = t3_counts, t3_reports
+        shutil.rmtree(pv3, ignore_errors=True)
+    assert len(pl3) == 1, pl3
+    assert "status:unmeasurable" in pl3[0] and "reason:no-control" in pl3[0], pl3
+    assert "control_status:missing" in pl3[0], pl3
+
+    # (c) An INVALID nonempty stored probe (a hand edit; _upsert_jsonl applies no schema).
+    #     No PROBE line, AND still counted as a gap - never absent from both.
+    pv4 = _pv_setup([_pv_rec("2026-07-08#1", "sh")], main_metrics)
+    try:
+        pl4 = probe_lines(date(2026, 7, 18))
+    finally:
+        globals()["REPORTS"] = t3_reports
+        shutil.rmtree(pv4, ignore_errors=True)
+    assert not [l for l in pl4 if l.startswith("PROBE rec:")], pl4
+    assert "PROBE-UNMEASURED n:1" in pl4, pl4
+
+    # (d) The after-window stops at the REPORT day. Here day=07-14, so 07-14..07-16 have
+    #     metrics rows but are not yet observable; without the guard they would be counted
+    #     as after-days, silently averaging in days the report cannot see.
+    pv5 = _pv_setup([_pv_rec("2026-07-08#1", "isolated in the worktree")], main_metrics)
+    globals()["probe_counts"] = fake_counts
+    try:
+        pl5 = [l for l in probe_lines(date(2026, 7, 14)) if l.startswith("PROBE rec:")]
+    finally:
+        globals()["probe_counts"], globals()["REPORTS"] = t3_counts, t3_reports
+        shutil.rmtree(pv5, ignore_errors=True)
+    assert len(pl5) == 1, pl5
+    assert "n_before:7 n_after:4" in pl5[0], pl5   # 07-10..07-13 only
+    print("probe verdict OK")
+
     print("selftest OK")
 
 
@@ -3449,6 +3761,8 @@ def main():
         sys.exit(cmd_validate_report(args[args.index("--file") + 1]))
     elif cmd == "effectiveness":
         cmd_effectiveness(day)
+    elif cmd == "probes":
+        cmd_probes(day)
     elif cmd == "memory-health":
         cmd_memory_health()
     elif cmd == "prior-recs":
