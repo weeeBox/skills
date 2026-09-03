@@ -79,8 +79,12 @@ Four guards, each closing a way the axis could flatter itself, and each with its
 new contract): the mechanical half works and the measurement half does not.** 3 of 3
 mechanism recs carried a `Probe:` line, all three passed `valid_probe`, and
 `validate-report` exited 0 - so the contract lands and no day is lost. But 0 of 3 probes
-were scoreable: `bypassed \`stage-and-regen.sh\`` hit 3 times (thin-baseline, kept),
-`legs that never ran` and `server_error` hit ZERO times in 14 days and were discarded.
+were scoreable - a number that was WRONG, and wrong because of a defect in this counter.
+`server_error` really scores 11 (SCOREABLE); it read 0 only because `probe_text_of` was
+reading `message.content` and tool inputs while the token lived under `error`,
+`toolUseResult`, `attachment` and a top-level `content`. Corrected: **1 of 3 scoreable** -
+`server_error` 11, `bypassed \`stage-and-regen.sh\`` 3 (thin-baseline),
+`legs that never ran` 0 (genuinely prose, not a signature).
 The model writes probes the way it writes prose - a description of the friction
 (`legs that never ran`), a guess at an error string it never checked (`server_error`), and
 markdown backticks that exist in its own output but not in the tool output being matched.

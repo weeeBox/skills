@@ -824,26 +824,39 @@ def valid_probe(pattern):
 
 
 def probe_text_of(d):
-    """Every byte of a row a probe may legitimately match, including TOOL INPUTS.
+    """Every string anywhere in a transcript row, for probe matching only.
 
-    `raw_text_of` returns only user-visible text: `text_of` reads a block's `text`/`content`,
-    and a `tool_use` block has neither - its payload is in `input`. So a probe for a command
-    shape (`git -C /other`, `rm -rf`, a refused redirect) would match NOTHING no matter how
-    often that command ran, and score every day as a success. That is the fail-open this axis
-    exists to remove, and `prompts/reduce.md` explicitly tells the writer to probe command
-    shapes, so it would have fired on real probes rather than as an edge case.
+    A row carries friction text in at least five different top-level fields, measured
+    2026-09-02 on this machine's own corpus: searching for one real error token found it
+    under `error` (41 rows), `message` (21), a TOP-LEVEL `content` (12), `toolUseResult` (6)
+    and `attachment` (3). `raw_text_of` reads `message.content` only, so a probe built on it
+    was blind to 62 of 83 of those - and blind precisely where tool errors and refusals land,
+    which is most of what a probe is for. The first version of this function added `tool_use`
+    inputs and still missed the other four fields; enumerating fields was the wrong shape.
 
-    Deliberately a SEPARATE function rather than a change to `raw_text_of`: that one feeds
-    friction scoring, injected-turn detection and the extract bodies, and widening it would
-    move every one of those numbers for reasons unrelated to probes.
+    So: recurse and collect every string leaf. No field list to keep in sync, and no
+    json.dumps either - a serialized row escapes quotes and newlines, so a probe containing
+    either would silently stop matching.
+
+    Known and accepted: this also sees the assistant's own prose, so a session that DISCUSSES
+    a friction signature counts as an occurrence of it. That was already true of raw_text_of.
+    It inflates a probe whose text gets quoted in retro discussion; `matches_before` is the
+    hook for spotting one.
     """
-    parts = [raw_text_of(d)]
-    for b in blocks(d):
-        if isinstance(b, dict) and b.get("type") == "tool_use":
-            inp = b.get("input")
-            if inp is not None:
-                parts.append(json.dumps(inp, ensure_ascii=False, sort_keys=True))
-    return " ".join(p for p in parts if p)
+    parts = []
+
+    def walk(v):
+        if isinstance(v, str):
+            parts.append(v)
+        elif isinstance(v, dict):
+            for x in v.values():
+                walk(x)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+
+    walk(d)
+    return " ".join(parts)
 
 
 def probe_counts(day, patterns):
@@ -3506,6 +3519,30 @@ def selftest():
     # see it. A probe for a command shape is the contract's own first example, so this
     # assertion is load-bearing, not an edge case.
     assert got["a#2"] == 1, got
+    # Friction text does not live in message.content. Measured on the real corpus, one error
+    # token appeared under `error`, a TOP-LEVEL `content`, `toolUseResult` and `attachment` as
+    # well - 62 of 83 rows were in fields a message.content reader cannot see. Each field here
+    # is one that was actually missed.
+    mf = Path(tempfile.mkdtemp()) / "mf"
+    (mf / "-proj-b").mkdir(parents=True)
+    mrows = [
+        {"type": "x", "timestamp": pts, "error": "overloaded_error retry"},
+        {"type": "x", "timestamp": pts, "content": "top level content string"},
+        {"type": "x", "timestamp": pts, "toolUseResult": {"stderr": "a nested tool result"}},
+        {"type": "x", "timestamp": pts, "attachment": {"body": ["deep in a list"]}},
+    ]
+    with (mf / "-proj-b" / "s.jsonl").open("w") as f:
+        for r in mrows:
+            f.write(json.dumps(r) + "\n")
+    globals()["PROJECTS"] = mf
+    try:
+        deep = probe_counts(date(2026, 7, 8), {
+            "e": "overloaded_error", "c": "top level content",
+            "t": "a nested tool result", "a": "deep in a list"})
+    finally:
+        globals()["PROJECTS"] = _real_projects_t1
+        shutil.rmtree(mf.parent, ignore_errors=True)
+    assert deep == {"e": 1, "c": 1, "t": 1, "a": 1}, deep
     print("probe counter OK")
 
     # --- probe recording + baseline validation (Task 2) ---
