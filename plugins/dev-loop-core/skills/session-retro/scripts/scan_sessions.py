@@ -789,6 +789,105 @@ def scan_day(day):
             "active_no_in_day_events": active_no_events}
 
 
+MIN_PROBE_LEN = 8     # a shorter literal matches incidentally; "git" is not a signature
+MAX_PROBE_LEN = 120   # also the cap _sanitize_summary imposes on every other stored field
+
+
+def valid_probe(pattern):
+    """Normalize a rec probe, or None if it is not usable.
+
+    A probe is a LITERAL substring, matched case-insensitively. It is deliberately not a
+    regex: the pattern comes from the REPORT, which is model output over untrusted transcript
+    content, and `re` offers no per-match timeout, so a model-authored pattern run against
+    every event of every transcript is an unbounded-backtracking surface that a length cap
+    does not bound. `str.find` cannot blow up. Metacharacters are therefore DATA - a probe
+    for `rc=$?` or `([` is stored and matched verbatim.
+
+    Validation is printable-ASCII plus a length band. It does NOT route through
+    `_sanitize_summary`, which strips `<`, `>` and `"` and truncates at 120: for a summary
+    that is cosmetic, but it would silently rewrite a probe into a DIFFERENT literal that
+    still matches things, which is worse than rejecting it. MAX_PROBE_LEN is set to that same
+    120 so the two can never disagree.
+
+    A pattern failing any check returns None and is DROPPED, never degraded to something that
+    matches less: a probe scoring 0 because it is broken is indistinguishable from a fix that
+    worked, which is the exact defect this whole axis exists to remove.
+    """
+    if not isinstance(pattern, str):
+        return None
+    p = pattern.strip()
+    if not (MIN_PROBE_LEN <= len(p) <= MAX_PROBE_LEN):
+        return None
+    if not re.fullmatch(r"[\x20-\x7e]+", p):
+        return None
+    return p
+
+
+def probe_text_of(d):
+    """Every byte of a row a probe may legitimately match, including TOOL INPUTS.
+
+    `raw_text_of` returns only user-visible text: `text_of` reads a block's `text`/`content`,
+    and a `tool_use` block has neither - its payload is in `input`. So a probe for a command
+    shape (`git -C /other`, `rm -rf`, a refused redirect) would match NOTHING no matter how
+    often that command ran, and score every day as a success. That is the fail-open this axis
+    exists to remove, and `prompts/reduce.md` explicitly tells the writer to probe command
+    shapes, so it would have fired on real probes rather than as an edge case.
+
+    Deliberately a SEPARATE function rather than a change to `raw_text_of`: that one feeds
+    friction scoring, injected-turn detection and the extract bodies, and widening it would
+    move every one of those numbers for reasons unrelated to probes.
+    """
+    parts = [raw_text_of(d)]
+    for b in blocks(d):
+        if isinstance(b, dict) and b.get("type") == "tool_use":
+            inp = b.get("input")
+            if inp is not None:
+                parts.append(json.dumps(inp, ensure_ascii=False, sort_keys=True))
+    return " ".join(p for p in parts if p)
+
+
+def probe_counts(day, patterns):
+    """{rec_id: pattern} -> {rec_id: matching events on `day`}.
+
+    ONE walk of the corpus for all patterns. A per-pattern walk re-reads every transcript
+    once per probe, and the digest carries tens of probes over a 14-day window.
+    Rejected patterns are absent from the result rather than present as 0.
+    """
+    compiled = {}
+    for rid, pat in (patterns or {}).items():
+        v = valid_probe(pat)
+        if v is not None:
+            compiled[rid] = v.lower()
+    if not compiled:
+        return {}
+    counts = {rid: 0 for rid in compiled}
+    start, end = day_bounds(day)
+    day_start_epoch = start.timestamp()
+    if not PROJECTS.exists():
+        return counts
+    for proj in sorted(PROJECTS.iterdir()):
+        if not proj.is_dir():
+            continue
+        for f in proj.glob("*.jsonl"):
+            try:
+                if f.stat().st_mtime < day_start_epoch:
+                    continue   # no appends since day start -> no in-day events
+            except OSError:
+                continue
+            for d in iter_lines(f):
+                ts = parse_ts(d.get("timestamp"))
+                if ts is None or not (start <= ts < end):
+                    continue
+                txt = probe_text_of(d)
+                if not txt:
+                    continue
+                low = txt.lower()
+                for rid, needle in compiled.items():
+                    if needle in low:
+                        counts[rid] += 1
+    return counts
+
+
 def _scan_totals(sessions):
     """Day totals, written into scan.json so the reduce model can COPY them.
 
@@ -3053,6 +3152,53 @@ def selftest():
                 REPORTS = _real_reports
     finally:
         PROJECTS = real_projects
+    # --- probe counter (Task 1) ---
+    import shutil
+    pdir = Path(tempfile.mkdtemp()) / "probes"
+    (pdir / "-proj-a").mkdir(parents=True)
+    pts = "2026-07-08T12:00:00.000Z"
+    outside = "2026-07-09T12:00:00.000Z"
+    prows = [
+        {"type": "assistant", "timestamp": pts, "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": "git -C /other/repo log"}}]}},
+        {"type": "user", "timestamp": pts, "message": {"content": [
+            {"type": "tool_result", "is_error": True,
+             "content": "this session is isolated in the worktree X"}]}},
+        {"type": "user", "timestamp": outside, "message": {"content": [
+            {"type": "tool_result", "is_error": True,
+             "content": "this session is isolated in the worktree X"}]}},
+    ]
+    with (pdir / "-proj-a" / "s1.jsonl").open("w") as f:
+        for r in prows:
+            f.write(json.dumps(r) + "\n")
+    _real_projects_t1 = globals()["PROJECTS"]
+    globals()["PROJECTS"] = pdir
+    try:
+        got = probe_counts(date(2026, 7, 8), {
+            "a#1": "Isolated In The Worktree",     # case-insensitive
+            "a#2": "git -C /other",
+            "a#3": "nothing matches this",
+            "a#4": "short",                        # under 8 chars -> dropped entirely
+            "a#5": "x" * (MAX_PROBE_LEN + 1),      # over length -> dropped entirely
+        })
+    finally:
+        globals()["PROJECTS"] = _real_projects_t1
+        shutil.rmtree(pdir.parent, ignore_errors=True)
+    # Counts are per EVENT, and the 07-09 row must not leak into the 07-08 window.
+    assert got == {"a#1": 1, "a#2": 1, "a#3": 0}, got
+    assert valid_probe("short") is None
+    assert valid_probe("x" * (MAX_PROBE_LEN + 1)) is None
+    assert valid_probe("   ") is None
+    assert valid_probe("caf\u00e9 au lait") is None        # non-ASCII rejected
+    # A literal is stored verbatim: regex metacharacters are DATA, never syntax, so a probe
+    # for a shell fragment cannot be reinterpreted or fail to compile.
+    assert valid_probe("rc=$?  (") == "rc=$?  ("
+    # a#2 lives ONLY in a tool_use `input`, never in any `text` block: raw_text_of cannot
+    # see it. A probe for a command shape is the contract's own first example, so this
+    # assertion is load-bearing, not an edge case.
+    assert got["a#2"] == 1, got
+    print("probe counter OK")
+
     print("selftest OK")
 
 
