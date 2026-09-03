@@ -272,6 +272,7 @@ for d in $dates; do
   probe_err=$("$PY" "$SKILL/scripts/scan_sessions.py" validate-report --file "$tmp" 2>&1) && probe_ok=y || probe_ok=n
   if [ -s "$tmp" ] && [ "$(stat -f %z "$tmp")" -gt 500 ] && grep -q "## Next actions" "$tmp" \
      && [ "$probe_ok" = y ]; then
+    [ -n "$probe_err" ] && echo "$probe_err"
     mv "$tmp" "$BASE/$d.md"
     printf '\n<!-- retro-complete -->\n' >> "$BASE/$d.md"
     echo "report complete: $BASE/$d.md"

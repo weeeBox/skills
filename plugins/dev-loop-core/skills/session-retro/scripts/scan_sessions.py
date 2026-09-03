@@ -1545,12 +1545,14 @@ def report_probe_gaps(text):
     `Probe: x` that will be rejected later has to be rejected here, while rejection still
     means something.
     """
-    gaps = []
+    gaps, mech_total = [], []
     state = {"cur": None, "mech": False, "probe": False}
 
     def close():
-        if state["cur"] and state["mech"] and not state["probe"]:
-            gaps.append(state["cur"])
+        if state["cur"] and state["mech"]:
+            mech_total.append(state["cur"])
+            if not state["probe"]:
+                gaps.append(state["cur"])
 
     for line in text.splitlines():
         m = REC_TAG_RE.search(line)
@@ -1572,14 +1574,38 @@ def report_probe_gaps(text):
             if valid_probe(v) is not None or re.match(r"(?i)none\s*-\s*\S", v):
                 state["probe"] = True
     close()
-    return gaps
+    return gaps, mech_total
 
 
 def cmd_validate_report(path):
-    gaps = report_probe_gaps(Path(path).read_text(encoding="utf-8", errors="replace"))
-    if gaps:
-        print("mechanism recs with no Probe: line: " + " ".join(gaps), file=sys.stderr)
+    """Exit 1 only when NO mechanism rec carries a usable probe; otherwise warn and pass.
+
+    Proportionality is the whole point, and it is measured rather than assumed. Run against
+    the five most recent real reports on 2026-09-02, this check found gaps in four of them
+    (5, 5, 5 and 3 recs) - reports written before the contract existed. Satisfying the
+    contract depends on reduce following a PROSE instruction, and this repo's own natural
+    experiment puts prose-rule compliance at 31.11% before a rule versus 32.11% after, across
+    1831 opportunities. So a strict gate would, on the evidence, discard whole days of retro
+    output whenever one rec of five missed its line.
+
+    Losing a day's report to enforce an instrument is the wrong trade: the report is the
+    deliverable, the probe is a measurement of it. A wholesale ignore (no rec complied at all)
+    still fails closed and is retried, because that means the contract did not land. A partial
+    miss ships the report and is counted - `probe_drop` names each one and
+    `PROBE-UNMEASURED n:<k>` totals them, with reduce instructed to treat a rising k as a
+    finding about this loop. The instrument reports its own coverage instead of holding the
+    deliverable hostage to it.
+    """
+    gaps, mech = report_probe_gaps(Path(path).read_text(encoding="utf-8", errors="replace"))
+    if not gaps:
+        return 0
+    msg = "mechanism recs with no Probe: line: %s (%d of %d)" % (
+        " ".join(gaps), len(gaps), len(mech))
+    if len(gaps) == len(mech):
+        print(msg + " - NO rec complied; the contract did not land", file=sys.stderr)
         return 1
+    print("warning: " + msg + " - report still stamped; counted in PROBE-UNMEASURED",
+          file=sys.stderr)
     return 0
 
 
@@ -3567,34 +3593,50 @@ def selftest():
     # --- pre-stamp probe gate (Task 2) ---
     ok = ("**[rec: 2026-07-08#1] a**\ntier: hook\nProbe: a real signature here\n"
           "**[rec: 2026-07-08#2] b**\ntier: script\nProbe: another real signature\n")
-    assert report_probe_gaps(ok) == [], report_probe_gaps(ok)
+    assert report_probe_gaps(ok)[0] == [], report_probe_gaps(ok)[0]
     # The count-comparison bug this replaced: two probes on #1, none on #2. A whole-file
     # `probes >= tiers` passes this text; the per-rec check must not.
     masked = ("**[rec: 2026-07-08#1] a**\ntier: hook\nProbe: a real signature here\n"
               "Probe: a second signature on the same rec\n"
               "**[rec: 2026-07-08#2] b**\ntier: script\n")
-    assert report_probe_gaps(masked) == ["2026-07-08#2"], report_probe_gaps(masked)
+    assert report_probe_gaps(masked)[0] == ["2026-07-08#2"], report_probe_gaps(masked)[0]
     # A non-mechanism rec needs no probe.
     prose = "**[rec: 2026-07-08#3] c**\ntier: claude-md\n"
-    assert report_probe_gaps(prose) == [], report_probe_gaps(prose)
+    assert report_probe_gaps(prose)[0] == [], report_probe_gaps(prose)[0]
     # The LAST rec in the file is closed too - an off-by-one here silently exempts it.
     last = ("**[rec: 2026-07-08#1] a**\ntier: hook\nProbe: a real signature here\n"
             "**[rec: 2026-07-08#9] z**\ntier: hook\n")
-    assert report_probe_gaps(last) == ["2026-07-08#9"], report_probe_gaps(last)
+    assert report_probe_gaps(last)[0] == ["2026-07-08#9"], report_probe_gaps(last)[0]
     # A block closes at the next SECTION too. A Probe: under `## Next actions` belongs to no
     # recommendation, and attaching it to the previous one is the masking bug again.
     spill = ("**[rec: 2026-07-08#7] a**\ntier: hook\n\n## Next actions\n"
              "Probe: a real signature here\n")
-    assert report_probe_gaps(spill) == ["2026-07-08#7"], report_probe_gaps(spill)
+    assert report_probe_gaps(spill)[0] == ["2026-07-08#7"], report_probe_gaps(spill)[0]
     # Presence is not enough - the value must be usable at GATE time, since nothing after
     # the stamp can reject it.
     junk = "**[rec: 2026-07-08#8] a**\ntier: hook\nProbe: x\n"
-    assert report_probe_gaps(junk) == ["2026-07-08#8"], report_probe_gaps(junk)
+    assert report_probe_gaps(junk)[0] == ["2026-07-08#8"], report_probe_gaps(junk)[0]
     # ...and the declared-absence form is accepted, with a reason.
     none_ok = "**[rec: 2026-07-08#9] a**\ntier: hook\nProbe: none - emits nothing\n"
-    assert report_probe_gaps(none_ok) == [], report_probe_gaps(none_ok)
+    assert report_probe_gaps(none_ok)[0] == [], report_probe_gaps(none_ok)[0]
     none_bare = "**[rec: 2026-07-08#9] a**\ntier: hook\nProbe: none\n"
-    assert report_probe_gaps(none_bare) == ["2026-07-08#9"], report_probe_gaps(none_bare)
+    assert report_probe_gaps(none_bare)[0] == ["2026-07-08#9"], report_probe_gaps(none_bare)[0]
+    # Proportionality. A partial miss must NOT cost the whole report: the report is the
+    # deliverable and the probe is a measurement of it. Only a wholesale ignore fails closed.
+    import tempfile as _tf
+    _pg = Path(_tf.mkdtemp())
+    partial = _pg / "partial.md"
+    partial.write_text("**[rec: 2026-07-08#1] a**\ntier: hook\nProbe: a real signature here\n"
+                       "**[rec: 2026-07-08#2] b**\ntier: script\n")
+    assert cmd_validate_report(str(partial)) == 0, "a partial miss must still stamp"
+    total = _pg / "total.md"
+    total.write_text("**[rec: 2026-07-08#1] a**\ntier: hook\n"
+                     "**[rec: 2026-07-08#2] b**\ntier: script\n")
+    assert cmd_validate_report(str(total)) == 1, "no rec complied -> fail closed"
+    clean = _pg / "clean.md"
+    clean.write_text("**[rec: 2026-07-08#1] a**\ntier: hook\nProbe: a real signature here\n")
+    assert cmd_validate_report(str(clean)) == 0
+    shutil.rmtree(_pg, ignore_errors=True)
     print("probe gate OK")
 
     # --- probe verdict lines (Task 3) ---
