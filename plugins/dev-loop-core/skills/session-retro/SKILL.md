@@ -75,6 +75,26 @@ Four guards, each closing a way the axis could flatter itself, and each with its
   forward, so every window it will evaluate is inside the covered range. `control_status:` is
   emitted per line rather than assumed, so if that stops being true the lines say so.
 
+**Measured on the first real run (2026-09-02, reduce over 2026-09-01's own data with the
+new contract): the mechanical half works and the measurement half does not.** 3 of 3
+mechanism recs carried a `Probe:` line, all three passed `valid_probe`, and
+`validate-report` exited 0 - so the contract lands and no day is lost. But 0 of 3 probes
+were scoreable: `bypassed \`stage-and-regen.sh\`` hit 3 times (thin-baseline, kept),
+`legs that never ran` and `server_error` hit ZERO times in 14 days and were discarded.
+The model writes probes the way it writes prose - a description of the friction
+(`legs that never ran`), a guess at an error string it never checked (`server_error`), and
+markdown backticks that exist in its own output but not in the tool output being matched.
+The guards held: nothing false was scored and `PROBE-UNMEASURED n:3` made the gap visible.
+The axis simply produced no signal.
+
+The fix is NOT another prose instruction - that is the tier this loop measured dead. Give
+the model EVIDENCE instead: the digest already walks the corpus, so it can carry the day's
+most frequent error/refusal strings and the contract can say "pick one of these, verbatim",
+turning probe-writing from invention into selection. Not built; it needs its own gate round
+and must be scored on the same question - how many probes clear `PROBE_MIN_BASELINE`.
+Until then expect `PROBE-UNMEASURED` to dominate, and do NOT read a low
+`probes_measured` as "the fixes are not working."
+
 **Ceiling: the writer still chooses the signature; only the value comes from the world.** The
 baseline requirement removes a probe that measures nothing and the control exposes one that
 fell with the tide, but neither stops a signature narrower than the friction it stands for.
