@@ -265,7 +265,13 @@ for d in $dates; do
 
   # completion marker stamped by THIS wrapper only after structural validation:
   # size + the mandatory final section (catches truncated model output)
-  if [ -s "$tmp" ] && [ "$(stat -f %z "$tmp")" -gt 500 ] && grep -q "## Next actions" "$tmp"; then
+  # Every mechanism-tier rec must carry its own usable Probe: line. Checked per-rec by
+  # scan_sessions.py (a whole-file count is satisfiable with one rec still unmeasured), and
+  # checked HERE because this is the last point before the report is mv'd and stamped -
+  # `recs` runs after the stamp below and can reject nothing.
+  probe_err=$("$PY" "$SKILL/scripts/scan_sessions.py" validate-report --file "$tmp" 2>&1) && probe_ok=y || probe_ok=n
+  if [ -s "$tmp" ] && [ "$(stat -f %z "$tmp")" -gt 500 ] && grep -q "## Next actions" "$tmp" \
+     && [ "$probe_ok" = y ]; then
     mv "$tmp" "$BASE/$d.md"
     printf '\n<!-- retro-complete -->\n' >> "$BASE/$d.md"
     echo "report complete: $BASE/$d.md"
@@ -276,7 +282,7 @@ for d in $dates; do
     "$PY" "$SKILL/scripts/scan_sessions.py" recs --date "$d" || { echo "recs FAILED for $d"; fail_reasons="$fail_reasons recs:$d"; }
     completed="$completed $d"
   else
-    echo "report FAILED validation for $d (missing/too small/truncated); left uncovered for retry"
+    echo "report FAILED validation for $d (missing/too small/truncated${probe_err:+; $probe_err}); left uncovered for retry"
     rm -f "$tmp"
     fail_reasons="$fail_reasons validate:$d"
   fi

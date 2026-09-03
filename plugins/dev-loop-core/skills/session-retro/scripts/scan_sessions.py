@@ -1525,6 +1525,64 @@ def _sanitize_summary(s):
     return s[:120]
 
 
+MECH_TIER_RE = re.compile(r"^\s*(?:\*\*)?tier:\s*(hook|script|test)\b", re.I)
+PROBE_LINE_RE = re.compile(r"^\s*(?:\*\*)?Probe:\s*(.+)$")
+
+
+def report_probe_gaps(text):
+    """Rec ids in `text` that declare a mechanism tier but carry no USABLE `Probe:` line.
+
+    Block-scoped on purpose: a whole-file count of `tier:` against a count of `Probe:` is
+    satisfied by one rec carrying two probes while another carries none, which is the exact
+    report this gate exists to reject.
+
+    A block closes on the next rec heading OR the next `## ` section - not only at EOF. A
+    `Probe:` line sitting under `## Next actions` is not part of the last recommendation, and
+    letting it attach there re-opens the same masking bug one level down.
+
+    Presence is not enough: the value must pass `valid_probe` or be the declared-absence form
+    `none - <reason>`. This is the ONLY check that runs before the report is stamped, so a
+    `Probe: x` that will be rejected later has to be rejected here, while rejection still
+    means something.
+    """
+    gaps = []
+    state = {"cur": None, "mech": False, "probe": False}
+
+    def close():
+        if state["cur"] and state["mech"] and not state["probe"]:
+            gaps.append(state["cur"])
+
+    for line in text.splitlines():
+        m = REC_TAG_RE.search(line)
+        if line.lstrip().startswith("**[rec:") and m:
+            close()
+            state.update(cur="%s#%s" % (m.group(1), m.group(2)), mech=False, probe=False)
+            continue
+        if line.startswith("## "):
+            close()
+            state.update(cur=None, mech=False, probe=False)
+            continue
+        if not state["cur"]:
+            continue
+        if MECH_TIER_RE.match(line):
+            state["mech"] = True
+        p = PROBE_LINE_RE.match(line)
+        if p:
+            v = p.group(1).strip()
+            if valid_probe(v) is not None or re.match(r"(?i)none\s*-\s*\S", v):
+                state["probe"] = True
+    close()
+    return gaps
+
+
+def cmd_validate_report(path):
+    gaps = report_probe_gaps(Path(path).read_text(encoding="utf-8", errors="replace"))
+    if gaps:
+        print("mechanism recs with no Probe: line: " + " ".join(gaps), file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_recs(day):
     """Upsert the rec-ids in <day>'s stamped report into recs.jsonl - the cross-day recurrence
     signal (a rec-id on multiple report dates = a pattern that recurred). Deterministic: only
@@ -1545,7 +1603,7 @@ def cmd_recs(day):
     # prompts/reduce.md). Stored so the fresh-id-restatement rate is measurable in-band
     # rather than only by re-clustering the corpus by hand: a rec with repeat False and
     # no Dedup line is the writer skipping the gate.
-    dedup, cur = {}, None
+    dedup, probe, cur = {}, {}, None
     for line in lines:
         m = REC_TAG_RE.search(line)
         if line.lstrip().startswith("**[rec:") and m:
@@ -1554,6 +1612,12 @@ def cmd_recs(day):
         d = re.match(r"\s*(?:\*\*)?Dedup:\*{0,2}\s*(.+)$", line)
         if d and cur and cur not in dedup:
             dedup[cur] = _sanitize_summary(d.group(1))
+        p = re.match(r"\s*(?:\*\*)?Probe:\*{0,2}\s*(.+)$", line)
+        if p and cur and cur not in probe:
+            # NOT _sanitize_summary: it strips <, > and " and truncates at 120, which would
+            # silently rewrite a probe into a DIFFERENT literal that still matches things.
+            # valid_probe is this field's sanitizer, and it rejects rather than rewrites.
+            probe[cur] = p.group(1).strip()
     recs = {}
     for canonical_only in (True, False):
         for line in lines:
@@ -1572,12 +1636,58 @@ def cmd_recs(day):
                     recs[rid] = {"id": rid, "repeat": "REPEAT" in line.upper(),
                                  "summary": _sanitize_summary(after),
                                  "dedup": dedup.get(rid, "")}
+    # A probe is only an outcome signal if it FIRED, often enough to be worth a ratio, before
+    # the fix landed. One that never matched cannot tell "the fix worked" from "the probe is
+    # wrong", and that failure is silent and self-flattering.
+    #
+    # This runs AFTER run_retro.sh has already stamped the report and cannot reject it - so
+    # nothing here is a gate. What it does instead is make the failure legible: `probe_drop`
+    # records WHY a probe was not kept, and probe_lines reports the count of mechanism recs
+    # landing unmeasured. The pre-stamp half of this check is cmd_validate_report.
+    #
+    # `Probe: none - <why>` is the contract's explicit "this friction leaves no textual
+    # trace". It satisfies the pre-stamp gate (a line IS present) and must NOT then be
+    # matched as the literal "none - ...", which would find nothing and be reported as
+    # `no-baseline` - i.e. as a broken probe rather than a declared absence. Three failure
+    # modes, three names.
+    declared_none = {rid for rid, p in probe.items() if p.lower().startswith("none")}
+    valid = {rid: v for rid, v in ((r, valid_probe(p)) for r, p in probe.items()
+                                   if r not in declared_none)
+             if v is not None}
+    baseline = {rid: 0 for rid in valid}
+    if valid:
+        for back in range(1, PROBE_BASELINE_DAYS + 1):
+            for rid, n in probe_counts(day - timedelta(days=back), valid).items():
+                baseline[rid] += n
+    for rid, rec in recs.items():
+        if rid not in probe:
+            rec["probe"], rec["probe_baseline"], rec["probe_drop"] = "", None, ""
+        elif rid in declared_none:
+            rec["probe"], rec["probe_baseline"], rec["probe_drop"] = "", None, "declared-none"
+        elif rid not in valid:
+            # Rejected by valid_probe. Distinct from a probe that ran and found nothing:
+            # baseline 0 here means NOT MEASURED, and conflating the two would report a
+            # broken probe as evidence the friction was already absent.
+            rec["probe"], rec["probe_baseline"], rec["probe_drop"] = "", 0, "invalid"
+        else:
+            n = baseline.get(rid, 0)
+            rec["probe_baseline"] = n
+            if n == 0:
+                rec["probe"], rec["probe_drop"] = "", "no-baseline"
+            elif n < PROBE_MIN_BASELINE:
+                # KEPT, not dropped: too thin to score, but the count is the evidence the
+                # threshold itself will be revisited against. Reported `unmeasurable`.
+                rec["probe"], rec["probe_drop"] = valid[rid], "thin-baseline"
+            else:
+                rec["probe"], rec["probe_drop"] = valid[rid], ""
     _upsert_jsonl(REPORTS / "recs.jsonl",
                   {"report_date": day.isoformat(), "recs": list(recs.values())},
                   key="report_date")
     print(f"recs upserted for {day.isoformat()}: {len(recs)} rec-ids")
 
 
+PROBE_BASELINE_DAYS = 14  # days before its report over which a probe's baseline is counted
+PROBE_MIN_BASELINE = 5    # baseline matches required before a probe is scored, not just kept
 PRIOR_REC_WINDOW = 21   # calendar days of prior rec titles shown to reduce for dedup
 CHRONIC_WINDOW = 14     # calendar days (window span; see cmd_effectiveness cutoff)
 CHRONIC_MIN_DAYS = 3    # appearances within the window to count as chronic
@@ -3199,6 +3309,121 @@ def selftest():
     assert got["a#2"] == 1, got
     print("probe counter OK")
 
+    # --- probe recording + baseline validation (Task 2) ---
+    # Each block captures and restores its OWN globals: a block that restores from a name
+    # bound in an earlier block is order-dependent, and a selftest whose correctness depends
+    # on statement order is one reordering away from passing vacuously.
+    t2_reports, t2_projects = globals()["REPORTS"], globals()["PROJECTS"]
+    prep_dir = Path(tempfile.mkdtemp())
+    pdir_2 = Path(tempfile.mkdtemp()) / "p2"
+    globals()["REPORTS"] = prep_dir
+    globals()["PROJECTS"] = pdir_2
+    (prep_dir / "2026-07-08.md").write_text(
+        "# Session retro 2026-07-08\n\n## Recommendations\n\n"
+        "**[rec: 2026-07-08#1] NEW - stop the worktree refusals**\n"
+        "Dedup: no prior\n"
+        "tier: hook\n"
+        "Probe: isolated in the worktree\n\n"
+        "**[rec: 2026-07-08#2] NEW - a probe that never fired**\n"
+        "Dedup: no prior\n"
+        "tier: script\n"
+        "Probe: a signature absent from every transcript\n\n"
+        "**[rec: 2026-07-08#3] NEW - a claude-md rec, no probe required**\n"
+        "Dedup: no prior\n"
+        "tier: hook\n\n"
+        "**[rec: 2026-07-08#4] NEW - a probe that barely fired**\n"
+        "Dedup: no prior\n"
+        "tier: script\n"
+        "Probe: a rare and thinly attested phrase\n\n"
+        "**[rec: 2026-07-08#5] NEW - a probe too short to mean anything**\n"
+        "Dedup: no prior\n"
+        "tier: hook\n"
+        "Probe: git\n\n"
+        "**[rec: 2026-07-08#6] NEW - friction with no textual trace**\n"
+        "Dedup: no prior\n"
+        "tier: script\n"
+        "Probe: none - the friction is a missing turn, which emits nothing\n\n"
+        "## Next actions\n")
+    (pdir_2 / "-proj-a").mkdir(parents=True)
+    with (pdir_2 / "-proj-a" / "s1.jsonl").open("w") as f:
+        # PROBE_MIN_BASELINE hits for #1, exactly one for #4 (thin), none for #2.
+        for _i in range(PROBE_MIN_BASELINE):
+            f.write(json.dumps({"type": "user", "timestamp": "2026-07-01T12:00:00.000Z",
+                                "message": {"content": [{"type": "tool_result",
+                                            "content": "this session is isolated in the worktree X"}]}}) + "\n")
+        f.write(json.dumps({"type": "user", "timestamp": "2026-07-01T12:00:00.000Z",
+                            "message": {"content": [{"type": "tool_result",
+                                        "content": "a rare and thinly attested phrase"}]}}) + "\n")
+    try:
+        cmd_recs(date(2026, 7, 8))
+        row = json.loads((prep_dir / "recs.jsonl").read_text().splitlines()[0])
+    finally:
+        globals()["REPORTS"], globals()["PROJECTS"] = t2_reports, t2_projects
+        shutil.rmtree(prep_dir, ignore_errors=True)
+        shutil.rmtree(pdir_2.parent, ignore_errors=True)
+    by_id = {r["id"]: r for r in row["recs"]}
+    # Fired enough times in its baseline window -> KEPT and scoreable.
+    assert by_id["2026-07-08#1"]["probe"] == "isolated in the worktree", by_id
+    assert by_id["2026-07-08#1"]["probe_baseline"] == PROBE_MIN_BASELINE, by_id
+    assert by_id["2026-07-08#1"]["probe_drop"] == "", by_id
+    # Never fired -> DROPPED. It cannot tell a fix from a typo.
+    assert by_id["2026-07-08#2"]["probe"] == "", by_id
+    assert by_id["2026-07-08#2"]["probe_baseline"] == 0, by_id
+    assert by_id["2026-07-08#2"]["probe_drop"] == "no-baseline", by_id
+    # No Probe: line at all -> absence recorded as null, never as 0.
+    assert by_id["2026-07-08#3"]["probe"] == "", by_id
+    assert by_id["2026-07-08#3"]["probe_baseline"] is None, by_id
+    assert by_id["2026-07-08#3"]["probe_drop"] == "", by_id
+    # Fired, but too thinly to score. KEPT with its count, flagged, never silently scored.
+    assert by_id["2026-07-08#4"]["probe"] == "a rare and thinly attested phrase", by_id
+    assert by_id["2026-07-08#4"]["probe_baseline"] == 1, by_id
+    assert by_id["2026-07-08#4"]["probe_drop"] == "thin-baseline", by_id
+    # Fails valid_probe outright -> never even counted, so baseline is 0 and the reason says
+    # `invalid` rather than `no-baseline`: a rejected probe and an absent friction are
+    # different failures and must not be reported as the same one.
+    assert by_id["2026-07-08#5"]["probe"] == "", by_id
+    assert by_id["2026-07-08#5"]["probe_drop"] == "invalid", by_id
+    # `Probe: none - ...` is the contract's declared absence. It satisfies the pre-stamp gate
+    # and must NOT be matched as the literal "none - ...": that would find nothing and be
+    # filed as `no-baseline`, reporting a declared gap as a broken probe.
+    assert by_id["2026-07-08#6"]["probe"] == "", by_id
+    assert by_id["2026-07-08#6"]["probe_drop"] == "declared-none", by_id
+    assert by_id["2026-07-08#6"]["probe_baseline"] is None, by_id
+    print("probe recording OK")
+
+    # --- pre-stamp probe gate (Task 2) ---
+    ok = ("**[rec: 2026-07-08#1] a**\ntier: hook\nProbe: a real signature here\n"
+          "**[rec: 2026-07-08#2] b**\ntier: script\nProbe: another real signature\n")
+    assert report_probe_gaps(ok) == [], report_probe_gaps(ok)
+    # The count-comparison bug this replaced: two probes on #1, none on #2. A whole-file
+    # `probes >= tiers` passes this text; the per-rec check must not.
+    masked = ("**[rec: 2026-07-08#1] a**\ntier: hook\nProbe: a real signature here\n"
+              "Probe: a second signature on the same rec\n"
+              "**[rec: 2026-07-08#2] b**\ntier: script\n")
+    assert report_probe_gaps(masked) == ["2026-07-08#2"], report_probe_gaps(masked)
+    # A non-mechanism rec needs no probe.
+    prose = "**[rec: 2026-07-08#3] c**\ntier: claude-md\n"
+    assert report_probe_gaps(prose) == [], report_probe_gaps(prose)
+    # The LAST rec in the file is closed too - an off-by-one here silently exempts it.
+    last = ("**[rec: 2026-07-08#1] a**\ntier: hook\nProbe: a real signature here\n"
+            "**[rec: 2026-07-08#9] z**\ntier: hook\n")
+    assert report_probe_gaps(last) == ["2026-07-08#9"], report_probe_gaps(last)
+    # A block closes at the next SECTION too. A Probe: under `## Next actions` belongs to no
+    # recommendation, and attaching it to the previous one is the masking bug again.
+    spill = ("**[rec: 2026-07-08#7] a**\ntier: hook\n\n## Next actions\n"
+             "Probe: a real signature here\n")
+    assert report_probe_gaps(spill) == ["2026-07-08#7"], report_probe_gaps(spill)
+    # Presence is not enough - the value must be usable at GATE time, since nothing after
+    # the stamp can reject it.
+    junk = "**[rec: 2026-07-08#8] a**\ntier: hook\nProbe: x\n"
+    assert report_probe_gaps(junk) == ["2026-07-08#8"], report_probe_gaps(junk)
+    # ...and the declared-absence form is accepted, with a reason.
+    none_ok = "**[rec: 2026-07-08#9] a**\ntier: hook\nProbe: none - emits nothing\n"
+    assert report_probe_gaps(none_ok) == [], report_probe_gaps(none_ok)
+    none_bare = "**[rec: 2026-07-08#9] a**\ntier: hook\nProbe: none\n"
+    assert report_probe_gaps(none_bare) == ["2026-07-08#9"], report_probe_gaps(none_bare)
+    print("probe gate OK")
+
     print("selftest OK")
 
 
@@ -3220,6 +3445,8 @@ def main():
         cmd_metrics(day)
     elif cmd == "recs":
         cmd_recs(day)
+    elif cmd == "validate-report":
+        sys.exit(cmd_validate_report(args[args.index("--file") + 1]))
     elif cmd == "effectiveness":
         cmd_effectiveness(day)
     elif cmd == "memory-health":
