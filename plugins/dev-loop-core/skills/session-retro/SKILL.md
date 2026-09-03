@@ -20,6 +20,68 @@ It also tracks recommendation recurrence across days (`recs.jsonl`) and reports,
 recommendation, whether the friction it targeted actually stopped ("Fix effectiveness &
 chronic friction"), so a fix that is not working surfaces instead of silently repeating.
 
+**Recurrence is not an outcome.** Measured 2026-09-02 on the live corpus, raw-id recurrence
+had fired **0 times in 115 taken recs** - all 14 `recurred-after-fix` verdicts arrive through
+`_cluster_recs`, whose edges are the writer's own `Dedup:` backrefs - so `holding` is very
+nearly the default verdict and means only "no later report restated this."
+
+Every `tier: hook|script|test` recommendation therefore carries a **`Probe:`** line: one
+LITERAL substring naming the friction signature the fix claims to remove. Never a regex - `re`
+has no per-match timeout, and a model-authored pattern run over every transcript event is an
+unbounded-backtracking surface a length cap does not bound; `str.find` cannot blow up, and
+metacharacters become inert data. Matching is case-insensitive over `probe_text_of`, which is
+`raw_text_of` PLUS each `tool_use` block's `input`: a `tool_use` block has no `text` field, so
+a probe for a command shape would otherwise match nothing however often that command ran.
+
+`effectiveness_lines` appends, into the same trusted digest as `EFFECTIVENESS`:
+
+    PROBE rec:<id> taken:<d> status:<measured|unmeasurable> reason:<r> before:<rate>
+      after:<rate> delta:<pct> control:<pct> control_status:<ok|missing>
+      matches_before:<n> matches_after:<n> n_before:<days> n_after:<days>
+    PROBE-UNMEASURED n:<k>
+
+Rates are matches per `coverage_hours` over the 7 days each side of the date the rec was
+TAKEN; a day with no metrics row has no denominator and is skipped, never counted as a zero
+(which would read as an improvement). `scan_sessions.py probes --date D` prints the same lines
+for manual inspection and is NOT the digest path - `reduce-input.txt` is assembled from five
+named subcommands, so a sixth would be dead code.
+
+Four guards, each closing a way the axis could flatter itself, and each with its own name in
+`reason:` so a reader can tell which one fired:
+
+- **Pre-stamp, per rec.** `run_retro.sh` runs `validate-report` before the `mv`/stamp and
+  rejects a report where any mechanism rec lacks a usable `Probe:`. Per-rec, not a whole-file
+  count: under a count, one rec carrying two probes masks another carrying none. Blocks close
+  on the next rec heading OR the next `## ` section, so a `Probe:` under `## Next actions`
+  cannot attach to the rec above it.
+- **Baseline.** A probe that never fired in the 14 days before its report is discarded at
+  record time. `probe_drop` names why one was not kept - `invalid`, `no-baseline`,
+  `thin-baseline`, `declared-none` - because `cmd_recs` runs AFTER the stamp and can reject
+  nothing, so its only honest option is to make the failure legible. `PROBE-UNMEASURED n:<k>`
+  counts them; a rising k is a finding about this instrument.
+- **Window-local eligibility.** `status:measured` needs `PROBE_MIN_BASELINE` matches in the
+  PRE-TAKE window, not the stored `probe_baseline`, which counts the days before the REPORT
+  and need not overlap the window being compared at all.
+- **Control.** `control:` is the same before/after ratio over raw `tool_failures`,
+  re-normalized over the window's own summed `coverage_hours` so it is the same shape as the
+  probe rate. A probe that fell by roughly what the control fell by measured the week, not the
+  fix. Availability measured 2026-09-02: `tool_failures` is on 7 of 36 metrics rows, but those
+  7 are consecutive and current (the counter landed 2026-08-26) and this axis only ever scores
+  forward, so every window it will evaluate is inside the covered range. `control_status:` is
+  emitted per line rather than assumed, so if that stops being true the lines say so.
+
+**Ceiling: the writer still chooses the signature; only the value comes from the world.** The
+baseline requirement removes a probe that measures nothing and the control exposes one that
+fell with the tide, but neither stops a signature narrower than the friction it stands for.
+`matches_before` on every line is the inspection hook. Literal matching also admits
+longer-word false positives and cannot express path or whitespace variation - the deliberate
+trade for removing the backtracking class.
+
+**Not backfilled.** The 115 already-taken recs carry no probe and never will: retrofitting
+signatures to fixes whose outcome is already decided would be scoring the claim, not the rule.
+The axis starts empty and fills forward, so the first `PROBE` line is possible roughly 8 days
+after the first probe-carrying rec is marked `taken`.
+
 The top `RERUN_TOP` (default 2) friction sessions are analyzed **twice**, by two
 independent map calls on the identical extract (`findings-<id>.md` and
 `findings-<id>-run2.md`; the friction rank comes from `work/<date>/rank.txt`, written by
