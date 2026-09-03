@@ -46,6 +46,18 @@ TAKEN; a day with no metrics row has no denominator and is skipped, never counte
 for manual inspection and is NOT the digest path - `reduce-input.txt` is assembled from five
 named subcommands, so a sixth would be dead code.
 
+`validate-report` also surveys the paths a report ASSERTS already exist. For every backticked
+path-shaped token in `## Recommendations` and `## Next actions` whose own clause carries a
+read/already/existing cue BEFORE it, it stats the token under scratch, claude-config and this
+marketplace, and prints `UNVERIFIED PREREQUISITE: <path> asserted as existing but not found`
+to stderr. Warning-only, always: a rec may legitimately propose creating a file, and the
+existing-vs-proposed line is drawn from prose cues, so a false MISSING must never cost a day's
+report. Scored 2026-09-03 over the five most recent reports: 3 warnings, all true - the two
+`gate-cmd-smoke` paths the 09-01 report named as landed (they were on no branch, and the
+session executing that rec discovered it mid-task) and one file living on an unlanded capped
+branch. The clause scope is what makes it usable; a line-wide cue search flagged 9 more, all
+of them files the rec was asking you to create.
+
 Four guards, each closing a way the axis could flatter itself, and each with its own name in
 `reason:` so a reader can tell which one fired:
 

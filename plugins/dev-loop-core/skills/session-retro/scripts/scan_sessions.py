@@ -1595,6 +1595,112 @@ def report_probe_gaps(text):
     return gaps, mech_total
 
 
+# A recommendation that names a file as an already-existing prerequisite, when it does not
+# exist, costs the executing session a discovery round INSIDE the task. Measured 2026-09-02:
+# two of the three 2026-09-01 recs were wrong about the tree (`scripts/gate-cmd-smoke.sh` and
+# a `LANDER_GATE_CODEX` seam named as landed, neither on any branch).
+#
+# Warning-only by construction, and for the same reason as the probe gate above: a rec may
+# legitimately propose CREATING a file, and the existing/proposed distinction is drawn from
+# prose cues, which no parser gets right every time. A false MISSING must not cost a day's
+# report.
+PATH_CUE_RE = re.compile(r"(?i)\b(read|already|existing|exists|locate|inspect|reuse)\b")
+BACKTICK_RE = re.compile(r"`([^`\s]+)`")
+CLAUSE_BOUNDARY_RE = re.compile(r"[.;:]\s|\s-\s|,\s(?=\b(?:add|and add|then)\b)")
+_PATH_SECTIONS = ("## Recommendations", "## Next actions")
+
+
+# Ephemeral by construction: a reaped scratch file or a lock held only during contention is
+# not a claim about the tree, and warning on one trains the reader to skip the whole block.
+_EPHEMERAL = ("/tmp/", "/var/folders/", "/private/tmp/", ".git/")
+
+
+def _path_roots():
+    """Roots a repo-relative path in a report is resolved against.
+
+    The report is cross-project, so a relative path has no single owner - `agents/` means
+    claude-config and `src/` means scratch, in adjacent sentences of the same rec. Trying
+    every root makes EXISTS the easy verdict and MISSING the strong one, which is the
+    direction that keeps a warning-only check from crying wolf. Scored 2026-09-03 over the
+    five most recent reports: without claude-config on this list, nine of twenty-one
+    warnings were real files in the wrong root.
+    """
+    here = Path(__file__).resolve()
+    roots = [Path.home() / "Projects" / "scratch", Path.home() / "Projects" / "claude-config"]
+    for parent in here.parents:
+        if (parent / ".git").exists():
+            roots.append(parent)
+            break
+    return [r for r in roots if r.is_dir()]
+
+
+def _is_path_shaped(tok):
+    """A path names ONE thing that can be stat'd.
+
+    `CAUGHT=0/7` and `weeeBox/skills` both contain a slash and neither is stattable; a glob
+    names a set, which no single stat answers. Requiring a dotted final segment or a trailing
+    slash is the cheapest rule that separates them.
+    """
+    if "/" not in tok or "://" in tok or any(c in tok for c in "*?<>|"):
+        return False
+    if any(e in tok for e in _EPHEMERAL):
+        return False
+    return tok.endswith("/") or "." in tok.rsplit("/", 1)[-1]
+
+
+def _asserts_existing(line, pos):
+    """Does the clause ending at `pos` assert the path already exists?
+
+    The unit is the CLAUSE, not the line. An Artifact block is one long sentence that both
+    tells you to read existing code and to add a new test, so a line-wide cue search marks
+    every proposed file as an unverified prerequisite - measured over the five most recent
+    reports, that was 9 of 12 remaining warnings. Scope the window to the last clause
+    boundary before the token. A create verb of its own adds nothing on top of that - every
+    real case it would have caught is already resolved by position or by the boundary.
+    """
+    starts = [m.end() for m in CLAUSE_BOUNDARY_RE.finditer(line) if m.end() <= pos]
+    return PATH_CUE_RE.search(line[(starts[-1] if starts else 0):pos]) is not None
+
+
+def report_path_claims(text, roots=None):
+    """[(path, exists, asserted_existing)] for backticked paths in the rec/next-action sections.
+
+    Only tokens that look like paths (contain `/`, no glob metacharacters) are considered; a
+    backticked command (`git worktree list`) or bare identifier is not a path claim.
+    """
+    roots = _path_roots() if roots is None else [Path(r) for r in roots]
+    out, active = [], False
+    for line in text.splitlines():
+        if line.startswith("## "):
+            active = line.strip() in _PATH_SECTIONS
+            continue
+        if not active:
+            continue
+        for m in BACKTICK_RE.finditer(line):
+            tok = m.group(1).rstrip(".,;:)")
+            cue = _asserts_existing(line, m.start())
+            if not _is_path_shaped(tok):
+                continue
+            cand = Path(tok).expanduser()
+            if cand.is_absolute():
+                exists = cand.exists()
+            else:
+                exists = any((r / tok).exists() for r in roots)
+            out.append((tok, exists, cue))
+    return out
+
+
+def report_path_gaps(text, roots=None):
+    """Paths asserted as existing that are not on disk under any root - deduped, in order."""
+    seen, gaps = set(), []
+    for tok, exists, cue in report_path_claims(text, roots):
+        if exists or not cue or tok in seen:
+            continue
+        seen.add(tok)
+        gaps.append(tok)
+    return gaps
+
+
 def cmd_validate_report(path):
     """Exit 1 only when NO mechanism rec carries a usable probe; otherwise warn and pass.
 
@@ -1615,6 +1721,7 @@ def cmd_validate_report(path):
     deliverable hostage to it.
     """
     text = Path(path).read_text(encoding="utf-8", errors="replace")
+    _report_path_warning(text)
     gaps, mech = report_probe_gaps(text)
     if not mech:
         # Zero mechanism recs is the gate's fail-open shape: an empty `gaps` reads as a pass
@@ -1638,6 +1745,13 @@ def cmd_validate_report(path):
     print("warning: " + msg + " - report still stamped; counted in PROBE-UNMEASURED",
           file=sys.stderr)
     return 0
+
+
+def _report_path_warning(text):
+    """Print `UNVERIFIED PREREQUISITE:` for each asserted-existing path not on disk."""
+    for tok in report_path_gaps(text):
+        print("UNVERIFIED PREREQUISITE: %s asserted as existing but not found" % tok,
+              file=sys.stderr)
 
 
 def cmd_recs(day):
@@ -3725,6 +3839,36 @@ def selftest():
     assert report_probe_gaps(none_ok)[0] == [], report_probe_gaps(none_ok)[0]
     none_bare = "**[rec: 2026-07-08#9] a**\ntier: hook\nProbe: none\n"
     assert report_probe_gaps(none_bare)[0] == ["2026-07-08#9"], report_probe_gaps(none_bare)[0]
+    # --- asserted-existing path check (rec:2026-09-02#1) ---
+    _r = [str(Path(__file__).resolve().parent.parent)]
+    hit = ("## Recommendations\n"
+           "Artifact: read `scripts/gate-cmd-smoke.sh` first, it already landed.\n")
+    assert report_path_gaps(hit, _r) == ["scripts/gate-cmd-smoke.sh"], report_path_gaps(hit, _r)
+    # An EXISTING path under a root is clean even with the cue.
+    clean = "## Recommendations\nArtifact: read `scripts/scan_sessions.py` first.\n"
+    assert report_path_gaps(clean, _r) == [], report_path_gaps(clean, _r)
+    # The two halves an Artifact block always mixes: a file to CREATE and a file to READ, in
+    # one sentence. Only the second is a prerequisite claim. Without the clause boundary the
+    # `read` leaks backwards onto `new.sh` and every proposed file warns - measured over the
+    # five most recent reports, that was 9 of 12 warnings.
+    mixed = "## Recommendations\nAdd `scripts/new.sh`; read the existing `scripts/old.sh`.\n"
+    assert report_path_gaps(mixed, _r) == ["scripts/old.sh"], report_path_gaps(mixed, _r)
+    # ...and in the order an Artifact block actually writes it, cue first. This is the case
+    # that needs the boundary rather than mere position: without the reset, the leading
+    # `read` reaches forward across the clause onto the file being proposed.
+    after = "## Recommendations\nArtifact: read the existing seam, then add `scripts/new.sh`.\n"
+    assert report_path_gaps(after, _r) == [], report_path_gaps(after, _r)
+    # Only path-SHAPED tokens are claims. A bare identifier is not a path, and a glob is not
+    # a path either - `tests/**/*_live.py` names a set, and no single stat answers it.
+    # (`git worktree list` is not a case: it has spaces, so the backtick regex never sees it.)
+    cmdline = "## Recommendations\nread `main` and the existing `docs/**/*.md` first\n"
+    assert report_path_gaps(cmdline, _r) == [], report_path_gaps(cmdline, _r)
+    # Outside the two sections nothing is checked - evidence prose cites paths that were
+    # deleted or lived in another session's worktree by construction.
+    other = "## Top friction patterns\nread `scripts/gate-cmd-smoke.sh` first\n"
+    assert report_path_gaps(other, _r) == [], report_path_gaps(other, _r)
+    print("path claim gate OK")
+
     # Proportionality. A partial miss must NOT cost the whole report: the report is the
     # deliverable and the probe is a measurement of it. Only a wholesale ignore fails closed.
     import tempfile as _tf
