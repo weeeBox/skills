@@ -23,7 +23,11 @@ honest, and is *not* an agy pass. Everything below about agy applies when you do
 Scripts it uses live in `${CLAUDE_PLUGIN_ROOT}/skills/review-gate/scripts/` and are **NOT on `PATH`** - always
 call them by full path (or set `RG=${CLAUDE_PLUGIN_ROOT}/skills/review-gate/scripts` and use `"$RG/..."`). Both are
 `--selftest`ed:
-- `$RG/review-gate-lock.sh acquire|record|heartbeat|release` - the per-worktree lock + reconnect state.
+- `$RG/review-gate-lock.sh acquire <scope>|record|heartbeat|release` - the per-worktree lock +
+  reconnect state. `<scope>` is a TOKEN - `staged [<pathspec>]`, `branch-diff [<base>]` or
+  `worktree [<pathspec>]` - never a command: a git command in a plain argument is refused by
+  containment in a worktree-isolated session, and on 2026-09-03 one session read that refusal as
+  the lock being unavailable and skipped locking entirely.
 - `$RG/watch-agent-output.sh <job-log-file>` - the wedge watchdog (exact-file mode).
 
 (Below, script names are written in shorthand for readability; invoke them by the full `$RG/...` path.)
@@ -43,7 +47,7 @@ is not ready to be specified further*, not an invitation to round 3.
 cap applies to that.)
 
 1. Stage the unit so it shows in `git diff --cached`.
-2. `review-gate-lock.sh acquire "git diff --cached -- <doc>"` and branch on the printed verdict
+2. `review-gate-lock.sh acquire staged <doc>` and branch on the printed verdict
    (see **Concurrency**). On `ACQUIRED`, dispatch; on `RECONNECT`, poll the printed jobs.
 3. Dispatch **codex** (and **agy** only if you opted in above - then both in parallel, fire-and-forget
    background jobs; with agy skipped, pass an empty agy job id to `record`):
@@ -146,7 +150,8 @@ Review a branch diff before merge (the path `/ship` delegates to). Same as plan 
   that changes only `docs/plans/*.md` needs the PLAN reviewed, not the pre-existing code it references),
   and to locate a symbol grep the bare name (`\bNAME\b`), not `def NAME` (imports, re-exports, and
   `X = Y` aliases have no local `def`). Evidence: `a5b90104` spent ~8 min tracing out-of-scope source.
-- Lock scope command: `review-gate-lock.sh acquire "git diff <base>...HEAD"`.
+- Lock scope: `review-gate-lock.sh acquire branch-diff` (add an explicit `<base>` only if the
+  merge-base with `main` is not the right one).
 
 ### Generated / build-output cleanup
 
@@ -241,7 +246,7 @@ ambiguous different-owner lock. Drive it by the `acquire` verdict:
 
 ```
 RG=${CLAUDE_PLUGIN_ROOT}/skills/review-gate/scripts        # bundled scripts are NOT on PATH - call by full path
-verdict=$("$RG/review-gate-lock.sh" acquire "<SCOPE_CMD>") || { echo "lock error -> FAIL CLOSED"; exit 1; }
+verdict=$("$RG/review-gate-lock.sh" acquire <SCOPE>) || { echo "lock error -> FAIL CLOSED"; exit 1; }
 read -r tag j_codex j_agy round <<< "$verdict"  # `read` splits on IFS in BOTH bash and zsh; `set -- $verdict` does NOT split in zsh (the user's shell)
 case "$tag" in
   ACQUIRED)   dispatch codex (+agy only if opted in); then "$RG/review-gate-lock.sh" record <codex_job> <agy_job|omit> <round> ;;

@@ -4,8 +4,12 @@
 # docs/plans/2026-07-11-review-gate-skill.md.
 #
 # Subcommands:
-#   acquire "<SCOPE_CMD>"          -> prints one of: ACQUIRED | RECONNECT <c> <a> <round> |
+#   acquire <scope> [<arg>]        -> prints one of: ACQUIRED | RECONNECT <c> <a> <round> |
 #                                     RECLAIM <c> <a> | BLOCKED <owner>   (exit 0; exit 3 = not a git repo)
+#         scope is a TOKEN, never a command:
+#           staged [<pathspec>]      the index, optionally narrowed  (plan stage)
+#           branch-diff [<base>]     <base>...HEAD; base defaults to the merge-base with main
+#           worktree [<pathspec>]    uncommitted changes
 #   record  <codex_job> <agy_job> <round>   (after a validated fresh dispatch; preserves bootstrap diff_hash)
 #   heartbeat                      -> refresh lock mtime so "stale" means genuinely dead
 #   release                        -> remove the lock (idempotent)
@@ -32,11 +36,48 @@ _write_state(){ # atomic: owner diff_hash codex_job agy_job round round_id
     "$1" "$2" "$3" "$4" "$5" "$6" "$(date +%s)" > "$state.tmp" && mv "$state.tmp" "$state"
 }
 
+# A SCOPE TOKEN, not a diff expression (rec:2026-09-03#1). `acquire "git diff main...HEAD"` was
+# refused outright by the harness containment check in a worktree-isolated session - the argument
+# is a git command in a plain string, which cannot be shown to stay inside the worktree. Measured
+# 2026-09-03: two sessions hit it, one retried a reduced form and was refused again, and one
+# ABANDONED the locking step entirely, which is the failure that matters - a skipped lock is
+# silent. The script derives the diff itself now, so the caller never passes a command.
+#
+# The diff is still HASHED, because that hash is what makes RECONNECT sound: same scope, changed
+# work must not reconnect. A bare opaque slug - which the recommendation also offered - would have
+# broken that, so it is deliberately not accepted.
+_scope_diff(){
+  case "$1" in
+    staged)      shift; git diff --cached ${1:+-- "$1"} ;;
+    worktree)    shift; git diff ${1:+-- "$1"} ;;
+    branch-diff) shift
+                 local base="${1:-}"
+                 [ -n "$base" ] || base=$(git merge-base HEAD main 2>/dev/null) || return 1
+                 [ -n "$base" ] || return 1
+                 git diff "$base"...HEAD ;;
+    *) return 64 ;;
+  esac
+}
+
 cmd_acquire(){
   _paths
-  local scope_cmd="${1:-}" out rc
-  out=$(eval "$scope_cmd"); rc=$?                # do NOT suppress scope errors (codex#3)
-  [ "$rc" -eq 0 ] || { echo "scope command failed (rc=$rc): $scope_cmd" >&2; exit 4; }
+  local scope="${1:-}" arg="${2:-}" out rc
+  # Reject anything command-shaped BEFORE running it, and say what is accepted - so a caller
+  # passing the old form gets a usage error it can act on, not a containment refusal it will
+  # misread as the lock being unavailable.
+  case "$scope" in
+    *[[:space:]]*|git\ *|"")
+      echo "acquire takes a SCOPE TOKEN, not a command: staged [<pathspec>] | branch-diff [<base>] | worktree [<pathspec>]" >&2
+      exit 2 ;;
+  esac
+  case "$arg" in
+    *[[:space:]]*)
+      echo "scope argument must be a single token without whitespace: '$arg'" >&2; exit 2 ;;
+  esac
+  out=$(_scope_diff "$scope" "$arg"); rc=$?      # do NOT suppress scope errors (codex#3)
+  [ "$rc" -eq 64 ] && {
+    echo "unknown scope '$scope': use staged | branch-diff | worktree" >&2; exit 2; }
+  [ "$rc" -eq 0 ] || { echo "scope diff failed (rc=$rc): $scope $arg" >&2; exit 4; }
   local dh; dh=$(printf '%s' "$out" | git hash-object --stdin)
   if mkdir "$lockdir" 2>/dev/null; then
     local rid; rid="$(python3 -c 'import uuid;print(uuid.uuid4().hex)' 2>/dev/null || uuidgen 2>/dev/null | tr -d - | tr 'A-Z' 'a-z')"
@@ -92,12 +133,24 @@ if [ "${1:-}" = "--selftest" ]; then
   tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
   ( cd "$tmp" && git init -q && git config user.email t@t && git config user.name t \
       && printf 'a\n' > f && git add f )
-  S="$0"; SC="git -C $tmp diff --cached"        # scope cmd for the temp repo
+  S="$0"; SC="staged"                           # scope TOKEN; run() cds into the temp repo
   run(){ ( cd "$tmp" && env "$@" ); }           # run with env overrides, in the repo
   fail(){ echo "FAIL: $1"; exit 1; }
 
   # 1. non-git dir -> exit 3
-  ( cd "$(mktemp -d)" && "$S" acquire "true" ) >/dev/null 2>&1; [ $? -eq 3 ] || fail "non-git should exit 3"
+  ( cd "$(mktemp -d)" && "$S" acquire staged ) >/dev/null 2>&1; [ $? -eq 3 ] || fail "non-git should exit 3"
+
+  # 1b. the OLD command form, and anything else command-shaped, is refused with usage (exit 2) -
+  # not run, and not mistaken for the lock being unavailable (rec:2026-09-03#1).
+  run CLAUDE_SESSION_ID=A "$S" acquire "git diff main...HEAD" >/dev/null 2>&1
+  [ $? -eq 2 ] || fail "old command form should exit 2"
+  run CLAUDE_SESSION_ID=A "$S" acquire "two words" >/dev/null 2>&1
+  [ $? -eq 2 ] || fail "whitespace scope should exit 2"
+  run CLAUDE_SESSION_ID=A "$S" acquire bogus-scope >/dev/null 2>&1
+  [ $? -eq 2 ] || fail "unknown scope should exit 2"
+  run CLAUDE_SESSION_ID=A "$S" acquire staged "two words" >/dev/null 2>&1
+  [ $? -eq 2 ] || fail "whitespace scope ARG should exit 2"
+  echo "PASS: command-shaped and malformed scopes are refused with usage"
   echo "PASS: non-git -> exit 3"
 
   # 2. first acquire -> ACQUIRED (+ bootstrap state written)
@@ -181,8 +234,10 @@ if [ "${1:-}" = "--selftest" ]; then
   [ -d "$tmp/.git/review-gate.lock.d" ] && fail "owner release did not remove the lock"
   echo "PASS: release is owner-guarded (non-owner can't free the holder's lock)"
 
-  # 13. scope command that ERRORS -> exit 4 (not a bogus empty hash) (codex#3)
-  run CLAUDE_SESSION_ID=A "$S" acquire "git -C /no/such/repo diff" >/dev/null 2>&1
+  # 13. a scope that ERRORS -> exit 4 (not a bogus empty hash) (codex#3). The old form for this
+  # was `acquire "git -C /no/such/repo diff"`, which the token grammar no longer accepts; an
+  # unresolvable base does the same job and stays inside the grammar.
+  run CLAUDE_SESSION_ID=A "$S" acquire branch-diff no-such-ref >/dev/null 2>&1
   [ $? -eq 4 ] || fail "scope error should exit 4, not hash empty"
   echo "PASS: scope command error -> exit 4 (fail closed, no empty-hash reconnect)"
 
