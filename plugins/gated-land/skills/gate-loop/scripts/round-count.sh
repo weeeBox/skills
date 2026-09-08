@@ -1,6 +1,23 @@
 #!/usr/bin/env bash
-# round-count.sh <verify.log> [branch]  — count this BRANCH's gateloop-block rows in the
-# append-only log. Defaults to the current branch. Prints the integer; exit 0. >=3 = cap-out.
+# round-count.sh <verify.log> [branch]  — count this BRANCH's blocked gate rounds of BOTH kinds,
+# `gateloop-block` (this skill) and `land-verdict-block` (a repo's lander), in the append-only log.
+#
+# TWO ROW KINDS, READ TWO WAYS (2026-09-08). A branch driven through a lander rather than this skill
+# emits `land-verdict-block`, so counting only `gateloop-block` left the per-branch cap
+# STRUCTURALLY BLIND to a land loop. Measured in the scratch ledger: one branch ran EIGHTEEN land
+# rounds while this counter returned 0 for it the whole time (17 land-verdict-block rows, 0
+# gateloop-block).
+#
+# They cannot be read the same way. A land row is a four-field row whose detail is
+# `<branch> <reason> run=<id>`, a shape its dashboard parses and which cannot grow a fifth field, so
+# the branch is read as the FIRST WHITESPACE TOKEN of field 4. That is a structural POSITION, not a
+# substring search, so a detail merely mentioning another branch still does not count: `see
+# session/alpha for context` has first token `see`. Verified over that ledger: all 64
+# land-verdict-block rows carry a branch as the detail's first token, zero non-branch.
+#
+# Only `land-verdict-block` counts, not `land-risk-block` or `land-verdict-override` or `land-abort`:
+# a round is a GATE returning not-SHIP. A risk stop awaits a human override and an aborted round was
+# discarded, so counting either would cap a branch nobody reviewed. Defaults to the current branch. Prints the integer; exit 0. >=3 = cap-out.
 #
 # rec:2026-08-23#3. It used to count rows after the LAST `gateloop-start`, which made the cap
 # defeatable by starting a "fresh" loop: 2026-08-23 session 45d27e2c wrote
@@ -32,6 +49,9 @@ count() { local log="$1" br="$2"
   awk -F '\t' -v br="$br" '
     $2 == "gateloop-block" {
       for (i = 3; i <= NF; i++) if ($i == br) { c++; break }
+    }
+    $2 == "land-verdict-block" {
+      split($4, a, " "); if (a[1] == br) c++
     }
     END { print c+0 }' "$log"
 }
@@ -68,6 +88,7 @@ selftest() {
   row 2026-08-23T06:30:00Z gateloop-capout aab0 'the gateloop-block rows above stand' session/mem-gaps
   want detail-substring 7 "$L" session/mem-gaps
 
+
   # FIELD 4 vs FIELD 5. Both shapes are live in one log; pinning $5 read three rounds as one.
   # Its own log, so the count is unambiguous rather than an offset from the arc above.
   local L4="$d/f4.log"
@@ -84,6 +105,36 @@ selftest() {
   want legacy-row 7 "$L" session/mem-gaps
 
   want missing-log 0 "$d/absent.log" session/mem-gaps
+
+  # LAND ROUNDS COUNT TOO (2026-09-08). Real shape from the ledger: FOUR fields, the detail being
+  # `<branch> <reason> run=<id>`, so the branch is its first whitespace token and not its own field.
+  landrow() { printf '%s\tland-verdict-block\t%s\t%s not-SHIP run=lander-%s-1788636279-67311\n' \
+    "2026-09-05T19:27:47Z" "d7dd6fdc" "$1" "$1" >> "$L"; }
+
+  landrow session/mem-gaps
+  want land-round-counts 8 "$L" session/mem-gaps
+  landrow session/other
+  want gateloop-and-land-SUM 2 "$L" session/other
+
+  # the anti-substring property must SURVIVE the new row kind: first TOKEN, not a search
+  printf '%s\tland-verdict-block\t%s\t%s\n' "2026-09-05T19:27:47Z" "d7dd6fdc" \
+    'see session/mem-gaps for context not-SHIP run=lander-x-1-2' >> "$L"
+  want land-detail-substring 8 "$L" session/mem-gaps
+
+  # ...and a branch whose name EXTENDS ours is a different branch
+  landrow session/mem-gaps-two
+  want land-prefix-is-not-a-match 8 "$L" session/mem-gaps
+
+  # a risk stop and an override are not review rounds, and an aborted round was discarded
+  printf '%s\tland-risk-block\t%s\t%s\n' "2026-09-05T19:27:47Z" "d7dd6fdc" \
+    'session/mem-gaps RISK=HIGH run=lander-x-1-3' >> "$L"
+  printf '%s\tland-abort\t%s\t%s\n' "2026-09-05T19:27:47Z" "d7dd6fdc" \
+    'session/mem-gaps stale round worktree run=lander-x-1-4' >> "$L"
+  want land-nonblock-rows-ignored 8 "$L" session/mem-gaps
+
+  # cumulative: the count still moves after all of the non-counting rows above
+  landrow session/mem-gaps
+  want land-count-still-moves 9 "$L" session/mem-gaps
 
   rm -rf "$d"
   if [ "$f" -eq 0 ]; then echo "round-count selftest: OK"; return 0; fi
