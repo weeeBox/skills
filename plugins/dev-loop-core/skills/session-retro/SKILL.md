@@ -310,6 +310,48 @@ A rec is open unless `session-reports/actions-log.md` carries a
 `taken`/`rejected`/`deferred`/`applied` line
 citing its exact id. Check before queueing, and append the outcome line when you finish one.
 
+## Weekly prior-art sweep (Mondays only)
+
+Ask, once a week, whether something built here already exists off the shelf - so a custom thing
+gets replaced or learns from prior art instead of accreting.
+
+**It runs in the INTERACTIVE closing turn, never in map or reduce.** Those calls are
+`--tools "" --strict-mcp-config` on purpose because they process untrusted transcript text, and
+`WebSearch` is a tool. Do not add it to them; that is the same boundary the "never give the synthesis
+calls tools" rule above protects, and it is codex-gated at plan AND diff stage.
+
+**Cadence is weekly, not daily, and that is deliberate.** A feature landed this morning has zero
+hours of use behind it, so "should we replace this?" cannot be answered honestly yet; a week later it
+can. Weekly also means the searches are few enough that no dedup ledger is needed.
+
+1. **Input is git, not transcripts.** Run
+   `scan_sessions.py day-artifacts --date D` for the last 7 dates - it already resolves each day's
+   repos from the sessions' own `cwd` and digests their commits (TRUSTED, wrapper-computed).
+   Take the merge subjects: a first-parent merge to `main` is this stack's "a feature shipped"
+   signal, and the branch name is already in the subject
+   (`Merge session/issue-55-r1 (#55, overnight run, codex SHIP)`).
+2. **Pick at most 3**, largest diffstat first. More than that is a research project, not a sweep.
+3. **One `WebSearch` each**, phrased as what the code DOES, never as its internal name. Emit exactly
+   one verdict per feature, each carrying the URL that justifies it - the same vocabulary
+   `next-feature` step 3a uses at plan time, so the two are comparable:
+   - `REPLACE` - a maintained off-the-shelf thing covers it. Raise it as a recommendation naming the
+     replacement, its URL, AND the files that would be deleted. A `REPLACE` with no deletion list is
+     not actionable and should be a `BORROW` instead.
+   - `BORROW` - ours stays; name the ONE specific thing to take (an algorithm, a schema, an edge case
+     they handle) plus its URL. "Look at X for inspiration" is not a finding.
+   - `KEEP` - nothing found, or found and worse. One line; no recommendation.
+4. **Findings become normal recommendations**, `rec:<date>#<n>`, in the report's `## Recommendations`
+   section, so they flow into the `TodoWrite` queue and the `actions-log.md` ledger like any other.
+   A prior-art section nobody has to close is a section that rots.
+
+Evidence class applies as everywhere else: the day-artifacts block is `VERIFIED`, a search result is
+`ACCEPTED` (an outside claim, not something this tool measured).
+
+**Ceiling: this is prompt-level, with no wrapper check.** `run_retro.sh` does not know what day it is
+for this purpose and will not notice a skipped Monday. Deliberate - a missed sweep costs a week, and
+the cheaper failure is skipping it, not a cron entry nobody maintains. Add a check only if it is
+observed to drift.
+
 ## Closing the loop (metrics + actions ledger)
 
 - `session-reports/metrics.jsonl` - one wrapper-written JSON line per day (sessions,
