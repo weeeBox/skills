@@ -40,6 +40,15 @@
 # The match is EXACT against a whole field, never a prefix or substring, so a detail string that
 # merely mentions another branch cannot be counted.
 #
+# THIRD SHAPE: THE BRANCH AS THE DETAIL'S FIRST TOKEN (2026-10-07, codegenalex/family-assistant#84).
+# Sessions also wrote gateloop rows the land-row way, `<branch> r1 <findings>` in field 4. Measured
+# on the family-assistant verify.log: session/issue-31 and session/issue-39 each have a block row
+# shaped so, and the whole-field match read both as 0 - fail-OPEN. A gateloop-block row now counts
+# when a whole field 3..NF OR the first whitespace token of field 4 is the branch; still a position,
+# never a search. A row naming no branch at all (`r1: ...`, 3 of the last 3 there) is nobody's: it
+# cannot be attributed, so it caps no one. That is the fail-open direction, and it is chosen over
+# counting it for EVERY branch, which would cap branches that never ran a round.
+#
 # ponytail: a reused branch name (a deleted and recreated session/<slug>) over-counts, which
 # stops the loop EARLY — the safe direction.
 set -uo pipefail
@@ -48,7 +57,9 @@ count() { local log="$1" br="$2"
   if [ ! -f "$log" ]; then echo 0; return; fi
   awk -F '\t' -v br="$br" '
     $2 == "gateloop-block" {
-      for (i = 3; i <= NF; i++) if ($i == br) { c++; break }
+      split($4, t, " "); hit = (t[1] == br)
+      for (i = 3; i <= NF && !hit; i++) if ($i == br) hit = 1
+      if (hit) c++
     }
     $2 == "land-verdict-block" {
       split($4, a, " "); if (a[1] == br) c++
@@ -105,6 +116,19 @@ selftest() {
   want legacy-row 7 "$L" session/mem-gaps
 
   want missing-log 0 "$d/absent.log" session/mem-gaps
+
+  # THIRD SHAPE: branch as the first token of the 4-field detail (family-assistant#84), two branches
+  # interleaved; a prefix-extended branch and a mid-detail mention still do not count
+  local L3="$d/f3.log"
+  printf '2026-09-18T22:30:30Z\tgateloop-block\tb7cee34\tsession/issue-31 r1 medium: x\n' >> "$L3"
+  printf '2026-09-18T23:05:28Z\tgateloop-block\t43fb2ae\tsession/issue-39 r1 SHIP-WITH-CHANGES\n' >> "$L3"
+  printf '2026-09-18T23:06:00Z\tgateloop-block\t43fb2ae\tsession/issue-31-r1 r1 x\n' >> "$L3"
+  printf '2026-09-18T23:07:00Z\tgateloop-block\t43fb2ae\tsee session/issue-31 for context\n' >> "$L3"
+  printf '2026-09-18T23:08:00Z\tgateloop-block\t43fb2ae\tsession/issue-31 r2 y\n' >> "$L3"
+  printf '2026-10-02T11:01:18Z\tgateloop-block\t07ba0b9\tr1: no branch named\n' >> "$L3"
+  want first-token-counted 2 "$L3" session/issue-31
+  want first-token-other   1 "$L3" session/issue-39
+  want first-token-prefix  1 "$L3" session/issue-31-r1
 
   # LAND ROUNDS COUNT TOO (2026-09-08). Real shape from the ledger: FOUR fields, the detail being
   # `<branch> <reason> run=<id>`, so the branch is its first whitespace token and not its own field.

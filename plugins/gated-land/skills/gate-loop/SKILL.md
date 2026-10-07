@@ -97,7 +97,7 @@ at the top of each round, if `${CLAUDE_PLUGIN_ROOT}/skills/gate-loop/scripts/rou
 returns `>=3`, take the Cap-out path (do NOT start a 4th round).
 
 **The cap is per BRANCH, for the branch's whole life.** The count is every `gateloop-block` row
-carrying this branch in field 5, so it survives context compaction, clock drift, and a fresh
+carrying this branch (field 5, or the detail's first token), so it survives context compaction, clock drift, and a fresh
 invocation of this skill. There is no loop-entry marker to re-emit: "I addressed the findings,
 so this is a fresh loop with a fresh round count" is exactly the move the cap exists to stop
 (2026-08-23 session `45d27e2c`: a cap-out at round 3, a relabelled "loop 2" thirteen minutes
@@ -208,7 +208,10 @@ printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" <event> "$(git re
 
 Five tab-separated fields: `ts`, `event`, `head`, `detail`, `branch`. **Field 5 is what the round
 cap is counted by** - a row written without it is invisible to `round-count.sh` and silently buys
-the branch an extra round, so never drop it.
+the branch an extra round, so never drop it. A four-field row (hand-written, or the lander's shape)
+must START its detail with the branch - `session/x r1 <findings>` - because the counter also reads
+the detail's first token. A row naming no branch in either place is nobody's: it caps no branch,
+which is fail-open, and is chosen over counting it against every branch (codegenalex/family-assistant#84).
 
 Events: `gateloop-pass` (detail = base + rounds used), `gateloop-block` (per BLOCK round, detail =
 one-line findings), `gateloop-capout`, `gateloop-tamper` (detail = offending paths).

@@ -1,6 +1,6 @@
 {
   "name": "gated-land",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "An opinionated, autonomous gate-and-land pipeline for solo devs: one-shot ship gate, a capped verify->fix->re-gate loop, and a serialized local merge queue with a config-driven risk classifier. Requires dev-loop-core (the review gate) and per-repo configuration via dev-loop.conf.",
   "author": { "name": "weeeBox", "url": "https://github.com/weeeBox" },
   "homepage": "https://github.com/weeeBox/skills",
