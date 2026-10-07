@@ -50,7 +50,10 @@
 # shape: a five-field row's owner is field 5 if it is a single token, else field 4 if that is - both
 # five-field shapes are live (measured 2026-10-07 on the family-assistant log: of 14 five-field block
 # rows, 10 put the branch in field 4 and the findings in field 5); a four-field row's owner is the
-# first token of field 4. Still a position, never a search. A row naming no branch at all (`r1: ...`, 3 of the last 3 there) is nobody's: it
+# first token of field 4. Still a position, never a search.
+# When BOTH are single tokens (`session/ours<TAB>r1`, codex r3) the one containing a `/` owns the
+# row, field 5 on a tie. ponytail: a slash-less branch beside a one-word detail (`fix-x<TAB>r1`)
+# still reads as owned by the detail - fail-open for that shape; none is in the measured log. A row naming no branch at all (`r1: ...`, 3 of the last 3 there) is nobody's: it
 # cannot be attributed, so it caps no one. That is the fail-open direction, and it is chosen over
 # counting it for EVERY branch, which would cap branches that never ran a round.
 #
@@ -63,7 +66,10 @@ count() { local log="$1" br="$2"
   awk -F '\t' -v br="$br" '
     $2 == "gateloop-block" {
       owner = ""
-      if (NF >= 5) owner = ($5 !~ /[ ]/) ? $5 : (($4 !~ /[ ]/) ? $4 : "")
+      if (NF >= 5) {
+        owner = ($5 !~ /[ ]/) ? $5 : (($4 !~ /[ ]/) ? $4 : "")
+        if ($4 !~ /[ ]/ && $5 !~ /[ ]/ && $4 ~ /\// && $5 !~ /\//) owner = $4
+      }
       else if (NF == 4) { split($4, t, " "); owner = t[1] }
       if (owner != "" && owner == br) c++
     }
@@ -145,6 +151,10 @@ selftest() {
   want five-field-exact-ours  2 "$L3" session/ours
   printf '2026-09-18T23:11:00Z\tgateloop-block\th\tsession/issue-153\tr1: fresh NULL delivered\n' >> "$L3"
   want five-field-branch-in-4 1 "$L3" session/issue-153
+  # a one-word detail in field 5 does not take the row from a branch in field 4 (codex r3)
+  printf '2026-09-18T23:12:00Z\tgateloop-block\th\tsession/issue-153\tr2\n' >> "$L3"
+  want five-field-one-word-detail 2 "$L3" session/issue-153
+  want five-field-one-word-not-owner 0 "$L3" r2
 
   # LAND ROUNDS COUNT TOO (2026-09-08). Real shape from the ledger: FOUR fields, the detail being
   # `<branch> <reason> run=<id>`, so the branch is its first whitespace token and not its own field.
