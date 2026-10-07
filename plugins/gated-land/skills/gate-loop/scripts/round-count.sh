@@ -44,8 +44,10 @@
 # Sessions also wrote gateloop rows the land-row way, `<branch> r1 <findings>` in field 4. Measured
 # on the family-assistant verify.log: session/issue-31 and session/issue-39 each have a block row
 # shaped so, and the whole-field match read both as 0 - fail-OPEN. A gateloop-block row now counts
-# when a whole field 3..NF OR the first whitespace token of field 4 is the branch; still a position,
-# never a search. A row naming no branch at all (`r1: ...`, 3 of the last 3 there) is nobody's: it
+# when a whole field 3..NF is the branch, or - in a FOUR-field row only, which has no branch field of
+# its own - when the first whitespace token of field 4 is; still a position, never a search. In a
+# five-field row field 5 is authoritative: a detail that opens with another branch's name is a
+# cross-reference, and reading it would charge one round to two branches (codex r1). A row naming no branch at all (`r1: ...`, 3 of the last 3 there) is nobody's: it
 # cannot be attributed, so it caps no one. That is the fail-open direction, and it is chosen over
 # counting it for EVERY branch, which would cap branches that never ran a round.
 #
@@ -57,8 +59,9 @@ count() { local log="$1" br="$2"
   if [ ! -f "$log" ]; then echo 0; return; fi
   awk -F '\t' -v br="$br" '
     $2 == "gateloop-block" {
-      split($4, t, " "); hit = (t[1] == br)
+      hit = 0
       for (i = 3; i <= NF && !hit; i++) if ($i == br) hit = 1
+      if (!hit && NF == 4) { split($4, t, " "); hit = (t[1] == br) }
       if (hit) c++
     }
     $2 == "land-verdict-block" {
@@ -129,6 +132,10 @@ selftest() {
   want first-token-counted 2 "$L3" session/issue-31
   want first-token-other   1 "$L3" session/issue-39
   want first-token-prefix  1 "$L3" session/issue-31-r1
+  # a five-field row's branch field wins: a detail OPENING with another branch charges only field 5
+  printf '2026-09-18T23:09:00Z\tgateloop-block\th\tsession/issue-39 regressed here\tsession/ours\n' >> "$L3"
+  want five-field-is-authoritative 1 "$L3" session/issue-39
+  want five-field-counts-its-own   1 "$L3" session/ours
 
   # LAND ROUNDS COUNT TOO (2026-09-08). Real shape from the ledger: FOUR fields, the detail being
   # `<branch> <reason> run=<id>`, so the branch is its first whitespace token and not its own field.
