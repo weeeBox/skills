@@ -210,7 +210,8 @@ Five tab-separated fields: `ts`, `event`, `head`, `detail`, `branch`. **Field 5 
 cap is counted by** - a row written without it is invisible to `round-count.sh` and silently buys
 the branch an extra round, so never drop it. A four-field row (hand-written, or the lander's shape)
 must START its detail with the branch - `session/x r1 <findings>` - because in a row with no
-branch field the counter reads the detail's first token; in a five-field row field 5 alone counts. A row naming no branch in either place is nobody's: it caps no branch,
+branch field the counter reads the detail's first token. A row has ONE owner: in a five-field row,
+field 5 if it is a single token, else field 4 if that is. A row naming no branch in either place is nobody's: it caps no branch,
 which is fail-open, and is chosen over counting it against every branch (codegenalex/family-assistant#84).
 
 Events: `gateloop-pass` (detail = base + rounds used), `gateloop-block` (per BLOCK round, detail =

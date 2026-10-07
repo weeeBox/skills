@@ -43,11 +43,14 @@
 # THIRD SHAPE: THE BRANCH AS THE DETAIL'S FIRST TOKEN (2026-10-07, codegenalex/family-assistant#84).
 # Sessions also wrote gateloop rows the land-row way, `<branch> r1 <findings>` in field 4. Measured
 # on the family-assistant verify.log: session/issue-31 and session/issue-39 each have a block row
-# shaped so, and the whole-field match read both as 0 - fail-OPEN. A gateloop-block row now counts
-# when a whole field 3..NF is the branch, or - in a FOUR-field row only, which has no branch field of
-# its own - when the first whitespace token of field 4 is; still a position, never a search. In a
-# five-field row field 5 is authoritative: a detail that opens with another branch's name is a
-# cross-reference, and reading it would charge one round to two branches (codex r1). A row naming no branch at all (`r1: ...`, 3 of the last 3 there) is nobody's: it
+# shaped so, and the whole-field match read both as 0 - fail-OPEN.
+#
+# ONE OWNER PER ROW (codex r1, r2). Scanning every field let one row charge two branches (field 4
+# `session/other`, field 5 `session/ours`). So a gateloop-block row now has exactly one owner, by
+# shape: a five-field row's owner is field 5 if it is a single token, else field 4 if that is - both
+# five-field shapes are live (measured 2026-10-07 on the family-assistant log: of 14 five-field block
+# rows, 10 put the branch in field 4 and the findings in field 5); a four-field row's owner is the
+# first token of field 4. Still a position, never a search. A row naming no branch at all (`r1: ...`, 3 of the last 3 there) is nobody's: it
 # cannot be attributed, so it caps no one. That is the fail-open direction, and it is chosen over
 # counting it for EVERY branch, which would cap branches that never ran a round.
 #
@@ -59,10 +62,10 @@ count() { local log="$1" br="$2"
   if [ ! -f "$log" ]; then echo 0; return; fi
   awk -F '\t' -v br="$br" '
     $2 == "gateloop-block" {
-      hit = 0
-      for (i = 3; i <= NF && !hit; i++) if ($i == br) hit = 1
-      if (!hit && NF == 4) { split($4, t, " "); hit = (t[1] == br) }
-      if (hit) c++
+      owner = ""
+      if (NF >= 5) owner = ($5 !~ /[ ]/) ? $5 : (($4 !~ /[ ]/) ? $4 : "")
+      else if (NF == 4) { split($4, t, " "); owner = t[1] }
+      if (owner != "" && owner == br) c++
     }
     $2 == "land-verdict-block" {
       split($4, a, " "); if (a[1] == br) c++
@@ -136,6 +139,12 @@ selftest() {
   printf '2026-09-18T23:09:00Z\tgateloop-block\th\tsession/issue-39 regressed here\tsession/ours\n' >> "$L3"
   want five-field-is-authoritative 1 "$L3" session/issue-39
   want five-field-counts-its-own   1 "$L3" session/ours
+  # both five-field shapes are live: branch in 5 with findings in 4, and branch in 4 with findings in 5
+  printf '2026-09-18T23:10:00Z\tgateloop-block\th\tsession/other\tsession/ours\n' >> "$L3"
+  want five-field-exact-other 0 "$L3" session/other
+  want five-field-exact-ours  2 "$L3" session/ours
+  printf '2026-09-18T23:11:00Z\tgateloop-block\th\tsession/issue-153\tr1: fresh NULL delivered\n' >> "$L3"
+  want five-field-branch-in-4 1 "$L3" session/issue-153
 
   # LAND ROUNDS COUNT TOO (2026-09-08). Real shape from the ledger: FOUR fields, the detail being
   # `<branch> <reason> run=<id>`, so the branch is its first whitespace token and not its own field.
