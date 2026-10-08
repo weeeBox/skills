@@ -1524,6 +1524,15 @@ def _upsert_jsonl(path, line, key):
 
 
 REC_TAG_RE = re.compile(r"\[rec:\s*(\d{4}-\d{2}-\d{2})#(\d+)\]")
+# A canonical rec heading, in either shape reduce has written: the bold `**[rec: ...] ...**`
+# line, or a markdown heading `### 2. [rec: ...] ...`. Reports drifted to the second shape and
+# every bold-only test read them as zero recs: 2026-10-06's run logged "0 rec headings seen"
+# on a report with three, so the probe gate passed it unchecked.
+REC_HEADING_RE = re.compile(r"\s*(?:\*\*|#{2,4}\s+(?:\d+\.\s+)?)\[rec:")
+
+
+def is_rec_heading(line):
+    return bool(REC_HEADING_RE.match(line))
 
 
 def _sanitize_summary(s):
@@ -1574,7 +1583,7 @@ def report_probe_gaps(text):
 
     for line in text.splitlines():
         m = REC_TAG_RE.search(line)
-        if line.lstrip().startswith("**[rec:") and m:
+        if is_rec_heading(line) and m:
             close()
             state.update(cur="%s#%s" % (m.group(1), m.group(2)), mech=False, probe=False)
             continue
@@ -1729,7 +1738,7 @@ def cmd_validate_report(path):
         # markdown. Distinguish the two by looking for rec headings at all, and SAY which,
         # so a silent formatting drift shows up in the runner log instead of disabling this
         # check without a trace.
-        n_recs = sum(1 for l in text.splitlines() if l.lstrip().startswith("**[rec:"))
+        n_recs = sum(1 for l in text.splitlines() if is_rec_heading(l))
         print("probe gate: no mechanism-tier recs recognised (%d rec headings seen)" % n_recs,
               file=sys.stderr)
         return 0
@@ -1777,7 +1786,7 @@ def cmd_recs(day):
     dedup, probe, mech, cur = {}, {}, set(), None
     for line in lines:
         m = REC_TAG_RE.search(line)
-        if line.lstrip().startswith("**[rec:") and m:
+        if is_rec_heading(line) and m:
             cur = f"{m.group(1)}#{m.group(2)}"
             continue
         if line.startswith("## "):
@@ -1800,7 +1809,7 @@ def cmd_recs(day):
     recs = {}
     for canonical_only in (True, False):
         for line in lines:
-            if canonical_only and not line.lstrip().startswith("**[rec:"):
+            if canonical_only and not is_rec_heading(line):
                 continue
             for m in REC_TAG_RE.finditer(line):
                 origin, n = m.group(1), m.group(2)
@@ -3404,6 +3413,24 @@ def selftest():
         # the writer's dedup decision is stored with the rec, so "fresh id, no dedup
         # line" is countable in-band instead of only by re-clustering by hand (item D)
         assert rid2["dedup"].startswith("distinct from rec:2026-07-08#1"), rid2
+        # the markdown-heading shape reports drifted to is canonical too: it must win over
+        # an earlier cross-reference and carry its probe (2026-10-06 read as zero recs)
+        (REPORTS / "2026-07-12.md").write_text(
+            "# Session retro 2026-07-12\n"
+            "## Global rules health\n"
+            "See [rec: 2026-07-12#2] below for the sharpening.\n"
+            "## Recommendations\n"
+            "### 2. [rec: 2026-07-12#2] [tooling] Turn off nomatch. REPEAT\n"
+            "Probe: no matches found:\n\ntier: script\n" + COMPLETE_MARKER + "\n")
+        cmd_recs(date(2026, 7, 12))
+        rrow3_line = next(l for l in (REPORTS / "recs.jsonl").read_text().splitlines()
+                          if json.loads(l)["report_date"] == "2026-07-12")
+        rid3 = {r["id"]: r for r in json.loads(rrow3_line)["recs"]}["2026-07-12#2"]
+        assert rid3["summary"].startswith("[tooling]"), rid3
+        assert rid3["repeat"] is True, rid3
+        # attributed and validated; no transcripts here, so it lands as no-baseline, where a
+        # bold-only parser leaves the rec without any probe at all ("")
+        assert rid3["probe_drop"] == "no-baseline", rid3
         # --- effectiveness digest ---
         import io as _io
         from contextlib import redirect_stdout as _rso
@@ -3839,6 +3866,14 @@ def selftest():
     assert report_probe_gaps(none_ok)[0] == [], report_probe_gaps(none_ok)[0]
     none_bare = "**[rec: 2026-07-08#9] a**\ntier: hook\nProbe: none\n"
     assert report_probe_gaps(none_bare)[0] == ["2026-07-08#9"], report_probe_gaps(none_bare)[0]
+    # The markdown-heading shape is gated exactly like the bold one (2026-10-06's report read
+    # as "0 rec headings seen" and passed unchecked).
+    md = ("## Recommendations\n### 1. [rec: 2026-07-08#1] [tooling] a\ntier: hook\n"
+          "Probe: a real signature here\n#### [rec: 2026-07-08#2] b\ntier: script\n")
+    assert report_probe_gaps(md) == (["2026-07-08#2"], ["2026-07-08#1", "2026-07-08#2"]), \
+        report_probe_gaps(md)
+    assert not is_rec_heading("See [rec: 2026-07-08#1] below.")
+    assert not is_rec_heading("- [2026-07-08] taken rec:2026-07-08#1")
     # --- asserted-existing path check (rec:2026-09-02#1) ---
     _r = [str(Path(__file__).resolve().parent.parent)]
     hit = ("## Recommendations\n"
