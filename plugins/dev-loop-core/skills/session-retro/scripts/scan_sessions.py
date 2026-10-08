@@ -1523,7 +1523,10 @@ def _upsert_jsonl(path, line, key):
     os.replace(tmp, path)
 
 
-REC_TAG_RE = re.compile(r"\[rec:\s*(\d{4}-\d{2}-\d{2})#(\d+)\]")
+# Metadata after the number, inside the brackets, is allowed when a space separates it:
+# 2026-07-16's report wrote `### [rec: 2026-07-15#2 — REPEAT] ...`, and a strict `#(\d+)\]`
+# dropped both of its REPEAT recs from recs.jsonl (codex r2).
+REC_TAG_RE = re.compile(r"\[rec:\s*(\d{4}-\d{2}-\d{2})#(\d+)(?:\s[^\]\n]*)?\]")
 # A canonical rec heading, in every shape reduce has written: the bold `**[rec: ...] ...**`
 # line, or a markdown heading carrying the tag first (`### 2. [rec: ...] [tooling] title`,
 # 2026-10-06) or last (`### 1. [tooling] title `[rec: ...]``, 2026-09-20/22). Every bold-only
@@ -3436,7 +3439,10 @@ def selftest():
             # tag-LAST shape (2026-09-20/22), with no Probe of its own: the one above must not
             # leak into it, and its title is the text BEFORE the tag
             "### 3. [tooling] Inspect scripts it runs `[rec: 2026-07-12#3]`\n"
-            "Dedup: distinct from rec:2026-07-12#2\n\ntier: hook\n" + COMPLETE_MARKER + "\n")
+            "Dedup: distinct from rec:2026-07-12#2\n\ntier: hook\n"
+            # metadata inside the tag (2026-07-16's shape) is still a rec, and still closes #3
+            "### [rec: 2026-07-12#4 — REPEAT] Self-background the poll `[skill]`\n"
+            "Probe: a real signature here\n" + COMPLETE_MARKER + "\n")
         cmd_recs(date(2026, 7, 12))
         rrow3_line = next(l for l in (REPORTS / "recs.jsonl").read_text().splitlines()
                           if json.loads(l)["report_date"] == "2026-07-12")
@@ -3448,6 +3454,9 @@ def selftest():
         assert last["summary"] == "[tooling] Inspect scripts it runs", last
         assert last["dedup"].startswith("distinct from rec:2026-07-12#2"), last
         assert last["probe_drop"] == "absent", last  # a mechanism rec with no Probe line of its own
+        meta = rids["2026-07-12#4"]
+        assert meta["repeat"] is True, meta
+        assert meta["summary"].startswith("Self-background the poll"), meta
         # attributed and validated; no transcripts here, so it lands as no-baseline, where a
         # bold-only parser leaves the rec without any probe at all ("")
         assert rid3["probe_drop"] == "no-baseline", rid3
