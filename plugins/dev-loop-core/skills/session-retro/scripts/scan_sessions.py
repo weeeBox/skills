@@ -1524,15 +1524,25 @@ def _upsert_jsonl(path, line, key):
 
 
 REC_TAG_RE = re.compile(r"\[rec:\s*(\d{4}-\d{2}-\d{2})#(\d+)\]")
-# A canonical rec heading, in either shape reduce has written: the bold `**[rec: ...] ...**`
-# line, or a markdown heading `### 2. [rec: ...] ...`. Reports drifted to the second shape and
-# every bold-only test read them as zero recs: 2026-10-06's run logged "0 rec headings seen"
-# on a report with three, so the probe gate passed it unchecked.
-REC_HEADING_RE = re.compile(r"\s*(?:\*\*|#{2,4}\s+(?:\d+\.\s+)?)\[rec:")
+# A canonical rec heading, in every shape reduce has written: the bold `**[rec: ...] ...**`
+# line, or a markdown heading carrying the tag first (`### 2. [rec: ...] [tooling] title`,
+# 2026-10-06) or last (`### 1. [tooling] title `[rec: ...]``, 2026-09-20/22). Every bold-only
+# test read the markdown shapes as zero recs: 2026-10-06's run logged "0 rec headings seen" on
+# a report with three, so the probe gate passed it unchecked. Scored 2026-10-08 over all 67
+# stored reports: 162 lines match, every one inside `## Recommendations`.
+REC_HEADING_RE = re.compile(r"\s*(?:\*\*\[rec:|#{2,4}\s.*\[rec:)")
 
 
 def is_rec_heading(line):
     return bool(REC_HEADING_RE.match(line))
+
+
+def rec_heading_title(line, tag):
+    """The heading's own words: the tag, the markdown/bold markup and the `N.` removed, so a
+    tag-last heading keeps its title instead of storing the bytes AFTER the tag."""
+    s = line.replace("`" + tag + "`", "").replace(tag, "")
+    s = re.sub(r"^\s*(?:#{2,4}\s+)?(?:\d+\.\s+)?", "", s)
+    return s.replace("**", "").strip()
 
 
 def _sanitize_summary(s):
@@ -1820,9 +1830,10 @@ def cmd_recs(day):
                     continue  # `\d{4}-\d{2}-\d{2}` can still be a non-calendar date (2026-00-99)
                 rid = f"{origin}#{n}"
                 if rid not in recs:
-                    after = line.split(m.group(0), 1)[1]
+                    text = (rec_heading_title(line, m.group(0)) if canonical_only
+                            else line.split(m.group(0), 1)[1])
                     recs[rid] = {"id": rid, "repeat": "REPEAT" in line.upper(),
-                                 "summary": _sanitize_summary(after),
+                                 "summary": _sanitize_summary(text),
                                  "dedup": dedup.get(rid, "")}
     # A probe is only an outcome signal if it FIRED, often enough to be worth a ratio, before
     # the fix landed. One that never matched cannot tell "the fix worked" from "the probe is
@@ -3421,13 +3432,22 @@ def selftest():
             "See [rec: 2026-07-12#2] below for the sharpening.\n"
             "## Recommendations\n"
             "### 2. [rec: 2026-07-12#2] [tooling] Turn off nomatch. REPEAT\n"
-            "Probe: no matches found:\n\ntier: script\n" + COMPLETE_MARKER + "\n")
+            "Probe: no matches found:\n\ntier: script\n"
+            # tag-LAST shape (2026-09-20/22), with no Probe of its own: the one above must not
+            # leak into it, and its title is the text BEFORE the tag
+            "### 3. [tooling] Inspect scripts it runs `[rec: 2026-07-12#3]`\n"
+            "Dedup: distinct from rec:2026-07-12#2\n\ntier: hook\n" + COMPLETE_MARKER + "\n")
         cmd_recs(date(2026, 7, 12))
         rrow3_line = next(l for l in (REPORTS / "recs.jsonl").read_text().splitlines()
                           if json.loads(l)["report_date"] == "2026-07-12")
-        rid3 = {r["id"]: r for r in json.loads(rrow3_line)["recs"]}["2026-07-12#2"]
-        assert rid3["summary"].startswith("[tooling]"), rid3
+        rids = {r["id"]: r for r in json.loads(rrow3_line)["recs"]}
+        rid3 = rids["2026-07-12#2"]
+        assert rid3["summary"].startswith("[tooling] Turn off nomatch"), rid3
         assert rid3["repeat"] is True, rid3
+        last = rids["2026-07-12#3"]
+        assert last["summary"] == "[tooling] Inspect scripts it runs", last
+        assert last["dedup"].startswith("distinct from rec:2026-07-12#2"), last
+        assert last["probe_drop"] == "absent", last  # a mechanism rec with no Probe line of its own
         # attributed and validated; no transcripts here, so it lands as no-baseline, where a
         # bold-only parser leaves the rec without any probe at all ("")
         assert rid3["probe_drop"] == "no-baseline", rid3
@@ -3872,6 +3892,11 @@ def selftest():
           "Probe: a real signature here\n#### [rec: 2026-07-08#2] b\ntier: script\n")
     assert report_probe_gaps(md) == (["2026-07-08#2"], ["2026-07-08#1", "2026-07-08#2"]), \
         report_probe_gaps(md)
+    tag_last = ("## Recommendations\n### 1. [tooling] a `[rec: 2026-07-08#1]`\ntier: hook\n"
+                "Probe: a real signature here\n### 2. [tooling] b `[rec: 2026-07-08#2]`\n"
+                "tier: script\n")
+    assert report_probe_gaps(tag_last)[0] == ["2026-07-08#2"], report_probe_gaps(tag_last)
+    assert not is_rec_heading("### 1. REPEAT: containment refusals (`rec:2026-09-13#1`)")
     assert not is_rec_heading("See [rec: 2026-07-08#1] below.")
     assert not is_rec_heading("- [2026-07-08] taken rec:2026-07-08#1")
     # --- asserted-existing path check (rec:2026-09-02#1) ---
