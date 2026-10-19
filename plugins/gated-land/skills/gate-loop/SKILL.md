@@ -149,6 +149,13 @@ the counter honestly returned 2). Once this branch is at the cap, a "confirmatio
      repo's `ship` skill and run its release preflight instead of reading the diff... it never ran
      the review"* - one dispatch, one watchdog and one result fetch for nothing. Open with
      `ADVERSARIAL CODE REVIEW` and include `Do not run any release protocol.`
+     **End every round's prompt with this sentence, verbatim:** `For every finding, list EVERY
+     other site sharing its root cause (file:line), or the grep that found none.` The codex
+     adversarial-review template says "Prefer one strong finding over several weak ones" with one
+     location per finding, so by default the reviewer reports one site of a class per round and the
+     next round finds its sibling - Step 0b's sweep is on your side, this sentence is on the
+     reviewer's. Measured on one repo's verify.log 2026-10-05..10-19: 25 branches gated, 42 BLOCK
+     rounds, 9 cap-outs, the largest share one class per round. Score it on BLOCKs per gated branch.
    - **A RED suite still rejects the round, exactly as before - this is a concurrency change, not a
      policy change.** Discard this round's codex verdict (a SHIP on a red tree is never a pass), find
      the **root cause** and fix it, re-run affected + full suite until green, then start the next
