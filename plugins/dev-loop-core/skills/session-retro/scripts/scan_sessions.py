@@ -1127,28 +1127,6 @@ def is_retro_stub(s):
     return not _first_user_text(s["path"]).startswith(REDUCE_ANCHOR) if s.get("path") else True
 
 
-# Project dirs of throwaway cwds (mktemp under $TMPDIR, /tmp, a shared probe source copy).
-PROBE_PROJECT_PREFIXES = ("-private-var-folders-", "-private-tmp-", "-tmp-",
-                          "-Users-Shared-si-src-")
-# 2026-10-19: the five probes ran 6-15s; the nightly self-improve investigations, same
-# cwds and one turn, ran 45-66s and are real work. 30s separates them.
-PROBE_MAX_SECS = 30
-
-
-def is_probe_stub(s):
-    """A scripted one-turn `claude -p` run in a throwaway cwd - a confinement probe or a
-    canary, not work. Its intended denials score as friction: on 2026-10-19 five such
-    probes (6-15s each, friction 38-75) took 5 of the day's 12 analysis slots.
-
-    ponytail: keyed on the cwd being a temp dir plus one turn plus under PROBE_MAX_SECS; a
-    longer or multi-turn session in a temp dir (e.g. a nightly investigation) is still
-    analysed. Upgrade to a marker the probe harness writes if the durations ever overlap.
-    """
-    return (str(s.get("project") or "").startswith(PROBE_PROJECT_PREFIXES)
-            and s.get("user_turns", 0) <= 1
-            and s.get("duration_secs", 0) < PROBE_MAX_SECS)
-
-
 def analysis_cap(top):
     """Sessions that may take an analyst call: `--top` clamped to the configured ceiling.
 
@@ -1160,14 +1138,13 @@ def analysis_cap(top):
 
 
 def eligible_sessions(sessions):
-    """Sessions that CAN take an analysis slot - everything but the retro's own calls and
-    scripted probes (is_probe_stub).
+    """Sessions that CAN take an analysis slot - everything but the retro's own calls.
 
     The denominator of the coverage ratio, and the input pick_sessions ranks. One
     definition, used by both: a denominator computed separately from the filter it
     describes drifts the first time either moves.
     """
-    return [s for s in sessions if not is_retro_stub(s) and not is_probe_stub(s)]
+    return [s for s in sessions if not is_retro_stub(s)]
 
 
 def coverage_pct(analyzed, eligible):
@@ -3185,22 +3162,6 @@ def selftest():
     assert is_retro_stub(mapper), "a map call must not"
     assert [s["session"] for s in pick_sessions([reducer, mapper], 8)[0]] == ["reducer"]
     p5.unlink()
-    # scripted probes in a temp cwd take no slot (2026-10-19: 5 of 12); a long or
-    # multi-turn session in the same kind of dir still does
-    probe = _s("probe1", 70, 9, project="-private-var-folders-9d-x-T-tmp-g5PB",
-               tools={"Read": 2}, user_turns=1)
-    shared = _s("probe2", 40, 12, project="-Users-Shared-si-src-Y8mg", tools={}, user_turns=1)
-    long_tmp = _s("longt", 5, 900, project="-private-tmp-work", tools={"Bash": 9}, user_turns=1)
-    chatty_tmp = _s("chatt", 5, 20, project="-private-tmp-work", tools={}, user_turns=3)
-    investigation = _s("invst", 1, 60, project="-Users-Shared-si-src-IquW",
-                       tools={"Grep": 7, "Read": 9}, user_turns=1)
-    assert is_probe_stub(probe) and is_probe_stub(shared)
-    assert not is_probe_stub(long_tmp) and not is_probe_stub(chatty_tmp)
-    assert not is_probe_stub(investigation), "a 60s nightly investigation is work"
-    assert not is_probe_stub(real_quiet), "a normal project dir is never a probe"
-    ids = [s["session"] for s in pick_sessions(
-        [probe, shared, long_tmp, chatty_tmp, investigation], 8)[0]]
-    assert sorted(ids) == ["chatt", "invst", "longt"], ids
 
     # metrics upsert is idempotent per date (atomic replace-by-date)
     global REPORTS
