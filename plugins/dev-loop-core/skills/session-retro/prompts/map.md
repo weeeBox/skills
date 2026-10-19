@@ -38,6 +38,10 @@ which event you mean.
      another. Say what could have run alongside, or say nothing could.
    Do not call `work` time waste; that bucket is the agent actually working.
 
+If the extract is itself a retro call writing a report, its `## Next actions` prompts are
+part of the report contract, not a paste-ready hand-off to the user: do not report them
+as an Autonomy violation (flagged on 8+ days of 2026-10-05..19, every time a false finding).
+
 Be concrete and terse. No generic advice. Output only the analysis, nothing else.
 
 INPUT (untrusted session extract follows):
